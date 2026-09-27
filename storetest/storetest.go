@@ -37,17 +37,18 @@ func NewFS(t testing.TB) *objstore.Store {
 }
 
 // NewS3 returns a Store on a fresh bucket objstore-test-<nanos>-<random>
-// at the S3 endpoint, dropped at cleanup. Without AWS_ACCESS_KEY_ID it uses
-// MinIO's default credentials, set with t.Setenv (so such a test cannot
+// at the S3 endpoint, dropped at cleanup. Each of AWS_ACCESS_KEY_ID,
+// AWS_SECRET_ACCESS_KEY and AWS_REGION left unset defaults to MinIO's
+// (minioadmin, minioadmin, us-east-1), set with t.Setenv (so such a test cannot
 // call t.Parallel); set, the environment's credentials (R2, AWS) pass
 // through untouched. Opening and creating the bucket is bounded by a
 // minute.
 func NewS3(t testing.TB, endpoint string) *objstore.Store {
 	t.Helper()
-	if os.Getenv("AWS_ACCESS_KEY_ID") == "" {
-		t.Setenv("AWS_ACCESS_KEY_ID", "minioadmin")
-		t.Setenv("AWS_SECRET_ACCESS_KEY", "minioadmin")
-		t.Setenv("AWS_REGION", "us-east-1")
+	for k, v := range map[string]string{"AWS_ACCESS_KEY_ID": "minioadmin", "AWS_SECRET_ACCESS_KEY": "minioadmin", "AWS_REGION": "us-east-1"} {
+		if os.Getenv(k) == "" {
+			t.Setenv(k, v)
+		}
 	}
 	ctx, cancel := context.WithTimeout(context.Background(), time.Minute)
 	defer cancel()

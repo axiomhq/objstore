@@ -375,6 +375,35 @@ func (c *ByteCache) PutDecoded(key string, v any, size int, generation uint64) {
 	s.evictLocked()
 }
 
+// Recharge sets the charge of key's decode to size when that decode is v
+// itself (v is a pointer: identity, not equality), and reports whether it
+// did. A holder of a value that lost a publication race, was evicted or
+// predates the generation is refused, so it cannot re-charge another
+// value's entry. A charge that no longer fits the stripe drops the entry.
+func (c *ByteCache) Recharge(key string, v any, size int, generation uint64) bool {
+	if size <= 0 || v == nil {
+		return false
+	}
+	s := c.stripe(key)
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if generation != c.GenerationOf(key) {
+		return false
+	}
+	e, ok := s.items[key]
+	if !ok || e.decoded == nil || e.decoded.decodedValue() != v {
+		return false
+	}
+	if size > s.cap-len(e.val) {
+		s.remove(e)
+		return false
+	}
+	s.charge(e, size-e.dsize)
+	e.decoded, e.dsize = concreteDecoded{value: v, bytes: size}, size
+	s.evictLocked()
+	return true
+}
+
 // InvalidateNamespace drops every entry under ns/<name>/ and retires the
 // namespace's generation, so a load of one of its keys still in flight
 // cannot publish afterwards. Other namespaces are untouched.

@@ -252,3 +252,39 @@ func TestInvalidateNamespaceIsScoped(t *testing.T) {
 		t.Fatal("another namespace's disk key moved")
 	}
 }
+
+// Recharge applies only to the value the entry holds, in its generation,
+// and drops an entry whose new charge no longer fits.
+func TestRechargeIsIdentityChecked(t *testing.T) {
+	type block struct{ n int }
+	c := NewByteCacheStripes(1000, 1)
+	won, lost := &block{1}, &block{1}
+	g := c.GenerationOf("k")
+	c.PutValue("k", won, 100, g)
+	c.PutValue("k", lost, 100, g) // first write wins
+
+	if c.Recharge("k", lost, 300, g) {
+		t.Fatal("a losing value re-charged the winner's entry")
+	}
+	if n, _ := c.DecodedSize("k"); n != 100 {
+		t.Fatalf("charge %d after refused recharge, want 100", n)
+	}
+	if !c.Recharge("k", won, 300, g) {
+		t.Fatal("the held value's recharge was refused")
+	}
+	if n, _ := c.DecodedSize("k"); n != 300 || c.Charge() != 300+len("k")+EntryOverhead {
+		t.Fatalf("charge %d (stripe %d), want 300 plus the entry overhead", n, c.Charge())
+	}
+	if c.Recharge("k", won, 400, g+1) {
+		t.Fatal("a stale generation re-charged")
+	}
+	if c.Recharge("absent", won, 10, g) {
+		t.Fatal("recharged a missing key")
+	}
+	if c.Recharge("k", won, 2000, g) {
+		t.Fatal("an oversized charge applied")
+	}
+	if _, ok := c.DecodedSize("k"); ok || c.Charge() != 0 {
+		t.Fatalf("oversized recharge kept the entry (charge %d)", c.Charge())
+	}
+}

@@ -14,14 +14,17 @@ import (
 func TestWriterCommitsAtOnceWhenIdle(t *testing.T) {
 	s, f := storetest.NewFaulty(t)
 	f.SetShape(storetest.Shape{Latency: 20 * time.Millisecond})
-	w := NewWriter[Bytes](s, testPrefix, 1, nil, WithCommitInterval(time.Second))
+	const interval = time.Second
+	w := NewWriter[Bytes](s, testPrefix, 1, nil, WithCommitInterval(interval))
 	defer w.Close()
 	start := time.Now()
 	if err := w.Append(context.Background(), rows("one")); err != nil {
 		t.Fatal(err)
 	}
-	if elapsed := time.Since(start); elapsed >= 100*time.Millisecond {
-		t.Fatalf("idle append took %s, want < 100ms", elapsed)
+	// An idle writer PUTs at once instead of waiting out the interval. The
+	// bound leaves room for a real store's PUT on top of the injected 20ms.
+	if elapsed := time.Since(start); elapsed >= interval/2 {
+		t.Fatalf("idle append took %s, want < %s", elapsed, interval/2)
 	}
 }
 
@@ -86,7 +89,12 @@ func TestWriterRateLimitsEntries(t *testing.T) {
 
 func TestWriterCloseKeepsEntryRate(t *testing.T) {
 	s := storetest.New(t)
-	w := NewWriter[Bytes](s, testPrefix, 1, nil, WithCommitInterval(100*time.Millisecond))
+	const interval = 100 * time.Millisecond
+	w := NewWriter[Bytes](s, testPrefix, 1, nil, WithCommitInterval(interval))
+	// The interval runs from the first PUT's start, so start the clock
+	// before it: timed from Append's return, a slow store's PUT latency
+	// came off the measured gap.
+	start := time.Now()
 	if err := w.Append(context.Background(), rows("first")); err != nil {
 		t.Fatal(err)
 	}
@@ -94,12 +102,11 @@ func TestWriterCloseKeepsEntryRate(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	start := time.Now()
 	w.Close()
 	if err := <-receipt; err != nil {
 		t.Fatal(err)
 	}
-	if elapsed := time.Since(start); elapsed < 80*time.Millisecond {
+	if elapsed := time.Since(start); elapsed < interval {
 		t.Fatalf("Close drained next entry after %s, before rate limit", elapsed)
 	}
 }
