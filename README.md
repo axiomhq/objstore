@@ -12,6 +12,9 @@ Object storage with compare-and-swap, for Go. One `Store` over an S3 bucket
 - a `file://` store that fsyncs every object and writes large ones back in chunks, so a small urgent write never waits behind a big one
 - envelope encryption per name, with local, AWS KMS and GCP KMS key providers (`objstore/kms`)
 - fault injection and metering for tests (`objstore/storetest`)
+- a write-ahead log: one entry per second, conditional PUT, nonce read-back (`objstore/wal`)
+- a memory and disk object cache with singleflight and per-request stats (`objstore/cache`)
+- a ranged reader that coalesces nearby reads into one GET (`objstore/rangeread`)
 
 ## Use
 
@@ -48,6 +51,39 @@ heartbeats and log commits.
 `ctx = objstore.WithTimings(ctx, &t)` has the store add the wall time of
 every call made under `ctx` to `t`, per call kind; `t.LogAttrs()` returns
 them as `slog` arguments.
+
+## Write-ahead log
+
+1. Make your row a `wal.Record`: `Size() int` and `AppendTo(b []byte) ([]byte, error)`. `wal.Bytes` is one already.
+2. Start a writer: `w := wal.NewWriter(s, "log/", 1, onCommit)`. `onCommit(seq, at, records)` runs for each durable entry, before callers are acked.
+3. Write: `err := w.Append(ctx, records)`. It returns once the entry holding them is durable.
+4. Read back: `wal.Walk(ctx, s, "log/", after, 0, wal.Decode, visit)`. `visit` gets one `wal.Entry` per entry; a batch cut into several pages arrives whole.
+5. Stop: `w.Close()` drains, then returns.
+
+| error | means |
+| --- | --- |
+| `ErrOverloaded` | 128 MiB is already waiting for the store; retry later |
+| `ErrLostRace` | another writer took the sequence (split brain) |
+| `ErrUnresolved` | the outcome is unknown; reopen from your checkpoint and the log |
+| `ErrCorrupt` | a page failed its checksum or framing, or a page is missing inside a bounded walk |
+
+Concurrent `Append`s share one entry, at most one per `WithCommitInterval` (default 1 s). An idle writer commits at once. Entries over 32 MiB are cut into pages. Nothing is listed: the walk GETs `after+1`, `after+2`, ... and stops at the first missing key. `SetFloor` refuses claims at or below a truncated watermark.
+
+## Cache and ranged reads
+
+1. Build the tiers: `disk, _ := cache.NewDisk(dir, 10<<30)`, then `c := cache.New(s, 1<<30, disk, cache.Keys{})`.
+2. Read through them: `b, err := c.FetchWith(ctx, key, func(ctx context.Context) ([]byte, error) { return s.Get(ctx, key) })`.
+3. For byte ranges: `cfg, _ := rangeread.Config{}.Normalized()`, `r := rangeread.New(s, c, cfg)`, then `scope, err := r.FetchRanges(ctx, loads)` and `cache.Scoped(scope, key)` per load.
+
+| piece | does |
+| --- | --- |
+| `cache.ByteCache` | striped LRU under one byte budget; decoded values ride on their bytes (`PutDecoded`, charged via `cache.Sizer`) |
+| `cache.Disk` | disposable disk tier, 4 KiB block checksums, pins, inactivity expiry |
+| `cache.Keys` | tells the cache which keys are log pages (own share), low priority, or ranged |
+| `cache.WithRequestStats` | per-request hits and misses through every tier |
+| `rangeread.Plan` | unions and coalesces extents under gap, extra-byte and range limits |
+
+Objects are immutable: the cache never re-validates a key. A key under `ns/<name>/` belongs to namespace `<name>` for `InvalidateNamespace`, pins and expiry.
 
 ## Encryption
 
