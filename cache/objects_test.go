@@ -13,6 +13,7 @@ import (
 	"time"
 
 	"github.com/axiomhq/objstore"
+	"github.com/axiomhq/objstore/fs"
 	"github.com/axiomhq/objstore/storetest"
 )
 
@@ -56,10 +57,7 @@ func BenchmarkCacheTierScenarios(b *testing.B) {
 func runCacheScenarios(tb testing.TB) []cacheScenarioResult {
 	tb.Helper()
 	ctx := context.Background()
-	raw, err := objstore.New(ctx, "file://"+tb.TempDir(), "cache-bench")
-	if err != nil {
-		tb.Fatal(err)
-	}
+	raw := fs.Open(tb.TempDir(), "cache-bench", objstore.Config{})
 	if err := raw.EnsureBucket(ctx); err != nil {
 		tb.Fatal(err)
 	}

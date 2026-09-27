@@ -4,21 +4,32 @@ import (
 	"cmp"
 	"context"
 	"errors"
+	"fmt"
 	"golang.org/x/sync/semaphore"
-	"strings"
 	"time"
 )
 
 var ErrNotFound = errors.New("object not found")
 var ErrRange = errors.New("invalid object range")
 
+// ErrConflict is a conditional write whose outcome the backend never
+// decided: another conditional write on the same key was in flight (S3's
+// 409 ConditionalRequestConflict). The object may or may not have been
+// written; the caller retries. It is never a lost race, which is
+// (false, nil).
+var ErrConflict = errors.New("conditional write conflict, retry")
+
 const MaxListPage = 1000
 
-// backend is the object-store contract both implementations satisfy; the
-// conformance suite in store_test.go runs against each. The file backend
-// reserves terminal .lock and .tmp-* files; dot-prefixed
-// directory elements remain valid so documented namespace names work.
-type backend interface {
+// Backend is the object-store contract every provider package satisfies
+// (fs, s3, gcs); storetest.Conformance runs against each. Every error a
+// backend returns is wrapped by OpErr. A failed condition is (false, nil),
+// a missing object wraps ErrNotFound, a bad range wraps ErrRange. ETags
+// are opaque. Listing is lexical, after is exclusive, next is the last
+// key returned when more remain and "" otherwise. The file backend
+// reserves terminal .lock and .tmp-* files; dot-prefixed directory
+// elements remain valid so documented namespace names work.
+type Backend interface {
 	Put(ctx context.Context, key string, data []byte) error
 	PutIfAbsent(ctx context.Context, key string, data []byte) (bool, error)
 	Get(ctx context.Context, key string) ([]byte, error)
@@ -36,27 +47,41 @@ type backend interface {
 
 // Store is one bucket of write-once objects with the OCC primitives a
 // log and a manifest build on (PutIfAbsent to append, PutIfMatch to swap).
-//
-// sse/kmsKeyID are the Config values the backend was built with, kept here
-// so callers can REPORT the bucket's encryption (namespace metadata) without
-// reaching into a backend. They are descriptive: the backend applies them.
 type Store struct {
-	b             backend
-	sse, kmsKeyID string
-	cmek          *cmekState
+	b    Backend
+	cmek *cmekState
 	// writes bounds non-urgent object writes and deletes in flight; see
 	// Config.MaxInflightWrites. nil (a zero Store) means unbounded.
 	writes *semaphore.Weighted
 }
 
-// Backend is the backend contract, exported for test wrappers
-// (storetest.Fault).
-type Backend = backend
+// Open returns a Store over b with cfg's pacing and write bound. The
+// provider packages (fs, s3, gcs) each have an Open that builds the
+// backend and calls this.
+func Open(b Backend, cfg Config) *Store {
+	if cfg.RequestsPerSecond > 0 {
+		b = &paced{Backend: b, pace: newPacer(cfg.RequestsPerSecond)}
+	}
+	writes := semaphore.NewWeighted(int64(cmp.Or(cfg.MaxInflightWrites, defaultMaxInflightWrites)))
+	return &Store{b: b, writes: writes}
+}
 
 // WithBackend returns a Store over wrap(s's backend) with s's encryption
 // and write bound: the same bucket seen through a wrapper.
 func (s *Store) WithBackend(wrap func(Backend) Backend) *Store {
-	return &Store{b: wrap(s.b), sse: s.sse, kmsKeyID: s.kmsKeyID, writes: s.writes, cmek: s.cmek}
+	return &Store{b: wrap(s.b), writes: s.writes, cmek: s.cmek}
+}
+
+// OpErr attaches the operation and the key to every error leaving a
+// backend. A bare SDK error names neither, so a failure surfaced three
+// layers up — mid-compaction, mid-replay, inside a query's fan-out — says
+// only that storage was unhappy about something. %w keeps ErrNotFound
+// unwrappable by errors.Is. nil stays nil.
+func OpErr(op, key string, err error) error {
+	if err == nil {
+		return nil
+	}
+	return fmt.Errorf("store: %s %s: %w", op, key, err)
 }
 
 const defaultMaxInflightWrites = 16
@@ -64,43 +89,14 @@ const defaultMaxInflightWrites = 16
 // enterWrite takes a write slot unless ctx is Urgent. The returned release
 // must be called once the backend call has returned.
 func (s *Store) enterWrite(ctx context.Context) (func(), error) {
-	if s.writes == nil || isUrgent(ctx) {
+	if s.writes == nil || IsUrgent(ctx) {
 		return func() {}, nil
 	}
-	defer timingsOf(ctx).since(CallGate, time.Now())
+	defer TimingsOf(ctx).Since(CallGate, time.Now())
 	if err := s.writes.Acquire(ctx, 1); err != nil {
 		return nil, err
 	}
 	return func() { s.writes.Release(1) }, nil
-}
-
-// SSE reports the bucket's configured server-side encryption: the S3 mode
-// ("", "AES256" or "aws:kms") and the KMS key id when one is set. The caller
-// decides what it means for its users; the store does not interpret it.
-func (s *Store) SSE() (mode, kmsKeyID string) { return s.sse, s.kmsKeyID }
-
-// New connects to a bucket. endpoint selects the backend: "" = real AWS S3,
-// an http(s) URL = S3-compatible (MinIO), "file:///path" = local
-// filesystem (no dependencies — dev and hermetic CI; unix-only).
-func New(ctx context.Context, endpoint, bucket string) (*Store, error) {
-	return NewConfigured(ctx, Config{Endpoint: endpoint, Bucket: bucket})
-}
-
-func NewConfigured(ctx context.Context, cfg Config) (*Store, error) {
-	endpoint, bucket := cfg.Endpoint, cfg.Bucket
-	if !endpointAllowed(endpoint, cfg.AllowedEndpoints) {
-		return nil, ErrEndpointDenied
-	}
-	writes := semaphore.NewWeighted(int64(cmp.Or(cfg.MaxInflightWrites, defaultMaxInflightWrites)))
-	if root, ok := strings.CutPrefix(endpoint, "file://"); ok {
-		// The file backend encrypts nothing; it must not claim a mode.
-		return &Store{b: newFS(root, bucket), writes: writes}, nil
-	}
-	b, err := newS3(ctx, endpoint, bucket, cfg.SSE, cfg.KMSKeyID, cfg.RequestsPerSecond, cfg.RequestTimeout)
-	if err != nil {
-		return nil, err
-	}
-	return &Store{b: b, sse: cfg.SSE, kmsKeyID: cfg.KMSKeyID, writes: writes}, nil
 }
 
 func (s *Store) Put(ctx context.Context, key string, data []byte) error {
@@ -162,7 +158,7 @@ func (s *Store) Get(ctx context.Context, key string) ([]byte, error) {
 // ranges fail instead of returning a plausible partial index block.
 func (s *Store) GetRange(ctx context.Context, key string, offset, length int64) ([]byte, error) {
 	if offset < 0 || length <= 0 || offset > int64(^uint64(0)>>1)-length {
-		return nil, opErr("get-range", key, ErrRange)
+		return nil, OpErr("get-range", key, ErrRange)
 	}
 	if err := ctx.Err(); err != nil {
 		return nil, err
@@ -243,7 +239,7 @@ func (s *Store) PutIfMatch(ctx context.Context, key string, data []byte, etag st
 // next is the last returned key when another page remains, otherwise empty.
 func (s *Store) ListPage(ctx context.Context, prefix, after string, limit int) ([]string, string, error) {
 	if limit < 1 || limit > MaxListPage {
-		return nil, "", opErr("list-page", prefix, errors.New("limit must be between 1 and 1000"))
+		return nil, "", OpErr("list-page", prefix, errors.New("limit must be between 1 and 1000"))
 	}
 	return s.b.ListPage(ctx, prefix, after, limit)
 }
@@ -286,7 +282,7 @@ func (s *Store) ListPrefixes(ctx context.Context, prefix string) ([]string, erro
 
 func (s *Store) ListPrefixesPage(ctx context.Context, prefix, after string, limit int) ([]string, string, error) {
 	if limit < 1 || limit > MaxListPage {
-		return nil, "", opErr("list-prefixes-page", prefix, errors.New("limit must be between 1 and 1000"))
+		return nil, "", OpErr("list-prefixes-page", prefix, errors.New("limit must be between 1 and 1000"))
 	}
 	return s.b.ListPrefixesPage(ctx, prefix, after, limit)
 }

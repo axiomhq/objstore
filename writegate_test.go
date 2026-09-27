@@ -7,6 +7,7 @@ import (
 	"time"
 
 	"github.com/axiomhq/objstore"
+	"github.com/axiomhq/objstore/fs"
 	"github.com/axiomhq/objstore/storetest"
 )
 
@@ -16,10 +17,7 @@ import (
 // commit, manifest swap, or lease heartbeat — goes straight through.
 func TestWriteGateBoundsBulkWritesButNotUrgent(t *testing.T) {
 	ctx := context.Background()
-	base, err := objstore.NewConfigured(ctx, objstore.Config{Endpoint: "file://" + t.TempDir(), Bucket: "b", MaxInflightWrites: 1})
-	if err != nil {
-		t.Fatal(err)
-	}
+	base := fs.Open(t.TempDir(), "b", objstore.Config{MaxInflightWrites: 1})
 	if err := base.EnsureBucket(ctx); err != nil {
 		t.Fatal(err)
 	}

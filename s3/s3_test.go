@@ -1,4 +1,4 @@
-package objstore
+package s3
 
 import (
 	"context"
@@ -10,18 +10,20 @@ import (
 	"strings"
 	"sync/atomic"
 	"testing"
+
+	"github.com/axiomhq/objstore"
 )
 
 // fakeS3 serves canned S3 responses so the backend's error and paging
 // mapping is testable without MinIO. Each handler sees the raw request.
-func fakeS3(t *testing.T, handler http.HandlerFunc) *s3Store {
+func fakeS3(t *testing.T, handler http.HandlerFunc) *Backend {
 	t.Helper()
 	srv := httptest.NewServer(handler)
 	t.Cleanup(srv.Close)
 	t.Setenv("AWS_ACCESS_KEY_ID", "test")
 	t.Setenv("AWS_SECRET_ACCESS_KEY", "test")
 	t.Setenv("AWS_REGION", "us-east-1")
-	s, err := newS3(context.Background(), srv.URL, "b", "", "", 0, 0)
+	s, err := New(context.Background(), Config{Endpoint: srv.URL, Bucket: "b"})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -171,6 +173,42 @@ func TestS3ConditionalPutVerdicts(t *testing.T) {
 	code.Store("NoSuchKey")
 	if ok, err := s.PutIfMatch(ctx, "k", []byte("x"), "etag"); ok || err != nil {
 		t.Fatalf("PutIfMatch on a vanished key: ok=%v err=%v", ok, err)
+	}
+}
+
+// TestS3ConditionalRequestConflictIsErrConflict: the 409 surfaces as
+// objstore.ErrConflict so callers above the backend can tell "retry" from
+// a lost race without importing the SDK.
+func TestS3ConditionalRequestConflictIsErrConflict(t *testing.T) {
+	s := fakeS3(t, func(w http.ResponseWriter, r *http.Request) {
+		s3Error(w, http.StatusConflict, "ConditionalRequestConflict")
+	})
+	ctx := context.Background()
+	if ok, err := s.PutIfAbsent(ctx, "k", []byte("x")); ok || !errors.Is(err, objstore.ErrConflict) {
+		t.Fatalf("PutIfAbsent: ok=%v err=%v", ok, err)
+	}
+	if ok, err := s.PutIfMatch(ctx, "k", []byte("x"), "etag"); ok || !errors.Is(err, objstore.ErrConflict) {
+		t.Fatalf("PutIfMatch: ok=%v err=%v", ok, err)
+	}
+}
+
+// TestS3PutIfMatchSendsUnquotedETag pins the exact If-Match header: the
+// ETag goes out without its quotes (the Ceph RGW workaround on PutIfMatch).
+// R2 documents the quoted RFC 9110 form; changing this must be deliberate
+// and re-verified with TestR2 and TestConformance.
+func TestS3PutIfMatchSendsUnquotedETag(t *testing.T) {
+	var got atomic.Value
+	s := fakeS3(t, func(w http.ResponseWriter, r *http.Request) {
+		got.Store(r.Header.Values("If-Match"))
+		w.WriteHeader(http.StatusOK)
+	})
+	for _, etag := range []string{`"abc123"`, "abc123"} {
+		if ok, err := s.PutIfMatch(context.Background(), "k", []byte("x"), etag); !ok || err != nil {
+			t.Fatalf("PutIfMatch(%s): ok=%v err=%v", etag, ok, err)
+		}
+		if h := got.Load().([]string); len(h) != 1 || h[0] != "abc123" {
+			t.Fatalf("PutIfMatch(%s) sent If-Match %q, want [abc123]", etag, h)
+		}
 	}
 }
 

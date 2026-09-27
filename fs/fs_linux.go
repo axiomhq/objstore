@@ -1,6 +1,6 @@
 //go:build linux
 
-package objstore
+package fs
 
 import (
 	"os"

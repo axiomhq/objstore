@@ -42,13 +42,15 @@ func WithTimings(ctx context.Context, t *Timings) context.Context {
 	return context.WithValue(ctx, timingsKey{}, t)
 }
 
-func timingsOf(ctx context.Context) *Timings {
+// TimingsOf returns the Timings ctx carries, or nil. For backends.
+func TimingsOf(ctx context.Context) *Timings {
 	t, _ := ctx.Value(timingsKey{}).(*Timings)
 	return t
 }
 
-// since adds the time from start to op; a nil t records nothing.
-func (t *Timings) since(op Call, start time.Time) {
+// Since adds the time from start to op; a nil t records nothing. For
+// backends.
+func (t *Timings) Since(op Call, start time.Time) {
 	if t != nil {
 		t.nanos[op].Add(int64(time.Since(start)))
 		t.n[op].Add(1)

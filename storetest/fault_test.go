@@ -8,6 +8,7 @@ import (
 	"time"
 
 	"github.com/axiomhq/objstore"
+	"github.com/axiomhq/objstore/fs"
 	"github.com/axiomhq/objstore/storetest"
 )
 
@@ -188,10 +189,7 @@ func TestFaultShapeIsDeterministicAndBounded(t *testing.T) {
 // -race this is the whole assertion; it runs on file:// so it needs no MinIO.
 func TestFaultSetShapeRacesCalls(t *testing.T) {
 	ctx := context.Background()
-	raw, err := objstore.New(ctx, "file://"+t.TempDir(), "shape-race")
-	if err != nil {
-		t.Fatal(err)
-	}
+	raw := fs.Open(t.TempDir(), "shape-race", objstore.Config{})
 	if err := raw.EnsureBucket(ctx); err != nil {
 		t.Fatal(err)
 	}

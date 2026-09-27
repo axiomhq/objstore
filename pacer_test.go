@@ -33,3 +33,38 @@ func TestPacerSpacesRequestsInCallOrder(t *testing.T) {
 		t.Fatal("nil pacer must be a no-op")
 	}
 }
+
+// TestOpenPacesUnlessUrgent: Open wraps the backend in the pacer when
+// RequestsPerSecond is set, and an Urgent context skips it.
+func TestOpenPacesUnlessUrgent(t *testing.T) {
+	ctx := context.Background()
+	s := Open(newMemBackend(), Config{RequestsPerSecond: 200}) // 5 ms apart
+	if _, ok := s.b.(*paced); !ok {
+		t.Fatalf("backend %T, want *paced", s.b)
+	}
+	start := time.Now()
+	for range 6 {
+		if err := s.Put(ctx, "k", nil); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if el := time.Since(start); el < 25*time.Millisecond {
+		t.Fatalf("6 paced puts at 200/s took %v, want >= 25 ms", el)
+	}
+	s = Open(newMemBackend(), Config{RequestsPerSecond: 1})
+	if err := s.Put(ctx, "k", nil); err != nil {
+		t.Fatal(err)
+	}
+	start = time.Now()
+	for range 5 {
+		if err := s.Put(Urgent(ctx), "k", nil); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if el := time.Since(start); el > 500*time.Millisecond {
+		t.Fatalf("urgent puts at 1/s took %v, want no pacing", el)
+	}
+	if _, ok := Open(newMemBackend(), Config{}).b.(*paced); ok {
+		t.Fatal("unpaced Open wrapped the backend")
+	}
+}

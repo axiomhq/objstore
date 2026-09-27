@@ -34,13 +34,7 @@ func (p *meteredAWSProvider) Unwrap(_ context.Context, _ string, wrapped []byte)
 
 func TestAWSKeyChecksFollowLeaseCadence(t *testing.T) {
 	ctx := context.Background()
-	s, err := New(ctx, "file://"+t.TempDir(), "cmek")
-	if err != nil {
-		t.Fatal(err)
-	}
-	if err := s.EnsureBucket(ctx); err != nil {
-		t.Fatal(err)
-	}
+	s := newMemStore()
 	p := &meteredAWSProvider{}
 	s.ConfigureCMEK(p)
 	s.SetCMEKRefreshInterval(150 * time.Millisecond)
@@ -94,21 +88,15 @@ func TestAWSKeyChecksFollowLeaseCadence(t *testing.T) {
 
 func TestRetireNamespaceKeyClearsOtherProcessCache(t *testing.T) {
 	ctx := context.Background()
-	root := t.TempDir()
+	bucket := newMemBackend()
 	p := &testKeyProvider{}
 	open := func() *Store {
-		s, err := New(ctx, "file://"+root, "cmek")
-		if err != nil {
-			t.Fatal(err)
-		}
-		if err := s.EnsureBucket(ctx); err != nil {
-			t.Fatal(err)
-		}
+		s := Open(bucket, Config{})
 		s.ConfigureCMEK(p)
 		return s
 	}
 	first, second := open(), open()
-	fail := &failDelete{backend: first.b, key: "cmek/test"}
+	fail := &failDelete{Backend: first.b, key: "cmek/test"}
 	first.b = fail
 	wrapped, version, err := p.Wrap(ctx, "local:test", bytes.Repeat([]byte{4}, 32))
 	if err != nil {
@@ -135,7 +123,7 @@ func TestRetireNamespaceKeyClearsOtherProcessCache(t *testing.T) {
 	if err := first.RetireNamespaceKey(ctx, "test", "old"); err != nil {
 		t.Fatal(err)
 	}
-	if _, err := fail.backend.Get(ctx, "cmek/test"); !errors.Is(err, ErrNotFound) {
+	if _, err := fail.Backend.Get(ctx, "cmek/test"); !errors.Is(err, ErrNotFound) {
 		t.Fatalf("record still exists: %v", err)
 	}
 	if err := second.CheckNamespaceKey(ctx, "test"); err != nil {
@@ -168,14 +156,8 @@ func (p *testKeyProvider) Unwrap(_ context.Context, _ string, wrapped []byte) ([
 
 func TestEncryptedObjectRoundTrip(t *testing.T) {
 	ctx := context.Background()
-	root := t.TempDir()
-	s, err := New(ctx, "file://"+root, "cmek")
-	if err != nil {
-		t.Fatal(err)
-	}
-	if err := s.EnsureBucket(ctx); err != nil {
-		t.Fatal(err)
-	}
+	bucket := newMemBackend()
+	s := Open(bucket, Config{})
 	provider := &testKeyProvider{}
 	s.ConfigureCMEK(provider)
 	dek := make([]byte, 32)
@@ -208,10 +190,7 @@ func TestEncryptedObjectRoundTrip(t *testing.T) {
 	if err != nil || !bytes.Equal(got, plain) {
 		t.Fatalf("Get: %v", err)
 	}
-	reopened, err := New(ctx, "file://"+root, "cmek")
-	if err != nil {
-		t.Fatal(err)
-	}
+	reopened := Open(bucket, Config{})
 	reopened.ConfigureCMEK(provider)
 	if got, err := reopened.Get(ctx, key); err != nil || !bytes.Equal(got, plain) {
 		t.Fatalf("reopen: %v", err)
@@ -284,7 +263,7 @@ var errInjected = errors.New("injected delete failure")
 // storetest.Fault is the general injector; it imports this package, so an
 // in-package test carries its own.
 type failDelete struct {
-	backend
+	Backend
 	key   string
 	armed bool
 }
@@ -293,12 +272,12 @@ func (f *failDelete) Delete(ctx context.Context, key string) error {
 	if f.armed && key == f.key {
 		return errInjected
 	}
-	return f.backend.Delete(ctx, key)
+	return f.Backend.Delete(ctx, key)
 }
 
 func (f *failDelete) DeleteMany(ctx context.Context, keys ...string) error {
 	if f.armed && slices.Contains(keys, f.key) {
 		return errInjected
 	}
-	return f.backend.DeleteMany(ctx, keys...)
+	return f.Backend.DeleteMany(ctx, keys...)
 }

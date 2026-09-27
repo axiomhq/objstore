@@ -1,4 +1,4 @@
-package objstore
+package s3
 
 import (
 	"bytes"

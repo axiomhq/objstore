@@ -1,4 +1,4 @@
-package objstore
+package fs
 
 import (
 	"context"
@@ -10,6 +10,6 @@ import (
 
 // lockRoot takes the exclusive root flock used by older file-store writers.
 // New writers share this lock and serialize on a key stripe instead.
-func (f *fsStore) lockRoot(ctx context.Context) (unlock func(), err error) {
+func (f *Backend) lockRoot(ctx context.Context) (unlock func(), err error) {
 	return flock(ctx, filepath.Join(f.root, ".lock"), syscall.LOCK_EX)
 }

@@ -1,4 +1,4 @@
-package objstore
+package fs
 
 import (
 	"context"
@@ -7,7 +7,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
-	"io/fs"
+	iofs "io/fs"
 	"os"
 	"path/filepath"
 	"sort"
@@ -16,13 +16,15 @@ import (
 	"sync/atomic"
 	"syscall"
 	"time"
+
+	"github.com/axiomhq/objstore"
 )
 
-// fsStore is the file:// backend: write-once objects as files, O_EXCL-style
+// Backend is the file:// backend: write-once objects as files, O_EXCL-style
 // links for PutIfAbsent, temp+rename for atomic Put, striped flocks plus a
 // content hash for PutIfMatch. Dev and hermetic-CI backend; unix-only
 // (flock). Same single-writer-per-bucket contract as S3.
-type fsStore struct {
+type Backend struct {
 	root string
 	// durable is the set of directory paths whose chain up to the bucket
 	// root THIS PROCESS has fully synced (see syncPublishedDir): it decides
@@ -38,8 +40,15 @@ type fsStore struct {
 	dirSyncs atomic.Int64
 }
 
-func newFS(root, bucket string) *fsStore {
-	return &fsStore{root: filepath.Join(filepath.FromSlash(root), bucket)}
+// New returns the file backend for bucket, a directory under root.
+func New(root, bucket string) *Backend {
+	return &Backend{root: filepath.Join(filepath.FromSlash(root), bucket)}
+}
+
+// Open returns a Store over New(root, bucket) with cfg's pacing and
+// write bound.
+func Open(root, bucket string, cfg objstore.Config) *objstore.Store {
+	return objstore.Open(New(root, bucket), cfg)
 }
 
 // path maps a key to a file path. Keys become paths — a trust boundary the
@@ -48,7 +57,7 @@ func newFS(root, bucket string) *fsStore {
 // elements (".." and ".") are rejected, never resolved. Dot-prefixed nested
 // elements are valid because namespace names may begin with a dot; the
 // backend's own terminal .lock and .tmp-* files remain reserved.
-func (f *fsStore) path(key string) (string, error) {
+func (f *Backend) path(key string) (string, error) {
 	if key == "" {
 		return "", fmt.Errorf("store: invalid key %q", key)
 	}
@@ -79,9 +88,9 @@ const writeBackChunk = 256 << 10
 // key sub-directories beneath it are created here. An urgent write (a log
 // commit) is written whole; others over writeBackChunk are written back as
 // they are written (see writeBackChunk).
-func (f *fsStore) writeTemp(dst string, data []byte, urgent bool, t *Timings) (string, error) {
-	if _, err := os.Stat(f.root); errors.Is(err, fs.ErrNotExist) {
-		return "", fmt.Errorf("store: bucket %s: %w", f.root, ErrNotFound)
+func (f *Backend) writeTemp(dst string, data []byte, urgent bool, t *objstore.Timings) (string, error) {
+	if _, err := os.Stat(f.root); errors.Is(err, iofs.ErrNotExist) {
+		return "", fmt.Errorf("store: bucket %s: %w", f.root, objstore.ErrNotFound)
 	} else if err != nil {
 		return "", err
 	}
@@ -91,7 +100,7 @@ func (f *fsStore) writeTemp(dst string, data []byte, urgent bool, t *Timings) (s
 		return "", err
 	}
 	tmp, err := os.CreateTemp(parent, ".tmp-*")
-	t.since(CallCreate, start)
+	t.Since(objstore.CallCreate, start)
 	if err != nil {
 		return "", err
 	}
@@ -103,11 +112,11 @@ func (f *fsStore) writeTemp(dst string, data []byte, urgent bool, t *Timings) (s
 		part := data[off:min(off+chunk, len(data))]
 		start = time.Now()
 		_, err := tmp.Write(part)
-		t.since(CallWrite, start)
+		t.Since(objstore.CallWrite, start)
 		if err == nil && chunk < len(data) {
 			start = time.Now()
 			err = writeBack(tmp, int64(off), int64(len(part)))
-			t.since(CallWriteBack, start)
+			t.Since(objstore.CallWriteBack, start)
 		}
 		if err != nil {
 			tmp.Close()
@@ -117,7 +126,7 @@ func (f *fsStore) writeTemp(dst string, data []byte, urgent bool, t *Timings) (s
 	}
 	start = time.Now()
 	err = tmp.Sync()
-	t.since(CallFsync, start)
+	t.Since(objstore.CallFsync, start)
 	if err != nil {
 		tmp.Close()
 		os.Remove(tmp.Name())
@@ -132,7 +141,7 @@ func (f *fsStore) writeTemp(dst string, data []byte, urgent bool, t *Timings) (s
 
 // syncDir fsyncs one directory: the durable-publication primitive. A synced
 // file in an unsynced directory is not durable.
-func (f *fsStore) syncDir(dir string) error {
+func (f *Backend) syncDir(dir string) error {
 	d, err := os.Open(dir)
 	if err != nil {
 		return err
@@ -157,8 +166,8 @@ func (f *fsStore) syncDir(dir string) error {
 // one process the set is written only after a walk succeeds, so a failed
 // sync makes the next publish walk again. Cost: one chain walk per
 // directory per process lifetime.
-func (f *fsStore) syncPublishedDir(dst string, t *Timings) error {
-	defer t.since(CallDirSync, time.Now())
+func (f *Backend) syncPublishedDir(dst string, t *objstore.Timings) error {
+	defer t.Since(objstore.CallDirSync, time.Now())
 	parent := filepath.Dir(dst)
 	if _, walked := f.durable.Load(parent); walked {
 		return f.syncDir(parent)
@@ -177,7 +186,7 @@ func (f *fsStore) syncPublishedDir(dst string, t *Timings) error {
 // syncDirs fsyncs dst's parent directory and every ancestor up to and
 // including f.root, so a just-published rename or link survives a crash —
 // a synced file in an unsynced directory is not durable.
-func (f *fsStore) syncDirs(dst string) error {
+func (f *Backend) syncDirs(dst string) error {
 	for dir := filepath.Dir(dst); ; dir = filepath.Dir(dir) {
 		if err := f.syncDir(dir); err != nil {
 			return err
@@ -196,7 +205,7 @@ func (f *fsStore) syncDirs(dst string) error {
 // write holds its stripe through the directory fsync, and a log commit whose
 // key hashed to a bulk write's stripe (1 in 256) waited for that fsync. The class is the key's, never the
 // caller's, so one key always takes one stripe.
-func (f *fsStore) lockKey(ctx context.Context, key string) (func(), error) {
+func (f *Backend) lockKey(ctx context.Context, key string) (func(), error) {
 	rootUnlock, err := flock(ctx, filepath.Join(f.root, ".lock"), syscall.LOCK_SH)
 	if err != nil {
 		return nil, err
@@ -259,11 +268,11 @@ func flock(ctx context.Context, path string, mode int) (unlock func(), err error
 	}, nil
 }
 
-func (f *fsStore) Put(ctx context.Context, key string, data []byte) error {
-	return opErr("put", key, f.put(ctx, key, data))
+func (f *Backend) Put(ctx context.Context, key string, data []byte) error {
+	return objstore.OpErr("put", key, f.put(ctx, key, data))
 }
 
-func (f *fsStore) put(ctx context.Context, key string, data []byte) error {
+func (f *Backend) put(ctx context.Context, key string, data []byte) error {
 	dst, err := f.path(key)
 	if err != nil {
 		return err
@@ -271,34 +280,34 @@ func (f *fsStore) put(ctx context.Context, key string, data []byte) error {
 	if err := ctx.Err(); err != nil {
 		return err
 	}
-	tmp, err := f.writeTemp(dst, data, isUrgent(ctx), timingsOf(ctx))
+	tmp, err := f.writeTemp(dst, data, objstore.IsUrgent(ctx), objstore.TimingsOf(ctx))
 	if err != nil {
 		return err
 	}
 	defer os.Remove(tmp) // a no-op after Rename; the leak otherwise
-	t := timingsOf(ctx)
+	t := objstore.TimingsOf(ctx)
 	start := time.Now()
 	unlock, err := f.lockKey(ctx, key)
-	t.since(CallLock, start)
+	t.Since(objstore.CallLock, start)
 	if err != nil {
 		return err
 	}
 	defer unlock()
 	start = time.Now()
 	err = os.Rename(tmp, dst)
-	t.since(CallLink, start)
+	t.Since(objstore.CallLink, start)
 	if err != nil {
 		return err
 	}
 	return f.syncPublishedDir(dst, t)
 }
 
-func (f *fsStore) PutIfAbsent(ctx context.Context, key string, data []byte) (bool, error) {
+func (f *Backend) PutIfAbsent(ctx context.Context, key string, data []byte) (bool, error) {
 	ok, err := f.putIfAbsent(ctx, key, data)
-	return ok, opErr("put-if-absent", key, err)
+	return ok, objstore.OpErr("put-if-absent", key, err)
 }
 
-func (f *fsStore) putIfAbsent(ctx context.Context, key string, data []byte) (bool, error) {
+func (f *Backend) putIfAbsent(ctx context.Context, key string, data []byte) (bool, error) {
 	dst, err := f.path(key)
 	if err != nil {
 		return false, err
@@ -306,15 +315,15 @@ func (f *fsStore) putIfAbsent(ctx context.Context, key string, data []byte) (boo
 	if err := ctx.Err(); err != nil {
 		return false, err
 	}
-	tmp, err := f.writeTemp(dst, data, isUrgent(ctx), timingsOf(ctx))
+	tmp, err := f.writeTemp(dst, data, objstore.IsUrgent(ctx), objstore.TimingsOf(ctx))
 	if err != nil {
 		return false, err
 	}
 	defer os.Remove(tmp)
-	t := timingsOf(ctx)
+	t := objstore.TimingsOf(ctx)
 	start := time.Now()
 	unlock, err := f.lockKey(ctx, key)
-	t.since(CallLock, start)
+	t.Since(objstore.CallLock, start)
 	if err != nil {
 		return false, err
 	}
@@ -323,9 +332,9 @@ func (f *fsStore) putIfAbsent(ctx context.Context, key string, data []byte) (boo
 	// unlike O_EXCL+write, a crash can never leave a half-written winner.
 	start = time.Now()
 	err = os.Link(tmp, dst)
-	t.since(CallLink, start)
+	t.Since(objstore.CallLink, start)
 	if err != nil {
-		if errors.Is(err, fs.ErrExist) {
+		if errors.Is(err, iofs.ErrExist) {
 			return false, nil
 		}
 		return false, err
@@ -333,12 +342,12 @@ func (f *fsStore) putIfAbsent(ctx context.Context, key string, data []byte) (boo
 	return true, f.syncPublishedDir(dst, t)
 }
 
-func (f *fsStore) Get(ctx context.Context, key string) ([]byte, error) {
+func (f *Backend) Get(ctx context.Context, key string) ([]byte, error) {
 	data, err := f.get(ctx, key)
-	return data, opErr("get", key, err)
+	return data, objstore.OpErr("get", key, err)
 }
 
-func (f *fsStore) get(ctx context.Context, key string) ([]byte, error) {
+func (f *Backend) get(ctx context.Context, key string) ([]byte, error) {
 	p, err := f.path(key)
 	if err != nil {
 		return nil, err
@@ -348,23 +357,23 @@ func (f *fsStore) get(ctx context.Context, key string) ([]byte, error) {
 	}
 	start := time.Now()
 	data, err := os.ReadFile(p)
-	timingsOf(ctx).since(CallRead, start)
-	if errors.Is(err, fs.ErrNotExist) {
-		return nil, ErrNotFound
+	objstore.TimingsOf(ctx).Since(objstore.CallRead, start)
+	if errors.Is(err, iofs.ErrNotExist) {
+		return nil, objstore.ErrNotFound
 	}
 	return data, err
 }
 
-func (f *fsStore) GetWithETag(ctx context.Context, key string) ([]byte, string, error) {
+func (f *Backend) GetWithETag(ctx context.Context, key string) ([]byte, string, error) {
 	data, err := f.get(ctx, key)
 	if err != nil {
-		return nil, "", opErr("get-with-etag", key, err)
+		return nil, "", objstore.OpErr("get-with-etag", key, err)
 	}
 	sum := sha256.Sum256(data)
 	return data, hex.EncodeToString(sum[:]), nil
 }
 
-func (f *fsStore) GetIfChanged(ctx context.Context, key, etag string) ([]byte, string, bool, error) {
+func (f *Backend) GetIfChanged(ctx context.Context, key, etag string) ([]byte, string, bool, error) {
 	data, current, err := f.GetWithETag(ctx, key)
 	if err != nil {
 		return nil, "", false, err
@@ -375,28 +384,28 @@ func (f *fsStore) GetIfChanged(ctx context.Context, key, etag string) ([]byte, s
 	return data, current, false, nil
 }
 
-func (f *fsStore) PutIfMatch(ctx context.Context, key string, data []byte, etag string) (bool, error) {
+func (f *Backend) PutIfMatch(ctx context.Context, key string, data []byte, etag string) (bool, error) {
 	ok, err := f.putIfMatch(ctx, key, data, etag)
-	return ok, opErr("put-if-match", key, err)
+	return ok, objstore.OpErr("put-if-match", key, err)
 }
 
-func (f *fsStore) putIfMatch(ctx context.Context, key string, data []byte, etag string) (bool, error) {
+func (f *Backend) putIfMatch(ctx context.Context, key string, data []byte, etag string) (bool, error) {
 	dst, err := f.path(key)
 	if err != nil {
 		return false, err
 	}
-	t := timingsOf(ctx)
+	t := objstore.TimingsOf(ctx)
 	start := time.Now()
 	unlock, err := f.lockKey(ctx, key)
-	t.since(CallLock, start)
+	t.Since(objstore.CallLock, start)
 	if err != nil {
 		return false, err
 	}
 	defer unlock()
 	start = time.Now()
 	cur, err := os.ReadFile(dst)
-	t.since(CallRead, start)
-	if errors.Is(err, fs.ErrNotExist) {
+	t.Since(objstore.CallRead, start)
+	if errors.Is(err, iofs.ErrNotExist) {
 		return false, nil // precondition cannot hold
 	}
 	if err != nil {
@@ -406,7 +415,7 @@ func (f *fsStore) putIfMatch(ctx context.Context, key string, data []byte, etag 
 	if hex.EncodeToString(sum[:]) != etag {
 		return false, nil
 	}
-	tmp, err := f.writeTemp(dst, data, isUrgent(ctx), timingsOf(ctx))
+	tmp, err := f.writeTemp(dst, data, objstore.IsUrgent(ctx), objstore.TimingsOf(ctx))
 	if err != nil {
 		return false, err
 	}
@@ -418,37 +427,37 @@ func (f *fsStore) putIfMatch(ctx context.Context, key string, data []byte, etag 
 	}
 	start = time.Now()
 	err = os.Rename(tmp, dst)
-	t.since(CallLink, start)
+	t.Since(objstore.CallLink, start)
 	if err != nil {
 		return false, err
 	}
 	return true, f.syncPublishedDir(dst, t)
 }
 
-func (f *fsStore) ListPage(ctx context.Context, prefix, after string, limit int) ([]string, string, error) {
+func (f *Backend) ListPage(ctx context.Context, prefix, after string, limit int) ([]string, string, error) {
 	keys, err := f.list(ctx, prefix)
 	if err != nil {
-		return nil, "", opErr("list-page", prefix, err)
+		return nil, "", objstore.OpErr("list-page", prefix, err)
 	}
 	return pageStrings(keys, after, limit)
 }
 
-func (f *fsStore) list(ctx context.Context, prefix string) ([]string, error) {
+func (f *Backend) list(ctx context.Context, prefix string) ([]string, error) {
 	if err := ctx.Err(); err != nil {
 		return nil, err
 	}
-	defer timingsOf(ctx).since(CallList, time.Now())
+	defer objstore.TimingsOf(ctx).Since(objstore.CallList, time.Now())
 	var keys []string
-	err := filepath.WalkDir(f.root, func(p string, d fs.DirEntry, err error) error {
+	err := filepath.WalkDir(f.root, func(p string, d iofs.DirEntry, err error) error {
 		if cerr := ctx.Err(); cerr != nil {
 			return cerr
 		}
 		if err != nil {
-			if p == f.root && errors.Is(err, fs.ErrNotExist) {
+			if p == f.root && errors.Is(err, iofs.ErrNotExist) {
 				// missing bucket root is an error, matching S3's NoSuchBucket
-				return fmt.Errorf("store: bucket %s: %w", f.root, ErrNotFound)
+				return fmt.Errorf("store: bucket %s: %w", f.root, objstore.ErrNotFound)
 			}
-			if errors.Is(err, fs.ErrNotExist) {
+			if errors.Is(err, iofs.ErrNotExist) {
 				return nil // entry vanished mid-walk
 			}
 			return err
@@ -476,10 +485,10 @@ func (f *fsStore) list(ctx context.Context, prefix string) ([]string, error) {
 // ListPrefixesPage derives the common prefixes from the object walk, so a
 // directory left empty by a Delete is invisible here exactly as it is on S3,
 // which has no directories at all.
-func (f *fsStore) ListPrefixesPage(ctx context.Context, prefix, after string, limit int) ([]string, string, error) {
+func (f *Backend) ListPrefixesPage(ctx context.Context, prefix, after string, limit int) ([]string, string, error) {
 	keys, err := f.list(ctx, prefix)
 	if err != nil {
-		return nil, "", opErr("list-prefixes-page", prefix, err)
+		return nil, "", objstore.OpErr("list-prefixes-page", prefix, err)
 	}
 	var out []string
 	for _, k := range keys {
@@ -508,31 +517,31 @@ func pageStrings(all []string, after string, limit int) ([]string, string, error
 	return page, "", nil
 }
 
-func (f *fsStore) Delete(ctx context.Context, key string) error {
-	return opErr("delete", key, f.delete(ctx, key))
+func (f *Backend) Delete(ctx context.Context, key string) error {
+	return objstore.OpErr("delete", key, f.delete(ctx, key))
 }
 
-func (f *fsStore) delete(ctx context.Context, key string) error {
+func (f *Backend) delete(ctx context.Context, key string) error {
 	p, err := f.path(key)
 	if err != nil {
 		return err
 	}
-	t := timingsOf(ctx)
+	t := objstore.TimingsOf(ctx)
 	start := time.Now()
 	unlock, err := f.lockKey(ctx, key)
-	t.since(CallLock, start)
+	t.Since(objstore.CallLock, start)
 	if err != nil {
 		return err
 	}
 	defer unlock()
-	defer t.since(CallDelete, time.Now())
-	if err := os.Remove(p); err != nil && !errors.Is(err, fs.ErrNotExist) {
+	defer t.Since(objstore.CallDelete, time.Now())
+	if err := os.Remove(p); err != nil && !errors.Is(err, iofs.ErrNotExist) {
 		return err
 	}
 	return nil
 }
 
-func (f *fsStore) DeleteMany(ctx context.Context, keys ...string) error {
+func (f *Backend) DeleteMany(ctx context.Context, keys ...string) error {
 	for _, k := range keys {
 		if err := f.Delete(ctx, k); err != nil {
 			return err
@@ -541,18 +550,18 @@ func (f *fsStore) DeleteMany(ctx context.Context, keys ...string) error {
 	return nil
 }
 
-func (f *fsStore) EnsureBucket(ctx context.Context) error {
+func (f *Backend) EnsureBucket(ctx context.Context) error {
 	if err := ctx.Err(); err != nil {
-		return opErr("create-bucket", f.root, err)
+		return objstore.OpErr("create-bucket", f.root, err)
 	}
-	return opErr("create-bucket", f.root, os.MkdirAll(f.root, 0o755))
+	return objstore.OpErr("create-bucket", f.root, os.MkdirAll(f.root, 0o755))
 }
 
-func (f *fsStore) DropBucket(ctx context.Context) error {
+func (f *Backend) DropBucket(ctx context.Context) error {
 	if err := ctx.Err(); err != nil {
-		return opErr("drop-bucket", f.root, err)
+		return objstore.OpErr("drop-bucket", f.root, err)
 	}
-	err := opErr("drop-bucket", f.root, os.RemoveAll(f.root))
+	err := objstore.OpErr("drop-bucket", f.root, os.RemoveAll(f.root))
 	// The tree is gone: nothing in it is durable any more, and a stale mark
 	// would let a later publish into a recreated bucket skip its walk.
 	f.durable.Range(func(k, _ any) bool {
@@ -562,18 +571,18 @@ func (f *fsStore) DropBucket(ctx context.Context) error {
 	return err
 }
 
-func (f *fsStore) GetRange(ctx context.Context, key string, offset, length int64) ([]byte, error) {
+func (f *Backend) GetRange(ctx context.Context, key string, offset, length int64) ([]byte, error) {
 	p, err := f.path(key)
 	if err != nil {
 		return nil, err
 	}
-	defer timingsOf(ctx).since(CallRead, time.Now())
+	defer objstore.TimingsOf(ctx).Since(objstore.CallRead, time.Now())
 	file, err := os.Open(p)
-	if errors.Is(err, fs.ErrNotExist) {
-		return nil, opErr("get-range", key, ErrNotFound)
+	if errors.Is(err, iofs.ErrNotExist) {
+		return nil, objstore.OpErr("get-range", key, objstore.ErrNotFound)
 	}
 	if err != nil {
-		return nil, opErr("get-range", key, err)
+		return nil, objstore.OpErr("get-range", key, err)
 	}
 	defer file.Close()
 	info, err := file.Stat()
@@ -581,7 +590,7 @@ func (f *fsStore) GetRange(ctx context.Context, key string, offset, length int64
 		return nil, err
 	}
 	if offset > info.Size() || length > info.Size()-offset {
-		return nil, opErr("get-range", key, ErrRange)
+		return nil, objstore.OpErr("get-range", key, objstore.ErrRange)
 	}
 	// One exact-size buffer: ReadAll would grow a fresh buffer for every
 	// range read, which drains measurable allocation on a hot merge path.
@@ -592,7 +601,7 @@ func (f *fsStore) GetRange(ctx context.Context, key string, offset, length int64
 		if errors.Is(err, io.EOF) {
 			err = io.ErrUnexpectedEOF
 		}
-		return nil, opErr("get-range", key, err)
+		return nil, objstore.OpErr("get-range", key, err)
 	}
 	return data, nil
 }

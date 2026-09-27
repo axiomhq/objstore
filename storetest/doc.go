@@ -1,3 +1,4 @@
-// Package storetest provides test Stores: a MinIO- or file-backed bucket
-// per test, and a fault-injecting, metering wrapper around one.
+// Package storetest provides test Stores: an S3- or file-backed bucket
+// per test, a fault-injecting, metering wrapper around one, and
+// Conformance, the suite every backend passes.
 package storetest

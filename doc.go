@@ -1,8 +1,10 @@
 // Package objstore is one object-storage bucket with compare-and-swap:
 // conditional PUT (PutIfAbsent, PutIfMatch) and GET (GetIfChanged), the
-// ETag with the body, paginated listing and batch delete. New picks the
-// backend from the endpoint: an S3 URL (AWS, MinIO, any S3-compatible
-// service) or file:// for a durable local store with chunked write-back.
+// ETag with the body, paginated listing and batch delete. Each provider
+// is its own package, so a binary links only the SDKs it uses: package s3
+// (AWS, MinIO, Ceph, Hetzner, R2), package gcs (Google Cloud Storage) and
+// package fs, a durable local store with chunked write-back. Each builds a
+// Backend and hands it to Open.
 //
 // Objects are meant to be written once and never mutated except by
 // deletion; the conditional writes cover the few that must change.

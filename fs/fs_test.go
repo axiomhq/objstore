@@ -1,4 +1,4 @@
-package objstore
+package fs
 
 import (
 	"bytes"
@@ -13,6 +13,8 @@ import (
 	"sync"
 	"testing"
 	"time"
+
+	"github.com/axiomhq/objstore"
 )
 
 func fsTempFiles(root string) []string {
@@ -35,7 +37,7 @@ func fsTempFiles(root string) []string {
 // the set with it. A commit's device bill on this backend is this count
 // plus the one file fsync in writeTemp.
 func TestFSSyncDirsDecision(t *testing.T) {
-	f := newFS(t.TempDir(), "b")
+	f := New(t.TempDir(), "b")
 	ctx := context.Background()
 	if err := f.EnsureBucket(ctx); err != nil {
 		t.Fatal(err)
@@ -134,14 +136,14 @@ func TestFSSyncDirsDecision(t *testing.T) {
 }
 
 // TestFSGetRangeEdges pins the range contract at EOF: a read ending exactly
-// at the last byte succeeds, one byte past it is ErrRange before any read,
+// at the last byte succeeds, one byte past it is objstore.ErrRange before any read,
 // and a zero-length read at EOF is empty and error-free.
 // TestFSWritesBackInChunks: objects around and past writeBackChunk, which
 // writeTemp writes back a chunk at a time, publish byte for byte through
 // Put, PutIfAbsent and PutIfMatch, urgent or not, and leave no temp file
 // behind.
 func TestFSWritesBackInChunks(t *testing.T) {
-	f := newFS(t.TempDir(), "b")
+	f := New(t.TempDir(), "b")
 	ctx := context.Background()
 	if err := f.EnsureBucket(ctx); err != nil {
 		t.Fatal(err)
@@ -154,7 +156,7 @@ func TestFSWritesBackInChunks(t *testing.T) {
 		for i, op := range []string{"put", "put-if-absent", "put-if-match", "put", "put-if-absent", "put-if-match"} {
 			ctx := ctx
 			if i >= 3 {
-				ctx = Urgent(ctx) // written whole, not in chunks
+				ctx = objstore.Urgent(ctx) // written whole, not in chunks
 			}
 			key := fmt.Sprintf("k/%s/%d-%d", op, n, i)
 			var err error
@@ -192,7 +194,7 @@ func TestFSWritesBackInChunks(t *testing.T) {
 }
 
 func TestFSGetRangeEdges(t *testing.T) {
-	f := newFS(t.TempDir(), "b")
+	f := New(t.TempDir(), "b")
 	ctx := context.Background()
 	if err := f.EnsureBucket(ctx); err != nil {
 		t.Fatal(err)
@@ -204,7 +206,7 @@ func TestFSGetRangeEdges(t *testing.T) {
 	if err != nil || string(got) != "9" {
 		t.Fatalf("read ending exactly at EOF: %q %v", got, err)
 	}
-	if _, err := f.GetRange(ctx, "k", 10, 1); !errors.Is(err, ErrRange) {
+	if _, err := f.GetRange(ctx, "k", 10, 1); !errors.Is(err, objstore.ErrRange) {
 		t.Fatalf("read past EOF: %v", err)
 	}
 	if got, err := f.GetRange(ctx, "k", 10, 0); err != nil || len(got) != 0 {
@@ -216,7 +218,7 @@ func TestFSGetRangeEdges(t *testing.T) {
 // before touching the tree, and a contended root lock waits on the context
 // instead of on a blocking flock. Either failure leaves no temp file behind.
 func TestFSHonoursContext(t *testing.T) {
-	f := newFS(t.TempDir(), "b")
+	f := New(t.TempDir(), "b")
 	ctx := context.Background()
 	if err := f.EnsureBucket(ctx); err != nil {
 		t.Fatal(err)
@@ -284,7 +286,7 @@ func (c cancelWhen) Err() error {
 // operation has started still wins before any visible effect — PutIfMatch
 // never renames once ctx is gone, and a list walk aborts between entries.
 func TestFSHonoursContextMidOperation(t *testing.T) {
-	f := newFS(t.TempDir(), "b")
+	f := New(t.TempDir(), "b")
 	ctx := context.Background()
 	if err := f.EnsureBucket(ctx); err != nil {
 		t.Fatal(err)
@@ -327,14 +329,14 @@ func TestFSHonoursContextMidOperation(t *testing.T) {
 
 	cancelled, cancel := context.WithCancel(ctx)
 	cancel()
-	if err := newFS(t.TempDir(), "none").EnsureBucket(cancelled); !errors.Is(err, context.Canceled) {
+	if err := New(t.TempDir(), "none").EnsureBucket(cancelled); !errors.Is(err, context.Canceled) {
 		t.Fatalf("EnsureBucket with a cancelled context: %v", err)
 	}
 }
 
 func TestFSKeyLockIsolation(t *testing.T) {
 	root := t.TempDir()
-	f, other := newFS(root, "b"), newFS(root, "b")
+	f, other := New(root, "b"), New(root, "b")
 	ctx := context.Background()
 	if err := f.EnsureBucket(ctx); err != nil {
 		t.Fatal(err)
@@ -390,7 +392,7 @@ func TestFSKeyLockIsolation(t *testing.T) {
 
 func TestFSConcurrentCASWinner(t *testing.T) {
 	root := t.TempDir()
-	f := newFS(root, "b")
+	f := New(root, "b")
 	ctx := context.Background()
 	if err := f.EnsureBucket(ctx); err != nil {
 		t.Fatal(err)
@@ -411,7 +413,7 @@ func TestFSConcurrentCASWinner(t *testing.T) {
 			defer wg.Done()
 			<-start
 			value := string(rune('a' + i))
-			ok, err := newFS(root, "b").PutIfMatch(ctx, "key", []byte(value), etag)
+			ok, err := New(root, "b").PutIfMatch(ctx, "key", []byte(value), etag)
 			if err != nil {
 				t.Error(err)
 			}
@@ -435,7 +437,7 @@ func TestFSConcurrentCASWinner(t *testing.T) {
 func TestFSKeyLockAcrossProcesses(t *testing.T) {
 	ctx := context.Background()
 	if root := os.Getenv("OBJSTORE_TEST_FS_LOCK_ROOT"); root != "" {
-		f := newFS(root, "b")
+		f := New(root, "b")
 		bounded, cancel := context.WithTimeout(ctx, 30*time.Millisecond)
 		defer cancel()
 		if err := f.Put(bounded, "held", []byte("wrong")); !errors.Is(err, context.DeadlineExceeded) {
@@ -449,7 +451,7 @@ func TestFSKeyLockAcrossProcesses(t *testing.T) {
 		return
 	}
 	root := t.TempDir()
-	f := newFS(root, "b")
+	f := New(root, "b")
 	if err := f.EnsureBucket(ctx); err != nil {
 		t.Fatal(err)
 	}
@@ -465,7 +467,7 @@ func TestFSKeyLockAcrossProcesses(t *testing.T) {
 	if output, err := cmd.CombinedOutput(); err != nil {
 		t.Fatalf("child: %v\n%s", err, output)
 	}
-	if _, err := f.Get(ctx, "held"); !errors.Is(err, ErrNotFound) {
+	if _, err := f.Get(ctx, "held"); !errors.Is(err, objstore.ErrNotFound) {
 		t.Fatalf("blocked write landed: %v", err)
 	}
 	if got, err := f.Get(ctx, "independent"); err != nil || string(got) != "child" {
@@ -478,7 +480,7 @@ func TestFSKeyLockAcrossProcesses(t *testing.T) {
 // stripe as a data key being written must not wait for it. The same key
 // still serializes.
 func TestWALKeysDoNotShareAFoldWritesStripe(t *testing.T) {
-	f := newFS(t.TempDir(), "bucket")
+	f := New(t.TempDir(), "bucket")
 	if err := os.MkdirAll(f.root, 0o755); err != nil {
 		t.Fatal(err)
 	}

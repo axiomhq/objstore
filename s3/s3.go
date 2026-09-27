@@ -1,50 +1,32 @@
-package objstore
+package s3
 
 import (
 	"bytes"
 	"context"
 	"errors"
 	"fmt"
-	"golang.org/x/time/rate"
 	"io"
 	"net/http"
+	"net/url"
+	"slices"
 	"strings"
 	"time"
 
 	"github.com/aws/aws-sdk-go-v2/aws"
 	awshttp "github.com/aws/aws-sdk-go-v2/aws/transport/http"
 	"github.com/aws/aws-sdk-go-v2/config"
-	"github.com/aws/aws-sdk-go-v2/service/s3"
+	awss3 "github.com/aws/aws-sdk-go-v2/service/s3"
 	"github.com/aws/aws-sdk-go-v2/service/s3/types"
 	"github.com/aws/smithy-go"
+	"github.com/axiomhq/objstore"
 )
 
-// s3Store is the S3 / MinIO backend.
-type s3Store struct {
-	client   *s3.Client
+// Backend is the S3 backend: AWS S3, MinIO, Ceph RGW (Hetzner), R2.
+type Backend struct {
+	client   *awss3.Client
 	bucket   string
 	sse      string
 	kmsKeyID string
-	pace     *pacer
-}
-
-// pacer is a token bucket with a one-request burst: a 32-wide prefetch
-// never exceeds the configured rate, and slots go out in call order so a
-// lease renewal never starves behind bulk reads. nil means unpaced.
-type pacer struct{ l *rate.Limiter }
-
-func newPacer(rps float64) *pacer {
-	if rps <= 0 {
-		return nil
-	}
-	return &pacer{l: rate.NewLimiter(rate.Limit(rps), 1)}
-}
-
-func (p *pacer) wait(ctx context.Context) error {
-	if p == nil || isUrgent(ctx) {
-		return nil
-	}
-	return p.l.Wait(ctx)
 }
 
 // httpTimeout bounds one request end to end; a hung store never pins a
@@ -55,7 +37,59 @@ const httpTimeout = 60 * time.Second
 // typical caller's request gate width (32) so a full burst reuses connections.
 const idleConnsPerHost = 64
 
-func newS3(ctx context.Context, endpoint, bucket, sse, kmsKeyID string, rps float64, timeout time.Duration) (*s3Store, error) {
+// Config selects the bucket and the S3 endpoint.
+type Config struct {
+	// Endpoint is "" for AWS S3 (the SDK's region), or an http(s) URL for
+	// an S3-compatible service (MinIO, Ceph, Hetzner, R2), addressed
+	// path-style.
+	Endpoint string
+	Bucket   string
+	// AllowedEndpoints, when set, lists the only endpoints (scheme://host)
+	// New accepts; any other is ErrEndpointDenied.
+	AllowedEndpoints []string
+	// SSE is the server-side encryption mode: "", "AES256" or "aws:kms".
+	SSE string
+	// KMSKeyID is the KMS key for SSE "aws:kms"; any other mode rejects it.
+	KMSKeyID string
+	// RequestTimeout bounds one S3 request end to end; 0 = 60 s. A store
+	// whose queue is deeper than that truncates large uploads mid-body
+	// (MinIO answers 400 IncompleteBody) rather than finishing them.
+	RequestTimeout time.Duration
+}
+
+// ErrEndpointDenied is New's error for an Endpoint outside
+// Config.AllowedEndpoints.
+var ErrEndpointDenied = errors.New("store: endpoint denied by allow-list")
+
+func endpointAllowed(endpoint string, allowed []string) bool {
+	if len(allowed) == 0 {
+		return true
+	}
+	u, err := url.Parse(endpoint)
+	if err != nil || u.Scheme == "" || u.Host == "" {
+		return false
+	}
+	u.Path, u.RawQuery, u.Fragment = "", "", ""
+	return slices.Contains(allowed, u.String())
+}
+
+// Open returns a Store over New(ctx, cfg) with ocfg's pacing and write
+// bound.
+func Open(ctx context.Context, cfg Config, ocfg objstore.Config) (*objstore.Store, error) {
+	b, err := New(ctx, cfg)
+	if err != nil {
+		return nil, err
+	}
+	return objstore.Open(b, ocfg), nil
+}
+
+// New connects to cfg.Bucket. Credentials and region come from the SDK's
+// default chain (environment, shared config, instance role).
+func New(ctx context.Context, cfg Config) (*Backend, error) {
+	endpoint, bucket, sse, kmsKeyID, timeout := cfg.Endpoint, cfg.Bucket, cfg.SSE, cfg.KMSKeyID, cfg.RequestTimeout
+	if !endpointAllowed(endpoint, cfg.AllowedEndpoints) {
+		return nil, ErrEndpointDenied
+	}
 	if timeout <= 0 {
 		timeout = httpTimeout
 	}
@@ -73,11 +107,11 @@ func newS3(ctx context.Context, endpoint, bucket, sse, kmsKeyID string, rps floa
 		t.MaxIdleConnsPerHost = idleConnsPerHost
 		t.MaxIdleConns = idleConnsPerHost
 	})
-	cfg, err := config.LoadDefaultConfig(ctx, config.WithHTTPClient(httpClient))
+	awsCfg, err := config.LoadDefaultConfig(ctx, config.WithHTTPClient(httpClient))
 	if err != nil {
 		return nil, err
 	}
-	client := s3.NewFromConfig(cfg, func(o *s3.Options) {
+	client := awss3.NewFromConfig(awsCfg, func(o *awss3.Options) {
 		if endpoint != "" {
 			o.BaseEndpoint = aws.String(endpoint)
 			o.UsePathStyle = true
@@ -86,11 +120,16 @@ func newS3(ctx context.Context, endpoint, bucket, sse, kmsKeyID string, rps floa
 		// otherwise log a warning on every GET.
 		o.ResponseChecksumValidation = aws.ResponseChecksumValidationWhenRequired
 	})
-	return &s3Store{client: client, bucket: bucket, sse: sse, kmsKeyID: kmsKeyID, pace: newPacer(rps)}, nil
+	return &Backend{client: client, bucket: bucket, sse: sse, kmsKeyID: kmsKeyID}, nil
 }
 
-func (s *s3Store) putInput(key string, data []byte) *s3.PutObjectInput {
-	in := &s3.PutObjectInput{Bucket: &s.bucket, Key: &key, Body: bytes.NewReader(data)}
+// SSE reports the bucket's configured server-side encryption: the S3 mode
+// ("", "AES256" or "aws:kms") and the KMS key id when one is set. The caller
+// decides what it means for its users; the store does not interpret it.
+func (s *Backend) SSE() (mode, kmsKeyID string) { return s.sse, s.kmsKeyID }
+
+func (s *Backend) putInput(key string, data []byte) *awss3.PutObjectInput {
+	in := &awss3.PutObjectInput{Bucket: &s.bucket, Key: &key, Body: bytes.NewReader(data)}
 	if s.sse != "" {
 		in.ServerSideEncryption = types.ServerSideEncryption(s.sse)
 	}
@@ -98,18 +137,6 @@ func (s *s3Store) putInput(key string, data []byte) *s3.PutObjectInput {
 		in.SSEKMSKeyId = &s.kmsKeyID
 	}
 	return in
-}
-
-// opErr attaches the operation and the key to every error leaving this
-// backend. A bare SDK error names neither, so a failure surfaced three
-// layers up — mid-compaction, mid-replay, inside a query's fan-out — says
-// only that S3 was unhappy about something. %w keeps ErrNotFound
-// unwrappable by errors.Is.
-func opErr(op, key string, err error) error {
-	if err == nil {
-		return nil
-	}
-	return fmt.Errorf("store: %s %s: %w", op, key, err)
 }
 
 // readBody drains an object body and proves it arrived whole. A GET can end
@@ -135,41 +162,39 @@ func readBody(op, key string, body io.ReadCloser, contentLength *int64) ([]byte,
 		data, err = io.ReadAll(body)
 	}
 	if err != nil {
-		return nil, opErr(op, key, err)
+		return nil, objstore.OpErr(op, key, err)
 	}
 	if contentLength != nil && int64(len(data)) != *contentLength {
-		return nil, opErr(op, key, fmt.Errorf("short read: got %d bytes, ContentLength says %d",
+		return nil, objstore.OpErr(op, key, fmt.Errorf("short read: got %d bytes, ContentLength says %d",
 			len(data), *contentLength))
 	}
 	return data, nil
 }
 
-func (s *s3Store) Put(ctx context.Context, key string, data []byte) error {
-	if err := s.pace.wait(ctx); err != nil {
-		return err
-	}
+func (s *Backend) Put(ctx context.Context, key string, data []byte) error {
 	_, err := s.client.PutObject(ctx, s.putInput(key, data))
-	return opErr("put", key, err)
+	return objstore.OpErr("put", key, err)
 }
 
 // PutIfAbsent writes key only if it does not already exist (If-None-Match: *).
 // Returns false when the key existed. This is the OCC primitive the WAL builds on.
 // Only PreconditionFailed is a verdict. ConditionalRequestConflict (409) is
 // "another conditional write on this key is in flight, retry" — the object
-// may or may not exist — so it surfaces as an error and the caller's retry
-// loop handles it, never as "another writer won".
-func (s *s3Store) PutIfAbsent(ctx context.Context, key string, data []byte) (bool, error) {
-	if err := s.pace.wait(ctx); err != nil {
-		return false, err
-	}
+// may or may not exist — so it surfaces as an error wrapping
+// objstore.ErrConflict and the caller's retry loop handles it, never as
+// "another writer won".
+func (s *Backend) PutIfAbsent(ctx context.Context, key string, data []byte) (bool, error) {
 	in := s.putInput(key, data)
 	in.IfNoneMatch = aws.String("*")
 	_, err := s.client.PutObject(ctx, in)
 	if err != nil {
-		if apiErrorCode(err) == "PreconditionFailed" {
+		switch apiErrorCode(err) {
+		case "PreconditionFailed":
 			return false, nil
+		case "ConditionalRequestConflict":
+			return false, objstore.OpErr("put-if-absent", key, fmt.Errorf("%w: %v", objstore.ErrConflict, err))
 		}
-		return false, opErr("put-if-absent", key, err)
+		return false, objstore.OpErr("put-if-absent", key, err)
 	}
 	return true, nil
 }
@@ -182,31 +207,25 @@ func apiErrorCode(err error) string {
 	return ""
 }
 
-func (s *s3Store) Get(ctx context.Context, key string) ([]byte, error) {
-	if err := s.pace.wait(ctx); err != nil {
-		return nil, err
-	}
-	out, err := s.client.GetObject(ctx, &s3.GetObjectInput{Bucket: &s.bucket, Key: &key})
+func (s *Backend) Get(ctx context.Context, key string) ([]byte, error) {
+	out, err := s.client.GetObject(ctx, &awss3.GetObjectInput{Bucket: &s.bucket, Key: &key})
 	if err != nil {
 		if apiErrorCode(err) == "NoSuchKey" {
-			return nil, opErr("get", key, ErrNotFound)
+			return nil, objstore.OpErr("get", key, objstore.ErrNotFound)
 		}
-		return nil, opErr("get", key, err)
+		return nil, objstore.OpErr("get", key, err)
 	}
 	return readBody("get", key, out.Body, out.ContentLength)
 }
 
-func (s *s3Store) ListPage(ctx context.Context, prefix, after string, limit int) ([]string, string, error) {
-	if err := s.pace.wait(ctx); err != nil {
-		return nil, "", err
-	}
-	in := &s3.ListObjectsV2Input{Bucket: &s.bucket, Prefix: &prefix, MaxKeys: aws.Int32(int32(limit))}
+func (s *Backend) ListPage(ctx context.Context, prefix, after string, limit int) ([]string, string, error) {
+	in := &awss3.ListObjectsV2Input{Bucket: &s.bucket, Prefix: &prefix, MaxKeys: aws.Int32(int32(limit))}
 	if after != "" {
 		in.StartAfter = &after
 	}
 	page, err := s.client.ListObjectsV2(ctx, in)
 	if err != nil {
-		return nil, "", opErr("list-page", prefix, err)
+		return nil, "", objstore.OpErr("list-page", prefix, err)
 	}
 	keys := make([]string, 0, len(page.Contents))
 	for _, obj := range page.Contents {
@@ -225,18 +244,15 @@ func (s *s3Store) ListPage(ctx context.Context, prefix, after string, limit int)
 // a truncated page can carry no prefixes at all; that is not the end of the
 // listing, so keep walking the server's continuation until a prefix appears
 // or the listing ends. The public cursor stays the last prefix returned.
-func (s *s3Store) ListPrefixesPage(ctx context.Context, prefix, after string, limit int) ([]string, string, error) {
-	if err := s.pace.wait(ctx); err != nil {
-		return nil, "", err
-	}
-	in := &s3.ListObjectsV2Input{Bucket: &s.bucket, Prefix: &prefix, Delimiter: aws.String("/"), MaxKeys: aws.Int32(int32(limit))}
+func (s *Backend) ListPrefixesPage(ctx context.Context, prefix, after string, limit int) ([]string, string, error) {
+	in := &awss3.ListObjectsV2Input{Bucket: &s.bucket, Prefix: &prefix, Delimiter: aws.String("/"), MaxKeys: aws.Int32(int32(limit))}
 	if after != "" {
 		in.StartAfter = &after
 	}
 	for {
 		page, err := s.client.ListObjectsV2(ctx, in)
 		if err != nil {
-			return nil, "", opErr("list-prefixes-page", prefix, err)
+			return nil, "", objstore.OpErr("list-prefixes-page", prefix, err)
 		}
 		truncated := page.IsTruncated != nil && *page.IsTruncated
 		if len(page.CommonPrefixes) == 0 && truncated && page.NextContinuationToken != nil {
@@ -254,21 +270,15 @@ func (s *s3Store) ListPrefixesPage(ctx context.Context, prefix, after string, li
 	}
 }
 
-func (s *s3Store) Delete(ctx context.Context, key string) error {
-	if err := s.pace.wait(ctx); err != nil {
-		return err
-	}
-	_, err := s.client.DeleteObject(ctx, &s3.DeleteObjectInput{Bucket: &s.bucket, Key: &key})
-	return opErr("delete", key, err)
+func (s *Backend) Delete(ctx context.Context, key string) error {
+	_, err := s.client.DeleteObject(ctx, &awss3.DeleteObjectInput{Bucket: &s.bucket, Key: &key})
+	return objstore.OpErr("delete", key, err)
 }
 
 // DeleteMany removes keys. Missing keys are not an error. Empty input is a no-op.
 // A batch DELETE answers 200 even when individual keys failed; Quiet mode only
 // suppresses the successes, so Errors is the real verdict per key.
-func (s *s3Store) DeleteMany(ctx context.Context, keys ...string) error {
-	if err := s.pace.wait(ctx); err != nil {
-		return err
-	}
+func (s *Backend) DeleteMany(ctx context.Context, keys ...string) error {
 	if len(keys) == 0 {
 		return nil
 	}
@@ -280,76 +290,73 @@ func (s *s3Store) DeleteMany(ctx context.Context, keys ...string) error {
 	const batch = 1000
 	for i := 0; i < len(objs); i += batch {
 		end := min(i+batch, len(objs))
-		out, err := s.client.DeleteObjects(ctx, &s3.DeleteObjectsInput{
+		out, err := s.client.DeleteObjects(ctx, &awss3.DeleteObjectsInput{
 			Bucket: &s.bucket,
 			Delete: &types.Delete{Objects: objs[i:end], Quiet: aws.Bool(true)},
 		})
 		if err != nil {
-			return opErr("delete-many", keys[i], err)
+			return objstore.OpErr("delete-many", keys[i], err)
 		}
 		if len(out.Errors) > 0 {
 			e := out.Errors[0]
-			return opErr("delete-many", aws.ToString(e.Key), fmt.Errorf("%s: %s (%d keys failed)", aws.ToString(e.Code), aws.ToString(e.Message), len(out.Errors)))
+			return objstore.OpErr("delete-many", aws.ToString(e.Key), fmt.Errorf("%s: %s (%d keys failed)", aws.ToString(e.Code), aws.ToString(e.Message), len(out.Errors)))
 		}
 	}
 	return nil
 }
 
 // EnsureBucket creates the bucket if missing (dev/test convenience).
-func (s *s3Store) EnsureBucket(ctx context.Context) error {
+func (s *Backend) EnsureBucket(ctx context.Context) error {
 	// Reuse an existing bucket without CreateBucket permission or an AWS
 	// location constraint. Custom endpoints also include regional AWS S3.
-	_, err := s.client.HeadBucket(ctx, &s3.HeadBucketInput{Bucket: &s.bucket})
+	_, err := s.client.HeadBucket(ctx, &awss3.HeadBucketInput{Bucket: &s.bucket})
 	if err == nil {
 		return nil
 	}
 	if code := apiErrorCode(err); code != "NotFound" && code != "NoSuchBucket" {
-		return opErr("head-bucket", s.bucket, err)
+		return objstore.OpErr("head-bucket", s.bucket, err)
 	}
-	_, err = s.client.CreateBucket(ctx, &s3.CreateBucketInput{Bucket: &s.bucket})
+	_, err = s.client.CreateBucket(ctx, &awss3.CreateBucketInput{Bucket: &s.bucket})
 	var owned *types.BucketAlreadyOwnedByYou
 	var exists *types.BucketAlreadyExists
 	if errors.As(err, &owned) || errors.As(err, &exists) {
 		return nil
 	}
-	return opErr("create-bucket", s.bucket, err)
+	return objstore.OpErr("create-bucket", s.bucket, err)
 }
 
 // DropBucket empties the bucket (List + DeleteMany, both already bounded
 // by the client timeout) and deletes it. A bucket that is already gone is
 // not an error.
-func (s *s3Store) DropBucket(ctx context.Context) error {
+func (s *Backend) DropBucket(ctx context.Context) error {
 	for {
 		keys, _, err := s.ListPage(ctx, "", "", 1000)
 		if err != nil {
-			return opErr("drop-bucket", s.bucket, err)
+			return objstore.OpErr("drop-bucket", s.bucket, err)
 		}
 		if len(keys) == 0 {
 			break
 		}
 		if err := s.DeleteMany(ctx, keys...); err != nil {
-			return opErr("drop-bucket", s.bucket, err)
+			return objstore.OpErr("drop-bucket", s.bucket, err)
 		}
 	}
-	_, err := s.client.DeleteBucket(ctx, &s3.DeleteBucketInput{Bucket: &s.bucket})
+	_, err := s.client.DeleteBucket(ctx, &awss3.DeleteBucketInput{Bucket: &s.bucket})
 	var nsb *types.NoSuchBucket
 	if errors.As(err, &nsb) {
 		return nil
 	}
-	return opErr("drop-bucket", s.bucket, err)
+	return objstore.OpErr("drop-bucket", s.bucket, err)
 }
 
 // GetWithETag returns the object and its ETag for conditional replacement.
-func (s *s3Store) GetWithETag(ctx context.Context, key string) ([]byte, string, error) {
-	if err := s.pace.wait(ctx); err != nil {
-		return nil, "", err
-	}
-	out, err := s.client.GetObject(ctx, &s3.GetObjectInput{Bucket: &s.bucket, Key: &key})
+func (s *Backend) GetWithETag(ctx context.Context, key string) ([]byte, string, error) {
+	out, err := s.client.GetObject(ctx, &awss3.GetObjectInput{Bucket: &s.bucket, Key: &key})
 	if err != nil {
 		if apiErrorCode(err) == "NoSuchKey" {
-			return nil, "", opErr("get-with-etag", key, ErrNotFound)
+			return nil, "", objstore.OpErr("get-with-etag", key, objstore.ErrNotFound)
 		}
-		return nil, "", opErr("get-with-etag", key, err)
+		return nil, "", objstore.OpErr("get-with-etag", key, err)
 	}
 	data, err := readBody("get-with-etag", key, out.Body, out.ContentLength)
 	if err != nil {
@@ -363,11 +370,8 @@ func (s *s3Store) GetWithETag(ctx context.Context, key string) ([]byte, string, 
 }
 
 // GetIfChanged uses a single conditional request, including the 304 path.
-func (s *s3Store) GetIfChanged(ctx context.Context, key, etag string) ([]byte, string, bool, error) {
-	if err := s.pace.wait(ctx); err != nil {
-		return nil, "", false, err
-	}
-	in := &s3.GetObjectInput{Bucket: &s.bucket, Key: &key}
+func (s *Backend) GetIfChanged(ctx context.Context, key, etag string) ([]byte, string, bool, error) {
+	in := &awss3.GetObjectInput{Bucket: &s.bucket, Key: &key}
 	if etag != "" {
 		in.IfNoneMatch = &etag
 	}
@@ -378,9 +382,9 @@ func (s *s3Store) GetIfChanged(ctx context.Context, key, etag string) ([]byte, s
 			return nil, etag, true, nil
 		}
 		if apiErrorCode(err) == "NoSuchKey" {
-			err = ErrNotFound
+			err = objstore.ErrNotFound
 		}
-		return nil, "", false, opErr("get-if-changed", key, err)
+		return nil, "", false, objstore.OpErr("get-if-changed", key, err)
 	}
 	data, err := readBody("get-if-changed", key, out.Body, out.ContentLength)
 	if err != nil {
@@ -392,54 +396,54 @@ func (s *s3Store) GetIfChanged(ctx context.Context, key, etag string) ([]byte, s
 // PutIfMatch replaces key only if its current ETag equals etag — compare-and-
 // swap, the manifest-swap primitive. (false, nil) = precondition failed: the
 // object changed under us, or no longer exists. ConditionalRequestConflict
-// is an error, as in PutIfAbsent: the CAS was never evaluated.
+// is an error wrapping objstore.ErrConflict, as in PutIfAbsent: the CAS
+// was never evaluated.
 //
 // The ETag is sent without its surrounding quotes. S3 returns ETags quoted
 // and accepts either form in If-Match, but Ceph RGW (Hetzner Object Storage)
 // compares the quoted header literally against the bare stored value and
 // answers 412 for every conditional PUT, which would make manifest CAS
-// publication impossible there.
-func (s *s3Store) PutIfMatch(ctx context.Context, key string, data []byte, etag string) (bool, error) {
-	if err := s.pace.wait(ctx); err != nil {
-		return false, err
-	}
+// publication impossible there. Cloudflare R2 documents If-Match per RFC
+// 9110 (quoted); whether it accepts the unquoted form is unverified, and
+// TestR2 is the check. TestS3PutIfMatchSendsUnquotedETag pins the header.
+func (s *Backend) PutIfMatch(ctx context.Context, key string, data []byte, etag string) (bool, error) {
 	in := s.putInput(key, data)
 	in.IfMatch = aws.String(strings.Trim(etag, `"`))
 	_, err := s.client.PutObject(ctx, in)
 	if err != nil {
-		if code := apiErrorCode(err); code == "PreconditionFailed" || code == "NoSuchKey" {
+		switch apiErrorCode(err) {
+		case "PreconditionFailed", "NoSuchKey":
 			return false, nil
+		case "ConditionalRequestConflict":
+			return false, objstore.OpErr("put-if-match", key, fmt.Errorf("%w: %v", objstore.ErrConflict, err))
 		}
-		return false, opErr("put-if-match", key, err)
+		return false, objstore.OpErr("put-if-match", key, err)
 	}
 	return true, nil
 }
 
-func (s *s3Store) GetRange(ctx context.Context, key string, offset, length int64) ([]byte, error) {
-	if err := s.pace.wait(ctx); err != nil {
-		return nil, err
-	}
+func (s *Backend) GetRange(ctx context.Context, key string, offset, length int64) ([]byte, error) {
 	span := fmt.Sprintf("bytes=%d-%d", offset, offset+length-1)
-	out, err := s.client.GetObject(ctx, &s3.GetObjectInput{Bucket: &s.bucket, Key: &key, Range: &span})
+	out, err := s.client.GetObject(ctx, &awss3.GetObjectInput{Bucket: &s.bucket, Key: &key, Range: &span})
 	if err != nil {
 		switch apiErrorCode(err) {
 		case "NoSuchKey":
-			err = ErrNotFound
+			err = objstore.ErrNotFound
 		case "InvalidRange":
-			err = ErrRange
+			err = objstore.ErrRange
 		}
-		return nil, opErr("get-range", key, err)
+		return nil, objstore.OpErr("get-range", key, err)
 	}
 	// Check both the returned range and length: a server ignoring Range must
 	// not turn a block read into an unbounded whole-object download.
 	var first, last, total int64
 	if out.ContentRange == nil || out.ContentLength == nil || *out.ContentLength != length {
 		out.Body.Close()
-		return nil, opErr("get-range", key, ErrRange)
+		return nil, objstore.OpErr("get-range", key, objstore.ErrRange)
 	}
 	if n, _ := fmt.Sscanf(*out.ContentRange, "bytes %d-%d/%d", &first, &last, &total); n != 3 || first != offset || last != offset+length-1 || total <= last {
 		out.Body.Close()
-		return nil, opErr("get-range", key, ErrRange)
+		return nil, objstore.OpErr("get-range", key, objstore.ErrRange)
 	}
 	return readBody("get-range", key, out.Body, out.ContentLength)
 }

@@ -1,4 +1,4 @@
-package objstore
+package s3
 
 import (
 	"context"
@@ -7,7 +7,7 @@ import (
 )
 
 func TestEndpointAllowList(t *testing.T) {
-	if _, err := NewConfigured(context.Background(), Config{Endpoint: "https://evil.example", Bucket: "x", AllowedEndpoints: []string{"https://s3.example"}}); !errors.Is(err, ErrEndpointDenied) {
+	if _, err := New(context.Background(), Config{Endpoint: "https://evil.example", Bucket: "x", AllowedEndpoints: []string{"https://s3.example"}}); !errors.Is(err, ErrEndpointDenied) {
 		t.Fatalf("denied endpoint = %v", err)
 	}
 }
@@ -19,7 +19,7 @@ func TestSSEPutInput(t *testing.T) {
 		{"AES256", ""},
 		{"aws:kms", "arn:aws:kms:us-east-1:1:key/x"},
 	} {
-		s := &s3Store{sse: tc.mode, kmsKeyID: tc.key}
+		s := &Backend{sse: tc.mode, kmsKeyID: tc.key}
 		in := s.putInput("k", []byte("v"))
 		if string(in.ServerSideEncryption) != tc.mode || tc.key != "" && *in.SSEKMSKeyId != tc.key {
 			t.Fatalf("mode %q input = %+v", tc.mode, in)

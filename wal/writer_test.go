@@ -15,6 +15,8 @@ import (
 	"time"
 
 	"github.com/axiomhq/objstore"
+	"github.com/axiomhq/objstore/fs"
+	"github.com/axiomhq/objstore/s3"
 	"github.com/axiomhq/objstore/storetest"
 )
 
@@ -323,10 +325,7 @@ func TestWriterRejectsOversizedRecordBeforePublish(t *testing.T) {
 	} {
 		t.Run(name, func(t *testing.T) {
 			ctx := context.Background()
-			s, err := objstore.New(ctx, "file://"+t.TempDir(), "wal")
-			if err != nil {
-				t.Fatal(err)
-			}
+			s := fs.Open(t.TempDir(), "wal", objstore.Config{})
 			if err := s.EnsureBucket(ctx); err != nil {
 				t.Fatal(err)
 			}
@@ -338,7 +337,7 @@ func TestWriterRejectsOversizedRecordBeforePublish(t *testing.T) {
 				}
 			})
 			defer w.Close()
-			err = w.Append(ctx, records)
+			err := w.Append(ctx, records)
 			if err == nil || !strings.Contains(err.Error(), "exceeds page size limit") {
 				t.Fatalf("append: %v, want page size error", err)
 			}
@@ -381,7 +380,7 @@ func TestWriterUnresolvedOnClose(t *testing.T) {
 	t.Setenv("AWS_ACCESS_KEY_ID", "x")
 	t.Setenv("AWS_SECRET_ACCESS_KEY", "x")
 	t.Setenv("AWS_REGION", "us-east-1")
-	s, err := objstore.New(context.Background(), "http://127.0.0.1:1", "nowhere")
+	s, err := s3.Open(context.Background(), s3.Config{Endpoint: "http://127.0.0.1:1", Bucket: "nowhere"}, objstore.Config{})
 	if err != nil {
 		t.Fatal(err)
 	}

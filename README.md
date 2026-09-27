@@ -5,11 +5,15 @@ go get github.com/axiomhq/objstore
 ```
 
 Object storage with compare-and-swap, for Go. One `Store` over an S3 bucket
-(AWS, MinIO, any S3-compatible service) or a durable local directory, with:
+(`objstore/s3`: AWS, MinIO, Ceph, Hetzner, and Cloudflare R2 at
+`https://<account-id>.r2.cloudflarestorage.com` with `AWS_REGION=auto`),
+Google Cloud Storage (`objstore/gcs`), or a durable local directory
+(`objstore/fs`), with:
 
 - conditional PUT and GET, and the ETag with the body
 - paginated list, delimited list, batch delete
-- a `file://` store that fsyncs every object and writes large ones back in chunks, so a small urgent write never waits behind a big one
+- one package per provider, so a binary links only the SDKs it uses
+- a file store (`objstore/fs`) that fsyncs every object and writes large ones back in chunks, so a small urgent write never waits behind a big one
 - envelope encryption per name, with local, AWS KMS and GCP KMS key providers (`objstore/kms`)
 - fault injection and metering for tests (`objstore/storetest`)
 - a write-ahead log: one entry per second, conditional PUT, nonce read-back (`objstore/wal`)
@@ -19,8 +23,9 @@ Object storage with compare-and-swap, for Go. One `Store` over an S3 bucket
 
 ## Use
 
-1. Open a store: `s, err := objstore.New(ctx, "https://s3.us-east-1.amazonaws.com", "my-bucket")`.
-   Use `"file:///var/lib/data"` for a local store. `objstore.NewConfigured(ctx, objstore.Config{...})` adds SSE, rate limits, timeouts and a write bound.
+1. Open a store: `s, err := s3.Open(ctx, s3.Config{Endpoint: "https://s3.us-east-1.amazonaws.com", Bucket: "my-bucket"}, objstore.Config{})`.
+   For a local store: `s := fs.Open("/var/lib/data", "bucket", objstore.Config{})`.
+   `s3.Config` adds SSE, an endpoint allow-list and a request timeout; `objstore.Config` adds rate limits and a write bound.
 2. Create the bucket if you need to: `s.EnsureBucket(ctx)`.
 3. Write once: `created, err := s.PutIfAbsent(ctx, key, data)`. `created` is false when the key existed.
 4. Swap: `body, etag, err := s.GetWithETag(ctx, key)`, then `ok, err := s.PutIfMatch(ctx, key, next, etag)`. `ok` false means someone else won: re-read and retry.
@@ -29,6 +34,13 @@ Object storage with compare-and-swap, for Go. One `Store` over an S3 bucket
 A missing key returns an error wrapping `objstore.ErrNotFound`. Mark a
 context with `objstore.Urgent(ctx)` to skip pacing and the write bound, for
 heartbeats and log commits.
+
+### Migrating from v0.4
+
+- `objstore.New(ctx, endpoint, bucket)` → `s3.Open(ctx, s3.Config{Endpoint: endpoint, Bucket: bucket}, objstore.Config{})`, or `fs.Open(root, bucket, objstore.Config{})` for a `file://` endpoint.
+- `Config.SSE`, `KMSKeyID`, `AllowedEndpoints`, `RequestTimeout` → `s3.Config`. `objstore.Config` keeps `RequestsPerSecond` and `MaxInflightWrites`.
+- `Store.SSE()` → `(*s3.Backend).SSE()` (from `s3.New`). `objstore.ErrEndpointDenied` → `s3.ErrEndpointDenied`.
+- An S3 409 `ConditionalRequestConflict` now wraps `objstore.ErrConflict`: retry, it is not a lost race.
 
 ## Methods
 
@@ -134,9 +146,16 @@ go test -race ./...
 OBJSTORE_TEST_S3=http://localhost:9000 go test -race ./...   # the same suite against MinIO
 ```
 
-Without `OBJSTORE_TEST_S3` every suite runs on a `file://` bucket in a temp
+Without `OBJSTORE_TEST_S3` every suite runs on a file bucket in a temp
 directory; the S3 client's error and paging mapping runs against a fake
-server either way.
+server either way. `storetest.Conformance(t, s)` is the suite every backend
+passes; run it on your own `objstore.Backend` via `objstore.Open`.
+
+Real providers, each skipped when its variable is unset:
+
+- `OBJSTORE_TEST_S3`: S3 endpoint, e.g. MinIO at `http://localhost:9000` (defaults to `minioadmin` credentials when `AWS_ACCESS_KEY_ID` is unset).
+- `OBJSTORE_TEST_R2_ENDPOINT`: `https://<account-id>.r2.cloudflarestorage.com`, with an R2 API token in `AWS_ACCESS_KEY_ID` / `AWS_SECRET_ACCESS_KEY` and `AWS_REGION=auto`. Runs `TestR2` in `./s3`.
+- `OBJSTORE_TEST_GCS_PROJECT`: a GCP project where Application Default Credentials can create buckets. Runs `TestConformanceReal` in `./gcs` against a fresh `objstore-test-<nanos>` bucket, dropped afterwards. `TestConformance` runs on an in-process fake-gcs-server with no variable.
 
 ## License
 

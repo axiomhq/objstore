@@ -632,7 +632,7 @@ func (s *Store) encryptedRange(ctx context.Context, object string, offset, lengt
 		return nil, err
 	}
 	if offset > size || length > size-offset {
-		return nil, opErr("get-range", object, ErrRange)
+		return nil, OpErr("get-range", object, ErrRange)
 	}
 	first := offset / encryptedBlockSize
 	last := (offset+length-1)/encryptedBlockSize + 1

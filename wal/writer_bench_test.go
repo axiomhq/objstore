@@ -14,6 +14,7 @@ import (
 	"time"
 
 	"github.com/axiomhq/objstore"
+	"github.com/axiomhq/objstore/fs"
 	"github.com/axiomhq/objstore/storetest"
 )
 
@@ -69,10 +70,7 @@ func BenchmarkWALGroupCommit(b *testing.B) {
 func benchmarkGroupCommitRun(b *testing.B, backend string, interval time.Duration, callers, size int) {
 	b.Helper()
 	ctx := context.Background()
-	s, err := objstore.New(ctx, "file://"+b.TempDir(), "benchmark")
-	if err != nil {
-		b.Fatal(err)
-	}
+	s := fs.Open(b.TempDir(), "benchmark", objstore.Config{})
 	if err := s.EnsureBucket(ctx); err != nil {
 		b.Fatal(err)
 	}
@@ -145,10 +143,7 @@ func BenchmarkWALGroupCommitUncontended(b *testing.B) {
 	for _, size := range []int{512, 500_000} {
 		b.Run(fmt.Sprintf("%dB", size), func(b *testing.B) {
 			for range b.N {
-				s, err := objstore.New(context.Background(), "file://"+b.TempDir(), "uncontended")
-				if err != nil {
-					b.Fatal(err)
-				}
+				s := fs.Open(b.TempDir(), "uncontended", objstore.Config{})
 				if err := s.EnsureBucket(context.Background()); err != nil {
 					b.Fatal(err)
 				}
@@ -210,10 +205,7 @@ func benchmarkCommitUnderBulkLoad(b *testing.B, callers, bulk int, length time.D
 		}
 		defer os.RemoveAll(dir)
 	}
-	s, err := objstore.New(ctx, "file://"+dir, "bench")
-	if err != nil {
-		b.Fatal(err)
-	}
+	s := fs.Open(dir, "bench", objstore.Config{})
 	if err := s.EnsureBucket(ctx); err != nil {
 		b.Fatal(err)
 	}
