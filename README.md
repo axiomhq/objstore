@@ -136,7 +136,9 @@ OBJSTORE_TEST_S3=http://localhost:9000 go test -race ./...   # the same suite ag
 
 Without `OBJSTORE_TEST_S3` every suite runs on a `file://` bucket in a temp
 directory; the S3 client's error and paging mapping runs against a fake
-server either way.
+server either way. The S3 run takes its credentials from `AWS_ACCESS_KEY_ID`,
+`AWS_SECRET_ACCESS_KEY` and `AWS_REGION`; unset, they default to MinIO's
+`minioadmin`/`minioadmin`/`us-east-1`.
 
 ## License
 

@@ -65,6 +65,7 @@ func TestReadBodyLengthAndFinalErrors(t *testing.T) {
 		{name: "empty", length: 0, finalErr: io.EOF},
 		{name: "unknown", unknown: true, data: "aZ123", finalErr: io.EOF},
 		{name: "short", length: 6, data: "aZ123", finalErr: io.EOF},
+		{name: "nothing arrived", length: 6, finalErr: io.EOF},
 		{name: "long", length: 4, data: "aZ123", finalErr: io.EOF},
 		{name: "negative", length: -1, data: "aZ123", finalErr: io.EOF},
 		{name: "absurd header", length: 1<<63 - 1, data: "aZ123", finalErr: io.EOF},
@@ -85,6 +86,9 @@ func TestReadBodyLengthAndFinalErrors(t *testing.T) {
 			}
 			if err == nil && string(got) != tc.data {
 				t.Fatalf("body=%q, want %q", got, tc.data)
+			}
+			if err == nil && !tc.unknown && cap(got) != len(got) {
+				t.Fatalf("cap=%d, len=%d: callers cache the slice, slack stays pinned", cap(got), len(got))
 			}
 			if err != nil && (got != nil || !strings.Contains(err.Error(), "get-range pack")) {
 				t.Fatalf("data=%q err=%v", got, err)

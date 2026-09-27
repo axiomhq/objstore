@@ -120,20 +120,30 @@ func opErr(op, key string, err error) error {
 // comparison is free and turns a silent truncation into a named error.
 func readBody(op, key string, body io.ReadCloser, contentLength *int64) ([]byte, error) {
 	defer body.Close()
-	var data []byte
-	var err error
-	if contentLength != nil && *contentLength > 0 && *contentLength <= 64<<20 {
-		// Avoid repeated buffer growth for pack ranges. Cap speculative
-		// allocation: a bogus ContentLength must not cause an enormous make.
-		// ReadFrom needs MinRead slack for its final EOF/checksum read, even
-		// when the body exactly matches the advertised length.
-		var buf bytes.Buffer
-		buf.Grow(int(*contentLength) + bytes.MinRead)
-		_, err = buf.ReadFrom(body)
-		data = buf.Bytes()
-	} else {
-		data, err = io.ReadAll(body)
+	if contentLength != nil && *contentLength >= 0 && *contentLength <= 64<<20 {
+		// One exact-size buffer, as fs.go does: bytes.Buffer's MinRead slack
+		// stayed on every returned slice, and caches holding small blocks
+		// pinned 512 spare bytes each. Cap speculative allocation: a bogus
+		// ContentLength must not cause an enormous make.
+		data := make([]byte, *contentLength)
+		n, err := io.ReadFull(body, data)
+		if errors.Is(err, io.ErrUnexpectedEOF) || errors.Is(err, io.EOF) {
+			return nil, opErr(op, key, fmt.Errorf("short read: got %d bytes, ContentLength says %d", n, *contentLength))
+		}
+		if err != nil {
+			return nil, opErr(op, key, err)
+		}
+		// Read on to EOF: the SDK validates its checksum there, and a body
+		// longer than ContentLength is as wrong as a short one.
+		var extra [1]byte
+		if _, err := io.ReadFull(body, extra[:]); err == nil {
+			return nil, opErr(op, key, fmt.Errorf("long read: body exceeds ContentLength %d", *contentLength))
+		} else if !errors.Is(err, io.EOF) {
+			return nil, opErr(op, key, err)
+		}
+		return data, nil
 	}
+	data, err := io.ReadAll(body)
 	if err != nil {
 		return nil, opErr(op, key, err)
 	}

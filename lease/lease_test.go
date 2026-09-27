@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"os"
 	"testing"
 	"time"
 
@@ -13,7 +14,13 @@ import (
 func TestLeaseAcquireRenewExpireTakeover(t *testing.T) {
 	s, f := storetest.NewFaulty(t)
 	ctx := context.Background()
-	const ttl = 300 * time.Millisecond
+	// Every wait below is a multiple of ttl, and a renewal gets ttl/2 per
+	// attempt: on a real S3 endpoint that must clear the store's tail
+	// latency (a dev MinIO's p99 small PUT was 144ms, its max 1.5s).
+	ttl := 300 * time.Millisecond
+	if os.Getenv("OBJSTORE_TEST_S3") != "" {
+		ttl = 2 * time.Second
+	}
 
 	// First acquire: PutIfAbsent, nothing there yet.
 	a, err := Acquire(ctx, s, "a/lease", "owner-a", ttl)
