@@ -80,10 +80,10 @@ Concurrent `Append`s share one entry, at most one per `WithCommitInterval` (defa
 | `cache.ByteCache` | striped LRU under one byte budget; decoded values ride on their bytes (`PutDecoded`, charged via `cache.Sizer`) |
 | `cache.Disk` | disposable disk tier, 4 KiB block checksums, pins, inactivity expiry |
 | `cache.Keys` | tells the cache which keys are log pages (own share), low priority, or ranged |
-| `cache.WithRequestStats` | per-request hits and misses through every tier |
+| `cache.WithRequestStats` | per-request lookups through every tier as memory hits, disk hits and loads (`ClassCounts`, `HitRatio`); `Cache.ClassCounts` is the process's |
 | `rangeread.Plan` | unions and coalesces extents under gap, extra-byte and range limits |
 
-Objects are immutable: the cache never re-validates a key. A key under `ns/<name>/` belongs to namespace `<name>` for `InvalidateNamespace`, pins and expiry.
+`Cache.Put` writes through to the memory and disk tiers, so ranged reads of an object this process wrote are cache hits. Objects are immutable: the cache never re-validates a key. A key under `ns/<name>/` belongs to namespace `<name>` for `InvalidateNamespace`, pins and expiry.
 
 ## Encryption
 

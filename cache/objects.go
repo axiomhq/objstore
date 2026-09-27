@@ -96,14 +96,18 @@ func (c *Cache) InvalidateNamespace(name string) {
 
 func (c *Cache) Close() { c.Disk.Close() }
 
-// Put writes an immutable object and caches it on the way past, so the
-// process that published it never re-reads it.
+// Put writes an immutable object and caches it on the way past, in memory
+// and on disk, so the process that published it never re-reads it: the
+// memory entry of a large object may be low priority (Keys.Low) and go
+// first, and the range reads after that (CachedRange) find it on disk.
 func (c *Cache) Put(ctx context.Context, key string, data []byte) error {
 	if err := c.Store.Put(ctx, key, data); err != nil {
 		return err
 	}
 	memory := c.ByteCacheFor(key)
-	memory.Put(key, data, memory.Generation.Load())
+	generation := memory.Generation.Load()
+	memory.Put(key, data, generation)
+	c.Disk.Put(DiskKey(key, generation), data)
 	return nil
 }
 
@@ -136,37 +140,45 @@ func (c *Cache) FetchWith(ctx context.Context, key string, load func(context.Con
 	return c.FetchCached(ctx, key, load, true)
 }
 
-// Physical coalesced ranges are internal parents of logical cache entries.
-// Their lookup must not charge a second hit/miss for the same logical read.
-// Store-tier transfers and Range* counters still account for physical I/O.
-func (c *Cache) FetchCached(ctx context.Context, key string, load func(context.Context) ([]byte, error), logical bool) ([]byte, error) {
-	return c.fetchCached(ctx, key, load, logical, 0)
-}
-
 // FetchCachedRange caches a decoded single-child range while charging the
 // store tier for its physical length instead of the decoded child's length.
-func (c *Cache) FetchCachedRange(ctx context.Context, key string, storedBytes int, load func(context.Context) ([]byte, error)) ([]byte, error) {
-	return c.fetchCached(ctx, key, load, false, storedBytes)
+// It counts nothing: the range reader, which already missed key in both
+// tiers, counts the returned outcome, who answered it in the end.
+func (c *Cache) FetchCachedRange(ctx context.Context, key string, storedBytes int, load func(context.Context) ([]byte, error)) ([]byte, Outcome, error) {
+	b, o, _, err := c.fetchCached(ctx, key, load, false, storedBytes)
+	return b, o, err
 }
 
-func (c *Cache) fetchCached(ctx context.Context, key string, load func(context.Context) ([]byte, error), logical bool, storedBytes int) ([]byte, error) {
+// FetchCached is FetchWith for a caller that counts its own lookup:
+// logical=false charges no outcome and peeks rather than touching the
+// memory tier's recency.
+func (c *Cache) FetchCached(ctx context.Context, key string, load func(context.Context) ([]byte, error), logical bool) ([]byte, error) {
+	if b, ok := Scoped(ctx, key); ok { // the stage paid for it already
+		return b, nil
+	}
+	b, o, owner, err := c.fetchCached(ctx, key, load, logical, 0)
+	if err == nil && logical {
+		c.NoteAs(ctx, key, o, owner)
+	}
+	return b, err
+}
+
+// fetchCached returns key's bytes, who answered this caller (a caller that
+// waited on another's load is answered from memory), and whether this
+// lookup owns the request's miss of key (MarkMissed).
+func (c *Cache) fetchCached(ctx context.Context, key string, load func(context.Context) ([]byte, error), logical bool, storedBytes int) ([]byte, Outcome, bool, error) {
 	memory := c.ByteCacheFor(key)
 	if b, ok := Scoped(ctx, key); ok {
-		return b, nil
+		return b, MemoryHit, false, nil
 	}
 	lookup := memory.Peek
 	if logical {
 		lookup = memory.Get
 	}
 	if b, ok := lookup(key); ok {
-		if logical {
-			c.RecordRequestHit(ctx, key, true)
-		}
-		return b, nil
+		return b, MemoryHit, false, nil
 	}
-	if logical {
-		c.classes.misses[c.keys.class(key)].Add(1) // the request's is charged below, once the flight says
-	}
+	owner := logical && MarkMissed(ctx, key)
 	generation := memory.Generation.Load()
 	flightKey := DiskKey(key, generation)
 	flightGroupKey := flightKey
@@ -177,12 +189,12 @@ func (c *Cache) fetchCached(ctx context.Context, key string, load func(context.C
 		flightGroupKey += "\x00range-child"
 	}
 	type fetched struct {
-		data   []byte
-		hit    bool
-		disk   bool // the disk tier answered
-		memory bool // a concurrent fill had put it in memory
+		data    []byte
+		outcome Outcome
 	}
+	var led atomic.Bool // this caller ran the flight: its outcome is the load's
 	ch := c.flight.DoChan(flightGroupKey, func() (v any, err error) {
+		led.Store(true)
 		// DoChan re-raises a loader panic on singleflight's own goroutine,
 		// where nothing can recover it: convert it into every waiter's error.
 		defer func() {
@@ -190,15 +202,12 @@ func (c *Cache) fetchCached(ctx context.Context, key string, load func(context.C
 				v, err = nil, fmt.Errorf("cache: fetch %s: panic: %v\n%s", key, p, debug.Stack())
 			}
 		}()
-		if b, ok := memory.Peek(key); ok {
-			return fetched{data: b, hit: true, memory: true}, nil
+		if b, ok := memory.Peek(key); ok { // a concurrent fill
+			return fetched{b, MemoryHit}, nil
 		}
 		if b, ok := c.Disk.Get(flightKey); ok {
-			if logical {
-				c.noteDiskHit(key)
-			}
 			memory.Put(key, b, generation)
-			return fetched{data: b, hit: true, disk: true}, nil
+			return fetched{b, DiskHit}, nil
 		}
 		parent, _ := ctx.Value(loadSourceKey{}).(*loadSource)
 		source := &loadSource{parent: parent}
@@ -206,38 +215,35 @@ func (c *Cache) fetchCached(ctx context.Context, key string, load func(context.C
 		if err != nil {
 			return nil, err
 		}
-		fromCache := source.cached.Load() && !source.stored.Load()
-		if !fromCache { // a slice of an object a tier holds is on disk already
+		outcome := Load
+		if source.cached.Load() && !source.stored.Load() {
+			// Cut from a whole object a tier holds, which is on disk
+			// already whichever tier answered.
+			outcome = MemoryHit
+			if source.disk.Load() {
+				outcome = DiskHit
+			}
+		} else {
 			c.Disk.Put(flightKey, b)
 		}
 		memory.Put(key, b, generation)
-		return fetched{data: b, hit: fromCache}, nil
+		return fetched{b, outcome}, nil
 	})
 	select {
 	case r := <-ch:
 		if r.Err != nil {
-			return nil, r.Err
+			return nil, Load, false, r.Err
 		}
 		got := r.Val.(fetched)
-		if logical {
-			if got.hit {
-				c.RecordRequestHit(ctx, key, got.memory)
-			} else {
-				RecordRequestMiss(ctx, key)
-			}
-			if !got.memory {
-				recordRequestMiss(ctx, c.keys.class(key))
-			}
-			if got.disk {
-				recordRequestDiskHit(ctx, c.keys.class(key))
-			}
-		}
-		if !got.hit {
+		if got.outcome == Load {
 			NoteStoreLoad(ctx, key)
 		}
-		return got.data, nil
+		if !led.Load() {
+			return got.data, MemoryHit, owner, nil // another caller's load, counted there
+		}
+		return got.data, got.outcome, owner, nil
 	case <-ctx.Done():
-		return nil, ctx.Err()
+		return nil, Load, false, ctx.Err()
 	}
 }
 
@@ -249,7 +255,7 @@ func (c *Cache) FromDisk(ctx context.Context, key string) ([]byte, bool) {
 	generation := memory.Generation.Load()
 	b, ok := c.Disk.Get(DiskKey(key, generation))
 	if ok {
-		c.NoteDiskServed(ctx, key)
+		c.Note(ctx, key, DiskHit)
 		memory.Put(key, b, generation)
 	}
 	return b, ok
@@ -281,27 +287,32 @@ func (c *Cache) CachedRange(key string, off, n int64) (b []byte, fromDisk, ok bo
 }
 
 // loadSource records, for every enclosing fetchCached load, whether its
-// work was served from a whole object already in a cache tier and whether
-// it reached object storage. A load that only cut its bytes from a cached
-// object (an extent of an object a tier holds, e.g. after a warm) is a
-// request hit; any store read, or a load that reports neither, is a miss.
+// work was served from a whole object already in a cache tier (and whether
+// that tier was the disk) and whether it reached object storage. A load
+// that only cut its bytes from a cached object (a range of an object this
+// process wrote, say) is a hit of that tier; any store read, or a load
+// that reports neither, is a load.
 type loadSource struct {
-	cached, stored atomic.Bool
-	parent         *loadSource
+	cached, disk, stored atomic.Bool
+	parent               *loadSource
 }
 
 type loadSourceKey struct{}
 
 // MarkServedFromCache tells the enclosing loads their bytes came from
-// object, which a cache tier held. An object this same request read from
-// the store is no cache hit for it: its slices stay misses.
-func MarkServedFromCache(ctx context.Context, object string) {
+// object, which a cache tier held (the disk tier: fromDisk). An object this
+// same request read from the store is no cache hit for it: its slices stay
+// loads.
+func MarkServedFromCache(ctx context.Context, object string, fromDisk bool) {
 	if loadedByRequest(ctx, object) {
 		markStoreRead(ctx)
 		return
 	}
 	for f, _ := ctx.Value(loadSourceKey{}).(*loadSource); f != nil; f = f.parent {
 		f.cached.Store(true)
+		if fromDisk {
+			f.disk.Store(true)
+		}
 	}
 }
 

@@ -174,3 +174,28 @@ func TestWALPagesHaveTheirOwnBudget(t *testing.T) {
 		t.Fatalf("WAL charge after invalidation = %d", got)
 	}
 }
+
+// TestPutFillsTheDiskTier: an object this process put is on disk as well
+// as in memory, so a range read the memory tier cannot answer (here: a
+// table larger than the whole budget) is a disk hit, not a store read.
+func TestPutFillsTheDiskTier(t *testing.T) {
+	ctx := context.Background()
+	disk, err := NewDisk(t.TempDir(), 1<<20)
+	if err != nil {
+		t.Fatal(err)
+	}
+	c := New(storetest.New(t), 1<<10, disk, Keys{})
+	defer c.Close()
+	key := "ns/x/table/1"
+	data := bytes.Repeat([]byte("table"), 1000)
+	if err := c.Put(ctx, key, data); err != nil {
+		t.Fatal(err)
+	}
+	if _, ok := c.Memory.Peek(key); ok {
+		t.Fatal("a table past the memory budget was cached in memory")
+	}
+	b, fromDisk, ok := c.CachedRange(key, 100, 50)
+	if !ok || !fromDisk || !bytes.Equal(b, data[100:150]) {
+		t.Fatalf("CachedRange after a Put = %q disk %v ok %v, want a disk hit", b, fromDisk, ok)
+	}
+}

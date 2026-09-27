@@ -63,6 +63,7 @@ func (r *Reader) FetchRanges(ctx context.Context, loads []Load) (context.Context
 	results := make(map[string][]byte, len(loads))
 	unique := make(map[string]bool, len(loads))
 	var pending []Load
+	var owners []bool // owners[i]: this lookup owns the request's miss of pending[i] (cache.MarkMissed)
 	var extents []Extent
 	for _, load := range loads {
 		if unique[load.Key] {
@@ -75,18 +76,16 @@ func (r *Reader) FetchRanges(ctx context.Context, loads []Load) (context.Context
 		}
 		memory := r.Objects.ByteCacheFor(load.Key)
 		if b, ok := memory.Peek(load.Key); ok {
-			r.Objects.RecordRequestHit(ctx, load.Key, true)
+			r.Objects.Note(ctx, load.Key, cache.MemoryHit)
 			results[load.Key] = b
 			continue
 		}
 		if b, ok := r.Objects.FromDisk(ctx, load.Key); ok {
-			r.Objects.RecordRequestHit(ctx, load.Key, false)
 			results[load.Key] = b
 			continue
 		}
 		pending = append(pending, load)
-		r.Objects.NoteMiss(ctx, load.Key)
-		cache.RecordRequestMiss(ctx, load.Key)
+		owners = append(owners, cache.MarkMissed(ctx, load.Key))
 		extents = append(extents, load.Extent)
 	}
 	plans, err := Plan(extents, r.Cfg)
@@ -123,10 +122,26 @@ func (r *Reader) FetchRanges(ctx context.Context, loads []Load) (context.Context
 			assembled[i] = make([]byte, load.Length)
 		}
 	}
-	// stored[j]: some range child j was cut from came from the store. A
-	// child cut only from ranges a cache tier held is already on disk
-	// inside its object, and is not written there again.
+	// outcome[j] is who answered child j: a direct child's
+	// FetchCachedRange says, otherwise the worst of the ranges it was cut
+	// from, Load if any came from the store, a memory hit if it joined
+	// another query's read of the parent. stored[j]: some range it
+	// was cut from came from the store; a child cut only from ranges a
+	// cache tier held is already on disk inside its object, and is not
+	// written there again.
 	stored := make([]atomic.Bool, len(pending))
+	outcome := make([]atomic.Int32, len(pending))
+	for j := range outcome {
+		outcome[j].Store(-1)
+	}
+	charge := func(j int, o cache.Outcome) {
+		for {
+			old := outcome[j].Load()
+			if old >= int32(o) || outcome[j].CompareAndSwap(old, int32(o)) {
+				return
+			}
+		}
+	}
 	var started atomic.Bool
 	g, gctx := errgroup.WithContext(ctx)
 	g.SetLimit(r.Cfg.Concurrency)
@@ -137,12 +152,15 @@ func (r *Reader) FetchRanges(ctx context.Context, loads []Load) (context.Context
 				return err
 			}
 			defer r.Memory.Release(plan.Length)
-			// read reports whether its bytes came from the store (true) or
-			// were cut from an object a cache tier holds.
-			read := func(ctx context.Context) ([]byte, bool, error) {
-				if b, _, ok := r.Objects.CachedRange(plan.Object, plan.Offset, plan.Length); ok {
-					cache.MarkServedFromCache(ctx, plan.Object)
-					return bytes.Clone(b), false, nil
+			// read reports who answered: the store (Load), or the memory or
+			// disk tier holding the object its bytes were cut from.
+			read := func(ctx context.Context) ([]byte, cache.Outcome, error) {
+				if b, fromDisk, ok := r.Objects.CachedRange(plan.Object, plan.Offset, plan.Length); ok {
+					cache.MarkServedFromCache(ctx, plan.Object, fromDisk)
+					if fromDisk {
+						return bytes.Clone(b), cache.DiskHit, nil
+					}
+					return bytes.Clone(b), cache.MemoryHit, nil
 				}
 				data, err := r.Objects.Gated(ctx, func(ctx context.Context) ([]byte, error) {
 					if started.CompareAndSwap(false, true) {
@@ -160,28 +178,34 @@ func (r *Reader) FetchRanges(ctx context.Context, loads []Load) (context.Context
 					}
 					return data, err
 				})
-				return data, true, err
+				return data, cache.Load, err
 			}
 			var data []byte
-			var fromStore bool
+			var src, counted cache.Outcome
 			var err error
 			if child >= 0 && pending[child].Transient {
-				data, _, err = read(gctx)
+				data, src, err = read(gctx)
+				if err == nil {
+					charge(child, src)
+				}
 			} else if child >= 0 {
 				load := pending[child]
-				data, err = r.Objects.FetchCachedRange(gctx, load.Key, int(plan.Length), func(ctx context.Context) ([]byte, error) {
+				data, src, err = r.Objects.FetchCachedRange(gctx, load.Key, int(plan.Length), func(ctx context.Context) ([]byte, error) {
 					stored, _, err := read(ctx)
 					if err != nil || load.Decode == nil {
 						return stored, err
 					}
 					return load.Decode(stored)
 				})
+				if err == nil {
+					charge(child, src)
+				}
 			} else {
 				// A coalesced parent is not cached: its children are, and
 				// retaining it beside them halves the room the children
 				// have. Concurrent cold reads planning the
 				// same parent still share its one GET.
-				data, fromStore, err = r.sharedParent(gctx, plan.Extent, read)
+				data, src, counted, err = r.sharedParent(gctx, plan.Extent, read)
 			}
 			if err != nil {
 				return err
@@ -197,7 +221,8 @@ func (r *Reader) FetchRanges(ctx context.Context, loads []Load) (context.Context
 				lo, hi := max(plan.Offset, load.Offset), min(plan.Offset+plan.Length, load.Offset+load.Length)
 				if lo < hi {
 					copy(assembled[j][lo-load.Offset:hi-load.Offset], data[lo-plan.Offset:hi-plan.Offset])
-					if fromStore {
+					charge(j, counted)
+					if src == cache.Load {
 						stored[j].Store(true)
 					}
 				}
@@ -220,6 +245,9 @@ func (r *Reader) FetchRanges(ctx context.Context, loads []Load) (context.Context
 			}
 		}
 		memory.Missed(load.Key)
+		if o := outcome[i].Load(); o >= 0 {
+			r.Objects.NoteAs(ctx, load.Key, cache.Outcome(o), owners[i])
+		}
 		if !direct[i] && !load.Transient {
 			if stored[i].Load() {
 				r.Objects.Disk.Put(cache.DiskKey(load.Key, generation), data)
@@ -232,21 +260,23 @@ func (r *Reader) FetchRanges(ctx context.Context, loads []Load) (context.Context
 }
 
 type parentRead struct {
-	data      []byte
-	fromStore bool
+	data []byte
+	src  cache.Outcome
 }
 
 // sharedParent runs read once for concurrent identical coalesced parents
-// and hands every waiter the same bytes, which callers only copy out of.
+// and hands every waiter the same bytes, which callers only copy out of,
+// with who answered the read and the outcome this caller counts: its own
+// read's, or a memory hit for a waiter on another's.
 // Nothing is retained after the last waiter. The read runs under the
 // leader's context, so its error may be the leader's own (a cancellation, a
 // per-request budget): a follower that gets one retries once, as a fresh
 // shared flight under its own context, rather than inherit it.
-func (r *Reader) sharedParent(ctx context.Context, x Extent, read func(context.Context) ([]byte, bool, error)) ([]byte, bool, error) {
+func (r *Reader) sharedParent(ctx context.Context, x Extent, read func(context.Context) ([]byte, cache.Outcome, error)) (data []byte, src, counted cache.Outcome, err error) {
 	return r.sharedParentOnce(ctx, x, read, false)
 }
 
-func (r *Reader) sharedParentOnce(ctx context.Context, x Extent, read func(context.Context) ([]byte, bool, error), retried bool) ([]byte, bool, error) {
+func (r *Reader) sharedParentOnce(ctx context.Context, x Extent, read func(context.Context) ([]byte, cache.Outcome, error), retried bool) (data []byte, src, counted cache.Outcome, err error) {
 	key := x.Object + "\x00" + strconv.FormatInt(x.Offset, 10) + "+" + strconv.FormatInt(x.Length, 10)
 	var led atomic.Bool
 	ch := r.parents.DoChan(key, func() (v any, err error) {
@@ -258,8 +288,8 @@ func (r *Reader) sharedParentOnce(ctx context.Context, x Extent, read func(conte
 				v, err = nil, fmt.Errorf("rangeread: parent %s: panic: %v\n%s", key, p, debug.Stack())
 			}
 		}()
-		data, fromStore, err := read(ctx)
-		return parentRead{data, fromStore}, err
+		data, src, err := read(ctx)
+		return parentRead{data, src}, err
 	})
 	select {
 	case res := <-ch:
@@ -267,11 +297,14 @@ func (r *Reader) sharedParentOnce(ctx context.Context, x Extent, read func(conte
 			if !led.Load() && !retried && ctx.Err() == nil {
 				return r.sharedParentOnce(ctx, x, read, true)
 			}
-			return nil, false, res.Err
+			return nil, cache.Load, cache.Load, res.Err
 		}
 		got := res.Val.(parentRead)
-		return got.data, got.fromStore, nil
+		if !led.Load() {
+			return got.data, got.src, cache.MemoryHit, nil
+		}
+		return got.data, got.src, got.src, nil
 	case <-ctx.Done():
-		return nil, false, ctx.Err()
+		return nil, cache.Load, cache.Load, ctx.Err()
 	}
 }

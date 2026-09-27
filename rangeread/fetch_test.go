@@ -254,18 +254,18 @@ func TestSharedParentFollowerRetriesTheLeadersError(t *testing.T) {
 	own := errors.New("the leader's own budget")
 	leader := make(chan error, 1)
 	go func() {
-		_, _, err := r.sharedParent(t.Context(), x, func(context.Context) ([]byte, bool, error) {
+		_, _, _, err := r.sharedParent(t.Context(), x, func(context.Context) ([]byte, cache.Outcome, error) {
 			close(started)
 			<-release
-			return nil, false, own
+			return nil, cache.Load, own
 		})
 		leader <- err
 	}()
 	<-started
 	follower := make(chan error, 1)
 	go func() {
-		data, _, err := r.sharedParent(t.Context(), x, func(context.Context) ([]byte, bool, error) {
-			return []byte("data"), true, nil
+		data, _, _, err := r.sharedParent(t.Context(), x, func(context.Context) ([]byte, cache.Outcome, error) {
+			return []byte("data"), cache.Load, nil
 		})
 		if err == nil && string(data) != "data" {
 			err = fmt.Errorf("follower read %q", data)
