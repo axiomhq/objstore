@@ -16,5 +16,5 @@
 //
 // Package wal is a write-ahead log on a Store, package cache a memory and
 // disk cache in front of one, package rangeread a coalescing ranged reader
-// over the cache.
+// over the cache, package lease a single-holder lease on one key.
 package objstore

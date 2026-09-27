@@ -15,6 +15,7 @@ Object storage with compare-and-swap, for Go. One `Store` over an S3 bucket
 - a write-ahead log: one entry per second, conditional PUT, nonce read-back (`objstore/wal`)
 - a memory and disk object cache with singleflight and per-request stats (`objstore/cache`)
 - a ranged reader that coalesces nearby reads into one GET (`objstore/rangeread`)
+- a lease for leader election or a single writer: acquire, renew, fence (`objstore/lease`)
 
 ## Use
 
@@ -84,6 +85,27 @@ Concurrent `Append`s share one entry, at most one per `WithCommitInterval` (defa
 | `rangeread.Plan` | unions and coalesces extents under gap, extra-byte and range limits |
 
 `Cache.Put` writes through to the memory and disk tiers, so ranged reads of an object this process wrote are cache hits. Objects are immutable: the cache never re-validates a key. A key under `ns/<name>/` belongs to namespace `<name>` for `InvalidateNamespace`, pins and expiry.
+
+## Leader election / single writer on S3
+
+1. Acquire: `l, err := lease.Acquire(ctx, s, "jobs/leader", lease.OwnerID(), lease.DefaultTTL)`. `ErrNotOwner` means someone else holds it; retry later.
+2. Say what losing it costs: `l.Start(func() { cancelWork() })`. The lease renews itself every TTL/4 from `Acquire` on.
+3. Before every guarded action: `if err := l.Valid(); err != nil { stop }`.
+4. Hand it over when done: `l.Release()`. The next process takes it at once instead of waiting out the TTL.
+
+| event | what happens |
+| --- | --- |
+| renewal CAS loses to another owner | `ErrNotOwner`, the lease fences: your `Start` callback runs once, `Valid` refuses from then on |
+| renewal fails without proof (timeout, 5xx) | one immediate retry; still a holder until the local deadline, fenced once it passes |
+| holder partitioned or crashed | nobody takes the key until its stored expiry plus TTL/2 (the clock-skew margin) |
+| PUT landed but the answer was lost | the object is read back: our own nonce there means held, not lost |
+| an earlier lost PUT lands late | its nonce was recorded as pending, so the renewal adopts it instead of fencing itself |
+
+Every write carries a fresh nonce, so the read-back tells "my write landed" from "someone else's did" without guessing. The holder's deadline runs on its local monotonic clock from before the PUT, so it stops acting no later than a taker may start. Same TTL across the fleet, clock error below TTL/2.
+
+- `lease.Shared` shares one lease among several holders in a process by reference count; the last `Release` hands it back.
+- `l.CheckHeadOnRenewal(fn)` runs `fn` after each renewal; its error counts as the renewal's.
+- A lease check cannot fence a write already in flight. Guard durable writes with their own CAS (the ETag, or a sequence), not a post-check.
 
 ## Encryption
 
