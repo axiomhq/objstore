@@ -78,7 +78,7 @@ Concurrent `Append`s share one entry, at most one per `WithCommitInterval` (defa
 
 | piece | does |
 | --- | --- |
-| `cache.ByteCache` | striped LRU under one byte budget; decoded values ride on their bytes (`PutDecoded`, charged via `cache.Sizer`) |
+| `cache.ByteCache` | striped LRU under one byte budget; decoded values ride on their bytes (`PutDecoded`, charged via `cache.Sizer`); `Recharge` re-charges a held value as it grows |
 | `cache.Disk` | disposable disk tier, 4 KiB block checksums, pins, inactivity expiry |
 | `cache.Keys` | tells the cache which keys are log pages (own share), low priority, or ranged |
 | `cache.WithRequestStats` | per-request lookups through every tier as memory hits, disk hits and loads (`ClassCounts`, `HitRatio`); `Cache.ClassCounts` is the process's |
