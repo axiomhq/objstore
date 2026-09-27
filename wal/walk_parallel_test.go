@@ -7,6 +7,8 @@ import (
 	"math/rand"
 	"reflect"
 	"runtime"
+	"slices"
+	"sync"
 	"testing"
 	"time"
 
@@ -180,5 +182,82 @@ func TestWalkParallelCancellation(t *testing.T) {
 	})
 	if !errors.Is(err, context.Canceled) || visits != 1 || time.Since(start) > time.Second {
 		t.Fatalf("visits=%d, error=%v, elapsed=%s", visits, err, time.Since(start))
+	}
+}
+
+// TestWalkParallelWithGetFetchesConcurrently: the GETs themselves run on
+// the workers. The first four reads wait for each other; a walk that
+// fetched serially would never let the first one finish.
+func TestWalkParallelWithGetFetchesConcurrently(t *testing.T) {
+	ctx := context.Background()
+	s := storetest.New(t)
+	const pages, workers = 8, 4
+	for seq := uint64(1); seq <= pages; seq++ {
+		if ok, err := put(ctx, s, testPrefix, Header{Seq: seq}, Bytes(fmt.Sprint(seq))); !ok || err != nil {
+			t.Fatal(err)
+		}
+	}
+	var mu sync.Mutex
+	entered := 0
+	all := make(chan struct{})
+	get := func(ctx context.Context, key string) ([]byte, error) {
+		seq, err := SeqFromKey(key)
+		if err != nil {
+			return nil, err
+		}
+		if seq <= workers {
+			mu.Lock()
+			if entered++; entered == workers {
+				close(all)
+			}
+			mu.Unlock()
+			select {
+			case <-all:
+			case <-time.After(10 * time.Second):
+				return nil, errors.New("reads were not concurrent")
+			}
+		}
+		return s.Get(ctx, key)
+	}
+	var got []uint64
+	err := WalkParallelWithGet(ctx, get, testPrefix, 0, pages, workers, Decode, nil, func(e entry) error {
+		got = append(got, e.Seq)
+		return nil
+	})
+	if err != nil || len(got) != pages || !slices.IsSorted(got) {
+		t.Fatalf("visits %v, err %v", got, err)
+	}
+}
+
+func BenchmarkWalk(b *testing.B) {
+	ctx := context.Background()
+	s := storetest.New(b)
+	const pages = 64
+	for seq := uint64(1); seq <= pages; seq++ {
+		records := make([]Bytes, 256)
+		for i := range records {
+			records[i] = filled(byte(i), 512)
+		}
+		if ok, err := put(ctx, s, testPrefix, Header{Seq: seq}, records...); !ok || err != nil {
+			b.Fatal(err)
+		}
+	}
+	for _, workers := range []int{0, 1, 8} {
+		b.Run(fmt.Sprintf("workers=%d", workers), func(b *testing.B) {
+			b.ReportAllocs()
+			for b.Loop() {
+				n := 0
+				visit := func(entry) error { n++; return nil }
+				var err error
+				if workers == 0 {
+					err = Walk(ctx, s, testPrefix, 0, 0, Decode, visit)
+				} else {
+					err = WalkParallel(ctx, s, testPrefix, 0, 0, workers, Decode, nil, visit)
+				}
+				if err != nil || n != pages {
+					b.Fatal(n, err)
+				}
+			}
+		})
 	}
 }

@@ -14,10 +14,11 @@ import (
 )
 
 const (
-	// DefaultCommitInterval limits WAL entry PUT starts per writer: one entry
+	// DefaultCommitInterval limits WAL entry starts per writer: one entry
 	// per second. An idle writer commits at once; later writes coalesce
 	// until the next entry is eligible, so concurrent writers share one
-	// entry.
+	// entry. The pages of one multi-page batch are one entry: they go out
+	// back to back.
 	DefaultCommitInterval = time.Second
 	// A scheduler-sized window lets concurrent idle callers join the first
 	// entry without adding a meaningful delay to an uncontended append.
@@ -31,12 +32,13 @@ const (
 	MinCommitInterval = time.Millisecond
 	MaxCommitInterval = 5 * time.Second
 
-	maxEntryBytes   = 32 << 20 // encoded WAL page, including header and CRC
+	maxEntryBytes = 32 << 20 // encoded WAL page, including header and CRC
+	// maxUnackedBytes is the byte admission bound. It holds four entries:
+	// one batch can be in flight while three more queue behind it, which
+	// covers a burst arriving during a single slow commit. Past that Append
+	// refuses instead of buffering more. SetMaxUnacked adds a separate
+	// record-count bound.
 	maxUnackedBytes = 4 * maxEntryBytes
-	// The byte bound holds four entries: one batch can be in flight while
-	// three more queue behind it, which covers a burst arriving during a
-	// single slow commit. Past that Append refuses instead of buffering more.
-	// SetMaxUnacked adds a separate record-count bound.
 	// defaultAttemptTimeout bounds ONE commit attempt (see Writer.commit). A
 	// batch is shared, so no caller's context may abort it — but a hung store
 	// must not pin the flush goroutine, and therefore Close, forever.
@@ -48,10 +50,14 @@ const (
 )
 
 var (
+	// ErrWriterClosed refuses an Append after Close, and answers one Close
+	// found queued but never attempted.
 	ErrWriterClosed = errors.New("wal: writer closed")
 	// ErrLostRace means another writer's entry occupies our next sequence
 	// number: we are no longer the sole writer. Proven by nonce mismatch on
-	// read-back — never a guess. Fail loudly, never diverge silently.
+	// read-back — never a guess. Fail loudly, never diverge silently. The
+	// writer is terminal from then on: every queued and later Append gets
+	// ErrLostRace. Reopen from the checkpoint with a new Writer.
 	ErrLostRace = errors.New("wal: sequence claimed by another writer (split brain)")
 	// ErrUnresolved means durability could not be attributed, including when
 	// the floor has advanced past the nonce-bearing WAL pages. The batch may
@@ -63,6 +69,12 @@ var (
 	// — an overloaded process must degrade into fast rejections, never into
 	// unbounded memory. Retryable: the caller may come back.
 	ErrOverloaded = errors.New("wal: writer overloaded (unacked queue full)")
+	// ErrRecordTooLarge refuses, at Enqueue, a record no page can hold.
+	ErrRecordTooLarge = errors.New("wal: record exceeds page size limit")
+	// ErrInvalidRecord refuses a record whose Size is negative (at Enqueue)
+	// or whose AppendTo fails or disagrees with Size (at commit, failing
+	// only the Append that carried it).
+	ErrInvalidRecord = errors.New("wal: invalid record")
 
 	// errRetry is internal: this batch's outcome is unresolved; keep it in
 	// flight and retry the same seq with the same nonce on the next tick.
@@ -83,6 +95,43 @@ type WriteError struct {
 	Err error
 }
 
+func (e WriteError) Error() string {
+	return fmt.Sprintf("wal: %s %s at %s: %v", e.Op, e.Key, e.At.Format(time.RFC3339Nano), e.Err)
+}
+
+func (e WriteError) Unwrap() error { return e.Err }
+
+// call is one Enqueue: its receipt, how many of the batch's records are its
+// own, and its own verdict when one of its records failed to encode (the
+// rest of the batch still commits).
+type call struct {
+	ch  chan error
+	n   int
+	err error
+}
+
+// deliver sends each call its own error, or verdict when it has none.
+func deliver(calls []call, verdict error) {
+	for _, c := range calls {
+		if c.err != nil {
+			c.ch <- c.err
+		} else {
+			c.ch <- verdict
+		}
+	}
+}
+
+// live counts the calls whose verdict is the batch's.
+func live(calls []call) int64 {
+	var n int64
+	for _, c := range calls {
+		if c.err == nil {
+			n++
+		}
+	}
+	return n
+}
+
 // entryHeaderReserve is a page header with a minted (32-byte) nonce.
 var entryHeaderReserve = headerReserve(32)
 
@@ -93,7 +142,7 @@ type batch[R Record] struct {
 	records   []R
 	bytes     int // framed records plus a conservative header reserve
 	pageLimit int // zero means the codec's page limit (standalone callers)
-	waiters   []chan error
+	calls     []call
 	nonce     string
 	// enqueued is when the OLDEST record in this batch was accepted, carried
 	// over from pendingSince. It is what "how old is the oldest un-acked
@@ -110,6 +159,10 @@ type batch[R Record] struct {
 	// the batch's own pages may already be durable and already truncated, which
 	// is what the floor oracle is told (see Writer.floor).
 	attempts int
+	// landed is how many leading pages are proven durable (ours, won or
+	// adopted). A retry resumes after them; a terminal failure advances the
+	// writer past them, so its next batch never contends with its own page.
+	landed int
 }
 
 // Writer coalesces concurrent Append calls into single WAL objects: at most
@@ -155,10 +208,14 @@ type Writer[R Record] struct {
 	mu           sync.Mutex
 	pending      []R
 	pendingBytes int // exact framed record bytes; headers added at admission
-	waiters      []chan error
+	calls        []call
 	inflight     *batch[R] // unresolved batch; always retried before pending is touched
-	nextSeq      uint64
-	closed       bool
+	// nextSeq is the next sequence to claim. Only the flush goroutine
+	// (flush, commit) touches it, so it needs no lock.
+	nextSeq uint64
+	closed  bool
+	// lost latches ErrLostRace: another writer owns the log now.
+	lost bool
 	// pendingSince is when pending stopped being empty; zero when it is.
 	// Promoted into batch.enqueued so the age survives the flush boundary.
 	pendingSince time.Time
@@ -176,7 +233,7 @@ type Writer[R Record] struct {
 	lastCommit time.Time // start time of the last proven successful PUT, under mu
 	nextRetry  time.Time // retry unresolved flight no earlier than this
 
-	testNonce string // test-only (SetTestNonce): consumed as the next minted nonce
+	testNonce string // test-only, set under mu by this package's tests: consumed as the next minted nonce
 
 	kick    chan struct{}
 	done    chan struct{}
@@ -190,7 +247,8 @@ type Stats struct {
 	Inflight        int        // 1 while a batch is mid-commit, else 0
 	OldestPending   time.Time  // when the oldest un-acked record was accepted; zero when idle
 	LostRace        int64      // ErrLostRace ever returned to a waiter (split brain)
-	Unresolved      int64      // ErrUnresolved ever returned to a waiter (at Close)
+	Lost            bool       // the writer lost the race and refuses every Append
+	Unresolved      int64      // ErrUnresolved ever returned to a waiter: at Close, or a claim the floor or a corrupt read-back left unprovable
 	Rejected        int64      // ErrOverloaded ever returned: Appends shed at the bound
 	MaxUnacked      int        // optional record bound, zero when byte-only
 	UnackedBytes    int        // reserved encoded bytes accepted but not yet acked
@@ -203,7 +261,7 @@ type Stats struct {
 func (w *Writer[R]) Stats() Stats {
 	w.mu.Lock()
 	defer w.mu.Unlock()
-	s := Stats{Pending: len(w.pending), OldestPending: w.pendingSince, LostRace: w.lostRace,
+	s := Stats{Pending: len(w.pending), OldestPending: w.pendingSince, LostRace: w.lostRace, Lost: w.lost,
 		Unresolved: w.unresolved, Rejected: w.rejected, MaxUnacked: w.maxUnacked,
 		UnackedBytes: reservedEntryBytes(w.pendingBytes, len(w.pending)), MaxUnackedBytes: w.unackedByteLimit, LastError: w.lastErr}
 	if w.inflight != nil {
@@ -231,12 +289,14 @@ func (w *Writer[R]) SetFloor(f func(ctx context.Context, retry bool) (uint64, er
 }
 
 // SetAttemptTimeout overrides the per-attempt deadline (see
-// defaultAttemptTimeout); <= 0 restores the default. Safe to call after
-// NewWriter. Tests use it to make a hung store observable in milliseconds.
+// defaultAttemptTimeout); <= 0 restores the default, and a value below the
+// commit interval is raised to it. Safe to call after NewWriter. Tests use
+// it to make a hung store observable quickly.
 func (w *Writer[R]) SetAttemptTimeout(d time.Duration) {
 	if d <= 0 {
 		d = defaultAttemptTimeout
 	}
+	d = max(d, w.commitInterval)
 	w.mu.Lock()
 	w.attemptTimeout = d
 	w.mu.Unlock()
@@ -271,13 +331,13 @@ type Option func(*options)
 type options struct{ commitInterval time.Duration }
 
 // WithCommitInterval overrides the group-commit cadence (see
-// DefaultCommitInterval). Values outside [MinCommitInterval,
-// MaxCommitInterval] are ignored here; refuse them at configuration time,
-// where the caller can still be told why.
+// DefaultCommitInterval). <= 0 keeps the default; other values are clamped
+// to [MinCommitInterval, MaxCommitInterval]. Refuse out-of-range values at
+// configuration time, where the caller can still be told why.
 func WithCommitInterval(d time.Duration) Option {
 	return func(o *options) {
-		if d >= MinCommitInterval && d <= MaxCommitInterval {
-			o.commitInterval = d
+		if d > 0 {
+			o.commitInterval = min(max(d, MinCommitInterval), MaxCommitInterval)
 		}
 	}
 }
@@ -300,8 +360,11 @@ func NewWriter[R Record](s *objstore.Store, prefix string, nextSeq uint64, onCom
 }
 
 // Append queues records and blocks until the batch containing them is
-// durable. An empty append is a no-op: it must not register a waiter, or
-// flush's empty-batch path would strand it forever.
+// durable: nil means every record is in a WAL page and onCommit has run.
+// Any other error but ctx's means none of them will be (ErrUnresolved: may
+// already be; see its doc). If ctx ends first Append returns ctx's error
+// and the outcome is UNKNOWN: the batch may still commit. Use Enqueue to
+// wait for the verdict past a cancellation. An empty append is a no-op.
 func (w *Writer[R]) Append(ctx context.Context, records []R) error {
 	if len(records) == 0 {
 		return nil
@@ -324,7 +387,9 @@ func (w *Writer[R]) Append(ctx context.Context, records []R) error {
 // if ctx is subsequently canceled. Callers can retain mutation locks until
 // that verdict while allowing a canceled request to stop waiting promptly.
 // The records are encoded on the flush goroutine; they must not change
-// until the verdict.
+// until the verdict. A record no page can hold (ErrRecordTooLarge) or with
+// a negative Size (ErrInvalidRecord) is refused here, before anything is
+// queued.
 func (w *Writer[R]) Enqueue(ctx context.Context, records []R) (<-chan error, error) {
 	if err := ctx.Err(); err != nil {
 		return nil, err
@@ -335,18 +400,29 @@ func (w *Writer[R]) Enqueue(ctx context.Context, records []R) (<-chan error, err
 		return ch, nil
 	}
 	bytes := 0
-	for _, r := range records {
-		bytes += framedSize(r.Size())
+	for i, r := range records {
+		n := r.Size()
+		if n < 0 {
+			return nil, fmt.Errorf("%w: record %d: Size %d", ErrInvalidRecord, i, n)
+		}
+		if framedSize(n) > maxPageBytes-entryHeaderReserve {
+			return nil, fmt.Errorf("%w: record %d is %d bytes", ErrRecordTooLarge, i, n)
+		}
+		bytes += framedSize(n)
 	}
 	w.mu.Lock()
 	if w.closed {
 		w.mu.Unlock()
 		return nil, ErrWriterClosed
 	}
+	if w.lost {
+		w.mu.Unlock()
+		return nil, ErrLostRace
+	}
 	// Include the incoming records and a header reserve per record, the
 	// maximum number of pages they could need. Pending and flight are separate.
 	// Refuse promptly even when the store has stopped acknowledging writes.
-	if n := len(w.pending) + w.inflightRecordsLocked(); (w.maxUnacked > 0 && n >= w.maxUnacked) || reservedEntryBytes(w.pendingBytes+bytes, len(w.pending)+len(records))+w.inflightBytesLocked() > w.unackedByteLimit {
+	if n := len(w.pending) + w.inflightRecordsLocked(); (w.maxUnacked > 0 && n+len(records) > w.maxUnacked) || reservedEntryBytes(w.pendingBytes+bytes, len(w.pending)+len(records))+w.inflightBytesLocked() > w.unackedByteLimit {
 		w.rejected++
 		reserved := reservedEntryBytes(w.pendingBytes, len(w.pending)) + w.inflightBytesLocked()
 		w.mu.Unlock()
@@ -357,7 +433,7 @@ func (w *Writer[R]) Enqueue(ctx context.Context, records []R) (<-chan error, err
 	}
 	w.pending = append(w.pending, records...)
 	w.pendingBytes += bytes
-	w.waiters = append(w.waiters, ch)
+	w.calls = append(w.calls, call{ch: ch, n: len(records)})
 	select {
 	case w.kick <- struct{}{}:
 	default:
@@ -408,9 +484,7 @@ func (w *Writer[R]) Close() {
 func (w *Writer[R]) loop() {
 	defer close(w.stopped)
 	timer := time.NewTimer(time.Hour)
-	if !timer.Stop() {
-		<-timer.C
-	}
+	timer.Stop()
 	defer timer.Stop()
 	for {
 		w.mu.Lock()
@@ -452,12 +526,7 @@ func (w *Writer[R]) loop() {
 			w.finalDrain()
 			return
 		}
-		if hasWork && !timer.Stop() {
-			select {
-			case <-timer.C:
-			default:
-			}
-		}
+		timer.Stop() // since Go 1.23 a stopped timer's channel holds nothing stale
 	}
 }
 
@@ -469,20 +538,18 @@ func (w *Writer[R]) flush() {
 	w.mu.Lock()
 	if w.inflight == nil {
 		if len(w.pending) == 0 {
-			// Defense in depth: waiters must be signaled on every path,
+			// Defense in depth: calls must be signaled on every path,
 			// even an empty batch.
-			ws := w.waiters
-			w.waiters = nil
+			calls := w.calls
+			w.calls = nil
 			w.mu.Unlock()
-			for _, ch := range ws {
-				ch <- nil
-			}
+			deliver(calls, nil)
 			return
 		}
 		w.inflight = &batch[R]{records: w.pending, bytes: reservedEntryBytes(w.pendingBytes, len(w.pending)),
-			pageLimit: maxEntryBytes, waiters: w.waiters, nonce: w.mintNonceLocked(),
+			pageLimit: maxEntryBytes, calls: w.calls, nonce: w.mintNonceLocked(),
 			enqueued: w.pendingSince, at: time.Now().UTC().Truncate(time.Millisecond)}
-		w.pending, w.pendingBytes, w.waiters, w.pendingSince = nil, 0, nil, time.Time{}
+		w.pending, w.pendingBytes, w.calls, w.pendingSince = nil, 0, nil, time.Time{}
 	}
 	b := w.inflight
 	w.mu.Unlock()
@@ -494,9 +561,10 @@ func (w *Writer[R]) flush() {
 		w.mu.Unlock()
 		return // still in flight; same seq and nonce at the next retry
 	}
-	if err == nil && w.onCommit != nil {
+	if err == nil && w.onCommit != nil && len(b.records) > 0 {
 		w.onCommit(w.nextSeq-1, b.at, b.records) // keep pending until application completes
 	}
+	var queued []call
 	w.mu.Lock()
 	w.inflight = nil
 	w.nextRetry = time.Time{}
@@ -504,14 +572,18 @@ func (w *Writer[R]) flush() {
 	case err == nil:
 		w.lastErr = WriteError{} // the store is answering again
 	case errors.Is(err, ErrLostRace):
-		w.lostRace += int64(len(b.waiters))
+		// Terminal: another writer owns the log. Everything queued behind
+		// this batch would lose the same race.
+		w.lost = true
+		queued = w.calls
+		w.pending, w.pendingBytes, w.calls, w.pendingSince = nil, 0, nil, time.Time{}
+		w.lostRace += live(b.calls) + int64(len(queued))
 	case errors.Is(err, ErrUnresolved):
-		w.unresolved += int64(len(b.waiters))
+		w.unresolved += live(b.calls)
 	}
 	w.mu.Unlock()
-	for _, ch := range b.waiters {
-		ch <- err
-	}
+	deliver(b.calls, err)
+	deliver(queued, ErrLostRace)
 }
 
 // finalDrain gives the in-flight and pending batches a last resolution
@@ -523,20 +595,16 @@ func (w *Writer[R]) finalDrain() {
 	w.mu.Lock()
 	b := w.inflight
 	w.inflight = nil
-	ws := w.waiters
-	w.pending, w.pendingBytes, w.waiters, w.pendingSince = nil, 0, nil, time.Time{}
+	queued := w.calls
+	w.pending, w.pendingBytes, w.calls, w.pendingSince = nil, 0, nil, time.Time{}
 	if b != nil {
-		w.unresolved += int64(len(b.waiters))
+		w.unresolved += live(b.calls)
 	}
 	w.mu.Unlock()
 	if b != nil {
-		for _, ch := range b.waiters {
-			ch <- ErrUnresolved
-		}
+		deliver(b.calls, ErrUnresolved)
 	}
-	for _, ch := range ws {
-		ch <- ErrWriterClosed
-	}
+	deliver(queued, ErrWriterClosed)
 }
 
 func (w *Writer[R]) drainFlush() {
@@ -544,9 +612,8 @@ func (w *Writer[R]) drainFlush() {
 	due := w.lastCommit.Add(w.commitInterval)
 	hasWork := w.inflight != nil || len(w.pending) > 0
 	w.mu.Unlock()
-	if hasWork && time.Now().Before(due) {
-		timer := time.NewTimer(time.Until(due))
-		<-timer.C
+	if hasWork {
+		time.Sleep(time.Until(due))
 	}
 	w.flush()
 }
@@ -560,9 +627,7 @@ func (w *Writer[R]) mintNonceLocked() string {
 		return n
 	}
 	buf := make([]byte, 16)
-	if _, err := rand.Read(buf); err != nil {
-		panic("wal: crypto/rand unavailable: " + err.Error()) // no entropy = no safe batch identity
-	}
+	rand.Read(buf) // never fails: since Go 1.24 it crashes the program instead
 	return hex.EncodeToString(buf)
 }
 
@@ -576,42 +641,50 @@ func (w *Writer[R]) mintNonceLocked() string {
 //   - claim lost, foreign nonce: proven split brain — ErrLostRace.
 //   - anything unverifiable (PUT transport error, read-back failure, or this
 //     attempt's deadline): errRetry; the batch stays in flight, retried with
-//     the SAME seq and nonce.
+//     the SAME seq and nonce, from the first page not yet proven.
+//
+// A batch that fails for good after some of its pages landed advances the
+// writer past them: the log keeps those pages as an abandoned batch, which
+// a walk reports as a marker.
 func (w *Writer[R]) commit(b *batch[R]) error {
-	// Background ctx: a batch is shared by many callers; one caller's
-	// cancellation must not abort everyone's durability. Bounded per ATTEMPT,
-	// so a hung store is an unresolved retry, not a stuck flush goroutine.
-	w.mu.Lock()
-	floor := w.floor
-	attempt := w.attemptTimeout
-	w.mu.Unlock()
-	if attempt <= 0 {
-		attempt = defaultAttemptTimeout
-	}
-	ctx, cancel := context.WithTimeout(context.Background(), attempt)
-	defer cancel()
 	if b.pages == nil {
 		pages, err := splitBatch(w.nextSeq, b)
 		if err != nil {
 			return err
 		}
+		if len(pages) == 0 {
+			return nil // every call's records failed to encode; no sequence claimed
+		}
 		b.pages = pages
 	}
+	w.mu.Lock()
+	floor := w.floor
+	attempt := w.attemptTimeout
+	due := w.lastCommit.Add(w.commitInterval)
+	w.mu.Unlock()
+	// Pace the batch once, before its deadline starts: its pages are one
+	// entry and go out back to back, so a multi-page batch fits one attempt.
+	time.Sleep(time.Until(due))
+	// Background ctx: a batch is shared by many callers; one caller's
+	// cancellation must not abort everyone's durability. Bounded per ATTEMPT,
+	// so a hung store is an unresolved retry, not a stuck flush goroutine.
+	ctx, cancel := context.WithTimeout(context.Background(), attempt)
+	defer cancel()
 	b.attempts++
+	err := w.putPages(ctx, b, floor)
+	switch {
+	case err == nil:
+		w.nextSeq += uint64(len(b.pages))
+	case !errors.Is(err, errRetry):
+		w.nextSeq += uint64(b.landed)
+	}
+	return err
+}
+
+// putPages claims b's pages from the first one not yet proven durable.
+func (w *Writer[R]) putPages(ctx context.Context, b *batch[R], floor func(context.Context, bool) (uint64, error)) error {
 	batchPages := uint64(len(b.pages))
-	for i, data := range b.pages {
-		w.mu.Lock()
-		due := w.lastCommit.Add(w.commitInterval)
-		w.mu.Unlock()
-		if delay := time.Until(due); delay > 0 {
-			timer := time.NewTimer(delay)
-			select {
-			case <-timer.C:
-			case <-ctx.Done():
-				timer.Stop()
-				return w.retry("put", Key(w.prefix, w.nextSeq+uint64(i)), ctx.Err())
-			}
-		}
+	for i := b.landed; i < len(b.pages); i++ {
 		seq := w.nextSeq + uint64(i)
 		key := Key(w.prefix, seq)
 		if floor != nil {
@@ -626,11 +699,17 @@ func (w *Writer[R]) commit(b *batch[R]) error {
 		// Urgent: the acknowledged write path never waits behind bulk
 		// object writes for a store slot.
 		startedAt := time.Now()
-		ok, err := w.store.PutIfAbsent(objstore.Urgent(ctx), key, data)
+		ok, err := w.store.PutIfAbsent(objstore.Urgent(ctx), key, b.pages[i])
 		if err != nil {
 			return w.retry("put", key, err)
 		}
-		if !ok {
+		if ok {
+			w.mu.Lock()
+			w.lastCommit = startedAt
+			w.mu.Unlock()
+		} else {
+			// Adopting our own earlier PUT starts no new entry: pacing
+			// stays with the PUT that wrote it.
 			data, gerr := w.store.Get(ctx, key)
 			if gerr != nil {
 				return w.retry("readback", key, gerr)
@@ -643,11 +722,8 @@ func (w *Writer[R]) commit(b *batch[R]) error {
 				return ErrLostRace
 			}
 		}
-		w.mu.Lock()
-		w.lastCommit = startedAt
-		w.mu.Unlock()
+		b.landed = i + 1
 	}
-	w.nextSeq += batchPages
 	return nil
 }
 
@@ -670,7 +746,10 @@ func (w *Writer[R]) retry(op, key string, cause error) error {
 
 // splitBatch encodes b's records once and cuts them into bounded pages,
 // sequenced from seq in append order. A batch that fits one page is
-// returned without copying.
+// returned without copying. A call whose record fails to encode gets
+// ErrInvalidRecord and its records leave the batch (b.records is updated);
+// the others still commit. No pages and no error: every call failed.
+// Without calls (standalone callers) any failing record fails the batch.
 func splitBatch[R Record](seq uint64, b *batch[R]) ([][]byte, error) {
 	head := Header{Seq: seq, Nonce: b.nonce, At: b.at, BatchPages: 1}
 	header, err := appendHeader(nil, head, len(b.records))
@@ -684,13 +763,58 @@ func splitBatch[R Record](seq uint64, b *batch[R]) ([][]byte, error) {
 	}
 	buf := make([]byte, hdr, total+4)
 	copy(buf, header)
-	ends := make([]int, len(b.records)) // buf offset just past each record
-	for i, r := range b.records {
-		if buf, err = appendRecord(buf, r); err != nil {
+	ends := make([]int, 0, len(b.records)) // buf offset just past each kept record
+	groups := b.calls
+	if len(groups) == 0 {
+		groups = []call{{n: len(b.records)}}
+	}
+	dropped := false
+	next := 0
+	for gi := range groups {
+		g := &groups[gi]
+		mark, marks := len(buf), len(ends)
+		for _, r := range b.records[next : next+g.n] {
+			var nb []byte
+			if nb, err = appendRecord(buf, r); err != nil {
+				break
+			}
+			buf = nb
+			ends = append(ends, len(buf))
+		}
+		next += g.n
+		if err != nil {
+			if len(b.calls) == 0 {
+				return nil, fmt.Errorf("%w: %v", ErrInvalidRecord, err)
+			}
+			g.err = fmt.Errorf("%w: %v", ErrInvalidRecord, err)
+			buf, ends, err, dropped = buf[:mark], ends[:marks], nil, true
+		}
+	}
+	if dropped {
+		kept := make([]R, 0, len(ends))
+		next = 0
+		for _, c := range b.calls {
+			if c.err == nil {
+				kept = append(kept, b.records[next:next+c.n]...)
+			}
+			next += c.n
+		}
+		b.records = kept
+		if len(kept) == 0 {
+			return nil, nil
+		}
+		// The record count is in the header; its varint may shrink.
+		if header, err = appendHeader(nil, head, len(kept)); err != nil {
 			return nil, err
 		}
-		ends[i] = len(buf)
+		shift := len(header) - hdr
+		buf = append(header, buf[hdr:]...)
+		for i := range ends {
+			ends[i] += shift
+		}
+		hdr = len(header)
 	}
+	records := b.records
 	limit := b.pageLimit
 	if limit == 0 {
 		limit = maxPageBytes
@@ -700,7 +824,7 @@ func splitBatch[R Record](seq uint64, b *batch[R]) ([][]byte, error) {
 	// fit the entry budget; retain the ceiling for them and cap other
 	// batches at maxEntryBytes.
 	if limit == maxEntryBytes {
-		for i := range b.records {
+		for i := range records {
 			from := hdr
 			if i > 0 {
 				from = ends[i-1]
@@ -717,20 +841,21 @@ func splitBatch[R Record](seq uint64, b *batch[R]) ([][]byte, error) {
 	// Cut so every page fits beneath the largest header it could carry.
 	// Every record is checked against the budget of the page it lands on,
 	// including the one a cut was just made for: a record too large for
-	// any page fails the batch here, before its first PUT.
+	// any page fails the batch here, before its first PUT. (Enqueue refuses
+	// such records; this guards standalone callers.)
 	budget := limit - reserve
 	bounds := []int{0} // first record of each page, then len(records)
 	start := hdr
-	for i := range b.records {
+	for i := range records {
 		if ends[i]-start > budget && i > bounds[len(bounds)-1] {
 			bounds = append(bounds, i)
 			start = ends[i-1]
 		}
 		if ends[i]-start > budget {
-			return nil, fmt.Errorf("wal: record exceeds page size limit")
+			return nil, ErrRecordTooLarge
 		}
 	}
-	bounds = append(bounds, len(b.records))
+	bounds = append(bounds, len(records))
 	pages := make([][]byte, len(bounds)-1)
 	head.BatchPages = uint64(len(pages))
 	for i := range pages {

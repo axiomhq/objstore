@@ -31,7 +31,10 @@ type Record interface {
 // Bytes is a Record that is already encoded.
 type Bytes []byte
 
-func (b Bytes) Size() int                           { return len(b) }
+// Size is len(b).
+func (b Bytes) Size() int { return len(b) }
+
+// AppendTo appends b to dst.
 func (b Bytes) AppendTo(dst []byte) ([]byte, error) { return append(dst, b...), nil }
 
 // Header is what a page says about itself.
@@ -39,8 +42,9 @@ type Header struct {
 	Seq   uint64
 	Nonce string    // the writing batch's identity; resolves ambiguous conditional PUTs
 	At    time.Time // when the batch was first attempted, millisecond precision
-	// BatchPages is the page count of a multi-page batch, zero for a
-	// single-page entry; BatchIndex is this page's position in it.
+	// BatchPages is the page count of a batch; BatchIndex is this page's
+	// position in it. A single-page entry has BatchPages 0 (Encode's
+	// default) or 1 (what a Writer writes): walks treat the two alike.
 	BatchPages, BatchIndex uint64
 }
 
@@ -49,7 +53,17 @@ type Header struct {
 // length-prefixed, CRC32C. Encoding is deterministic, so retries of the
 // same batch write identical bytes: fix At once per batch.
 func Encode[R Record](h Header, records []R) ([]byte, error) {
-	b, err := appendHeader(nil, h, len(records))
+	size := headerReserve(len(h.Nonce))
+	for _, r := range records {
+		n := r.Size()
+		if n < 0 {
+			return nil, fmt.Errorf("wal: record Size %d is negative", n)
+		}
+		if size += framedSize(n); size > maxPageBytes+binary.MaxVarintLen64*6 {
+			return nil, fmt.Errorf("wal: page exceeds size limit")
+		}
+	}
+	b, err := appendHeader(make([]byte, 0, size), h, len(records))
 	if err != nil {
 		return nil, err
 	}

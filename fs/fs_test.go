@@ -1,3 +1,5 @@
+//go:build unix
+
 package fs
 
 import (
@@ -9,6 +11,7 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"slices"
 	"strings"
 	"sync"
 	"testing"
@@ -475,12 +478,13 @@ func TestFSKeyLockAcrossProcesses(t *testing.T) {
 	}
 }
 
-// TestWALKeysDoNotShareAFoldWritesStripe: a write holds its key's stripe
-// through the directory fsync; a WAL commit whose key hashes to the same
-// stripe as a data key being written must not wait for it. The same key
-// still serializes.
-func TestWALKeysDoNotShareAFoldWritesStripe(t *testing.T) {
+// TestIsolatedKeysDoNotShareAStripe: a write holds its key's stripe
+// through the directory fsync; a WAL commit (a key IsolatedKeys selects)
+// whose key hashes to the same stripe as a data key being written must not
+// wait for it. The same key still serializes.
+func TestIsolatedKeysDoNotShareAStripe(t *testing.T) {
 	f := New(t.TempDir(), "bucket")
+	f.IsolatedKeys = func(key string) bool { return strings.Contains(key, "/wal/") }
 	if err := os.MkdirAll(f.root, 0o755); err != nil {
 		t.Fatal(err)
 	}
@@ -512,5 +516,162 @@ func TestWALKeysDoNotShareAFoldWritesStripe(t *testing.T) {
 	defer cancel()
 	if _, err := f.putIfAbsent(ctx, walKey, []byte("again")); !errors.Is(err, context.DeadlineExceeded) {
 		t.Fatalf("a WAL key's own writers no longer serialize: %v", err)
+	}
+}
+
+// TestFSPutIfAbsentRetrySyncsAfterFailedDirSync: a PutIfAbsent whose link
+// landed but whose directory sync failed is (true, err); the retry finds
+// the object (false, nil) and must sync the directory itself, or a
+// read-back adoption would rest on an entry nothing made durable.
+func TestFSPutIfAbsentRetrySyncsAfterFailedDirSync(t *testing.T) {
+	ctx := context.Background()
+	for _, warm := range []bool{false, true} {
+		t.Run(fmt.Sprint("warm=", warm), func(t *testing.T) {
+			f := New(t.TempDir(), "b")
+			if err := f.EnsureBucket(ctx); err != nil {
+				t.Fatal(err)
+			}
+			if warm { // the directory chain is already proven durable
+				if err := f.Put(ctx, "log/0", []byte("v")); err != nil {
+					t.Fatal(err)
+				}
+			}
+			injected := errors.New("injected dirsync failure")
+			f.syncFault = func(string) error { return injected }
+			ok, err := f.PutIfAbsent(ctx, "log/1", []byte("v"))
+			if !ok || !errors.Is(err, injected) {
+				t.Fatalf("faulted dirsync: ok=%v err=%v, want (true, injected)", ok, err)
+			}
+			f.syncFault = nil
+			f.dirSyncs.Store(0)
+			ok, err = f.PutIfAbsent(ctx, "log/1", []byte("v"))
+			if ok || err != nil {
+				t.Fatalf("retry: ok=%v err=%v, want (false, nil)", ok, err)
+			}
+			if n := f.dirSyncs.Load(); n == 0 {
+				t.Fatal("retry that found its own unsynced object issued no directory sync")
+			}
+			f.dirSyncs.Store(0)
+			if ok, err := f.PutIfAbsent(ctx, "log/1", []byte("v")); ok || err != nil || f.dirSyncs.Load() != 0 {
+				t.Fatalf("lost race on a synced directory: ok=%v err=%v syncs=%d, want no sync", ok, err, f.dirSyncs.Load())
+			}
+		})
+	}
+}
+
+// TestFSListOrderAndBound: listing yields S3's lexical key order even where
+// it differs from directory order ("a-c" < "a/b" since '-' < '/'), pages
+// correctly across that boundary, and a page reads only the directories it
+// needs rather than the whole bucket.
+func TestFSListOrderAndBound(t *testing.T) {
+	ctx := context.Background()
+	f := New(t.TempDir(), "b")
+	if err := f.EnsureBucket(ctx); err != nil {
+		t.Fatal(err)
+	}
+	want := []string{"a-c", "a.d", "a/b", "a/b/c", "a0", "b/x/y"}
+	slices.Sort(want)
+	for _, k := range []string{"a/b/c", "a-c", "a/b", "b/x/y", "a0", "a.d"} {
+		// "a/b" and "a/b/c" cannot both exist as a file and a directory.
+		if k == "a/b" {
+			continue
+		}
+		if err := f.Put(ctx, k, []byte("v")); err != nil {
+			t.Fatal(err)
+		}
+	}
+	want = slices.DeleteFunc(want, func(k string) bool { return k == "a/b" })
+	for limit := 1; limit <= len(want)+1; limit++ {
+		var got []string
+		for after := ""; ; {
+			page, next, err := f.ListPage(ctx, "", after, limit)
+			if err != nil {
+				t.Fatal(err)
+			}
+			got = append(got, page...)
+			if next == "" {
+				break
+			}
+			after = next
+		}
+		if !slices.Equal(got, want) {
+			t.Fatalf("limit %d: %v, want %v", limit, got, want)
+		}
+	}
+	for prefix, want := range map[string][]string{
+		"a":     {"a-c", "a.d", "a/b/c", "a0"},
+		"a/":    {"a/b/c"},
+		"a/b/c": {"a/b/c"},
+		"b/x":   {"b/x/y"},
+		"c/":    nil,
+		"a//":   nil,
+		"../":   nil,
+	} {
+		keys, next, err := f.ListPage(ctx, prefix, "", 100)
+		if err != nil || next != "" || !slices.Equal(keys, want) {
+			t.Fatalf("prefix %q: %v %q %v, want %v", prefix, keys, next, err, want)
+		}
+	}
+	prefixes, _, err := f.ListPrefixesPage(ctx, "", "", 100)
+	if err != nil || !slices.Equal(prefixes, []string{"a/", "b/"}) {
+		t.Fatalf("prefixes: %v %v", prefixes, err)
+	}
+	if err := os.MkdirAll(filepath.Join(f.root, "empty", "dir"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	prefixes, _, err = f.ListPrefixesPage(ctx, "", "a/", 100)
+	if err != nil || !slices.Equal(prefixes, []string{"b/"}) {
+		t.Fatalf("prefixes after a/ with an empty directory: %v %v", prefixes, err)
+	}
+
+	// A wide tree: 64 directories of 16 keys each. One small page reads a
+	// handful of directories, not 65.
+	for d := range 64 {
+		for k := range 16 {
+			if err := f.Put(ctx, fmt.Sprintf("wide/%02d/%02d", d, k), nil); err != nil {
+				t.Fatal(err)
+			}
+		}
+	}
+	f.dirReads.Store(0)
+	keys, next, err := f.ListPage(ctx, "wide/", "wide/10/05", 20)
+	if err != nil || len(keys) != 20 || keys[0] != "wide/10/06" || next != "wide/11/09" {
+		t.Fatalf("wide page: %v %q %v", keys, next, err)
+	}
+	if n := f.dirReads.Load(); n > 4 {
+		t.Fatalf("one 20-key page read %d directories", n)
+	}
+	f.dirReads.Store(0)
+	if keys, _, err := f.ListPage(ctx, "wide/63/", "", 100); err != nil || len(keys) != 16 || f.dirReads.Load() != 1 {
+		t.Fatalf("one directory's keys: %d keys, %d reads, %v", len(keys), f.dirReads.Load(), err)
+	}
+}
+
+// TestFSInvalidKeyIsErrInvalidKey: rejected keys wrap objstore.ErrInvalidKey.
+func TestFSInvalidKeyIsErrInvalidKey(t *testing.T) {
+	f := New(t.TempDir(), "b")
+	if err := f.Put(context.Background(), "a//b", nil); !errors.Is(err, objstore.ErrInvalidKey) {
+		t.Fatalf("invalid key: %v", err)
+	}
+}
+
+func BenchmarkFSListPage(b *testing.B) {
+	ctx := context.Background()
+	f := New(b.TempDir(), "b")
+	if err := f.EnsureBucket(ctx); err != nil {
+		b.Fatal(err)
+	}
+	for d := range 100 {
+		for k := range 100 {
+			if err := f.Put(objstore.Urgent(ctx), fmt.Sprintf("ns/%02d/%02d", d, k), nil); err != nil {
+				b.Fatal(err)
+			}
+		}
+	}
+	b.ResetTimer()
+	for b.Loop() {
+		if _, _, err := f.ListPage(ctx, "ns/50/", "", 100); err != nil {
+			b.Fatal(err)
+		}
 	}
 }

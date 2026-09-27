@@ -27,13 +27,13 @@ func TestWriterCommitsAtOnceWhenIdle(t *testing.T) {
 
 func TestWriterRateLimitsEntries(t *testing.T) {
 	s, f := storetest.NewFaulty(t)
-	w := NewWriter[Bytes](s, testPrefix, 1, nil, WithCommitInterval(500*time.Millisecond))
+	w := NewWriter[Bytes](s, testPrefix, 1, nil, WithCommitInterval(250*time.Millisecond))
 	defer w.Close()
 	ctx := context.Background()
 	var wg sync.WaitGroup
 	var mu sync.Mutex
 	want := map[string]bool{}
-	stop := time.Now().Add(3 * time.Second)
+	stop := time.Now().Add(1500 * time.Millisecond)
 	for caller := range 8 {
 		wg.Add(1)
 		go func() {
@@ -52,7 +52,7 @@ func TestWriterRateLimitsEntries(t *testing.T) {
 	}
 	wg.Wait()
 	if n := f.Ops()[storetest.OpPutIfAbsent]; n > 7 {
-		t.Fatalf("%d WAL PUTs in three seconds, want at most 7", n)
+		t.Fatalf("%d WAL PUTs in 1.5 seconds at 250ms, want at most 7", n)
 	}
 	entries, err := replay(ctx, s, testPrefix, 0)
 	if err != nil {
@@ -157,7 +157,7 @@ func TestEntryBoundedByBytes(t *testing.T) {
 
 func TestWriterUnackedBoundRefuses(t *testing.T) {
 	s, f := storetest.NewFaulty(t)
-	w := NewWriter[Bytes](s, testPrefix, 1, nil)
+	w := NewWriter[Bytes](s, testPrefix, 1, nil, WithCommitInterval(50*time.Millisecond))
 	w.mu.Lock()
 	w.unackedByteLimit = 1 << 20 // exercise the byte path without a 128 MiB fixture
 	w.mu.Unlock()

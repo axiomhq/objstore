@@ -1,26 +1,47 @@
 package rangeread
 
 import (
+	"cmp"
 	"fmt"
 	"math"
 	"slices"
 	"strings"
 )
 
+// Extent is Length bytes of Object starting at byte Offset. Object must
+// not contain '#': logical cache keys derived from an object name use it
+// as their separator (object#...), so such a name could collide with one.
 type Extent struct {
 	Object         string
 	Offset, Length int64
 }
 
+// valid reports ErrInvalidExtent for an extent no store could serve.
+func (x Extent) valid() error {
+	if x.Object == "" || strings.Contains(x.Object, "#") || x.Offset < 0 || x.Length <= 0 || x.Offset > math.MaxInt64-x.Length {
+		return fmt.Errorf("%w: %q at %d+%d", ErrInvalidExtent, x.Object, x.Offset, x.Length)
+	}
+	return nil
+}
+
+// compareExtents orders extents by object, then offset.
+func compareExtents(a, b Extent) int {
+	return cmp.Or(strings.Compare(a.Object, b.Object), cmp.Compare(a.Offset, b.Offset))
+}
+
+// Planned is one ranged GET of a plan: the extents it covers, merged, with
+// Extra the bytes in gaps between them that no input extent asked for.
 type Planned struct {
 	Extent
 	Extra int64 // bytes in gaps, not requested by any input extent
 }
 
-// Plan unions overlaps before coalescing gaps. Cheaper gaps get first
+// Plan returns the ranged GETs that cover extents, sorted by object and
+// offset. It unions overlaps before coalescing gaps. Cheaper gaps get first
 // use of the wave-wide extra-byte budget, with object/offset order breaking
 // ties. Keep the original greedy plan if range limits make it use fewer reads.
 // Large required extents are split, never rejected or truncated to a budget.
+// An invalid extent is ErrInvalidExtent.
 func Plan(extents []Extent, cfg Config) ([]Planned, error) {
 	cfg, err := cfg.Normalized()
 	if err != nil {
@@ -28,22 +49,11 @@ func Plan(extents []Extent, cfg Config) ([]Planned, error) {
 	}
 	spans := slices.Clone(extents)
 	for _, r := range spans {
-		if r.Object == "" || strings.Contains(r.Object, "#") || r.Offset < 0 || r.Length <= 0 || r.Offset > math.MaxInt64-r.Length {
-			return nil, fmt.Errorf("rangeread: invalid read extent %q at %d+%d", r.Object, r.Offset, r.Length)
+		if err := r.valid(); err != nil {
+			return nil, err
 		}
 	}
-	slices.SortFunc(spans, func(a, b Extent) int {
-		if c := strings.Compare(a.Object, b.Object); c != 0 {
-			return c
-		}
-		if a.Offset < b.Offset {
-			return -1
-		}
-		if a.Offset > b.Offset {
-			return 1
-		}
-		return 0
-	})
+	slices.SortFunc(spans, compareExtents)
 	union := spans[:0]
 	for _, r := range spans {
 		if len(union) > 0 {
@@ -103,15 +113,7 @@ func Plan(extents []Extent, cfg Config) ([]Planned, error) {
 			}
 		}
 	}
-	slices.SortStableFunc(gaps, func(a, b gapBoundary) int {
-		if a.cost < b.cost {
-			return -1
-		}
-		if a.cost > b.cost {
-			return 1
-		}
-		return 0
-	})
+	slices.SortStableFunc(gaps, func(a, b gapBoundary) int { return cmp.Compare(a.cost, b.cost) })
 	extra = 0
 	for _, gap := range gaps {
 		if gap.cost > cfg.MaxExtraBytes-extra {

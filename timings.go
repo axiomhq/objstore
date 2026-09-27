@@ -2,6 +2,8 @@ package objstore
 
 import (
 	"context"
+	"log/slog"
+	"strconv"
 	"sync/atomic"
 	"time"
 )
@@ -26,6 +28,14 @@ const (
 )
 
 var callNames = [callCount]string{"gate", "create", "write", "writeback", "fsync", "lock", "link", "dirsync", "read", "list", "delete"}
+
+// String is the Call's short name, as used in Attrs ("gate", "fsync", ...).
+func (c Call) String() string {
+	if c < 0 || c >= callCount {
+		return "Call(" + strconv.Itoa(int(c)) + ")"
+	}
+	return callNames[c]
+}
 
 // Timings sums the wall time the store spent in each Call for the calls made
 // under one context (WithTimings), and how many there were: a background job
@@ -57,12 +67,17 @@ func (t *Timings) Since(op Call, start time.Time) {
 	}
 }
 
-// LogAttrs is t as slog key-value pairs: sys_<call>_ms and sys_<call>_n
-// per Call.
-func (t *Timings) LogAttrs() []any {
-	out := make([]any, 0, 4*callCount)
+// Attrs is t as slog attributes: sys_<call>_ms and sys_<call>_n per Call.
+// A nil t has none.
+func (t *Timings) Attrs() []slog.Attr {
+	if t == nil {
+		return nil
+	}
+	out := make([]slog.Attr, 0, 2*callCount)
 	for op := range callCount {
-		out = append(out, "sys_"+callNames[op]+"_ms", t.nanos[op].Load()/int64(time.Millisecond), "sys_"+callNames[op]+"_n", t.n[op].Load())
+		out = append(out,
+			slog.Int64("sys_"+op.String()+"_ms", t.nanos[op].Load()/int64(time.Millisecond)),
+			slog.Int64("sys_"+op.String()+"_n", t.n[op].Load()))
 	}
 	return out
 }

@@ -3,7 +3,6 @@ package lease
 import (
 	"context"
 	"crypto/rand"
-	"encoding/hex"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -19,11 +18,21 @@ import (
 // a public cloud store.
 const DefaultTTL = 10 * time.Second
 
-// ErrNotOwner means this process does not hold the lease: either somebody
-// else does, or ours lapsed and has not been re-taken. Retryable by
-// definition: nothing about the request is wrong, this process is simply not
-// the holder right now.
-var ErrNotOwner = errors.New("lease: held elsewhere")
+// ErrNotOwner means this process does not hold the lease: somebody else
+// does, ours lapsed, was released or fenced, or the handle never held it.
+// Retryable by definition: nothing about the request is wrong, this process
+// is simply not the holder right now.
+var ErrNotOwner = errors.New("lease: not held")
+
+// Store is the part of an objstore.Store a lease uses: a read with the
+// ETag and the two conditional writes. *objstore.Store implements it.
+// GetWithETag must return an error wrapping objstore.ErrNotFound for a
+// missing key.
+type Store interface {
+	GetWithETag(ctx context.Context, key string) ([]byte, string, error)
+	PutIfAbsent(ctx context.Context, key string, data []byte) (bool, error)
+	PutIfMatch(ctx context.Context, key string, data []byte, etag string) (bool, error)
+}
 
 // Body is the whole object. Expiry is wall-clock and absolute; Nonce
 // identifies ONE write attempt, so an ambiguous CAS is attributable.
@@ -44,29 +53,22 @@ func OwnerID() string {
 }
 
 // mint returns a fresh nonce for one write attempt.
-func mint() string {
-	buf := make([]byte, 16)
-	if _, err := rand.Read(buf); err != nil {
-		panic("lease: crypto/rand unavailable: " + err.Error())
-	}
-	return hex.EncodeToString(buf)
-}
+func mint() string { return rand.Text() }
 
 // Lease is one key's token held by this process. Several independent
 // leases (say, one for writing and one for compacting) are just several
 // keys; one process may hold any of them.
 type Lease struct {
-	store *objstore.Store
+	store Store
 	key   string
 	owner string
 	ttl   time.Duration
-	// Log receives renewal failures; nil is silent. Set it before the
-	// first renewal tick (TTL/4 after Acquire).
-	Log *slog.Logger
 
 	mu       sync.Mutex
-	nonce    string    // last attributed acquisition/renewal; owner alone is not continuity
-	deadline time.Time // LOCAL clock: this process stops serving here
+	log      *slog.Logger // renewal failures and fences; nil is silent
+	started  bool         // a renewal goroutine was started; it closes done
+	nonce    string       // last attributed acquisition/renewal; owner alone is not continuity
+	deadline time.Time    // LOCAL clock: this process stops serving here
 	// pending is every write attempt whose answer was lost, by nonce, with
 	// the time it started: a record later found in our name with one of
 	// these nonces is that write landing late, and it is ours.
@@ -84,6 +86,7 @@ type Lease struct {
 
 	stopOnce sync.Once
 	stop     chan struct{}
+	doneOnce sync.Once
 	done     chan struct{}
 }
 
@@ -91,25 +94,71 @@ type Lease struct {
 // has to cover whatever the caller does before it can install a fence
 // (a replay, say), which may outlast a TTL. The fence callback arrives
 // later, via Start. Every failure path between the two owes the lease a
-// Release.
-func Acquire(ctx context.Context, s *objstore.Store, key, owner string, ttl time.Duration) (*Lease, error) {
+// Release. A ttl <= 0 means DefaultTTL.
+func Acquire(ctx context.Context, s Store, key, owner string, ttl time.Duration) (*Lease, error) {
 	return New(s, key, owner, ttl).Acquire(ctx)
 }
 
 // New returns an unacquired lease on key. Take drives it by hand (no
-// renewal goroutine); Acquire takes it and starts renewing.
-func New(s *objstore.Store, key, owner string, ttl time.Duration) *Lease {
+// renewal goroutine); Acquire takes it and starts renewing. A ttl <= 0
+// means DefaultTTL.
+func New(s Store, key, owner string, ttl time.Duration) *Lease {
+	if ttl <= 0 {
+		ttl = DefaultTTL
+	}
 	return &Lease{store: s, key: key, owner: owner, ttl: ttl, stop: make(chan struct{}), done: make(chan struct{})}
 }
 
-// Acquire takes l and starts its renewal goroutine.
+// Acquire takes l and starts its renewal goroutine. It returns an error,
+// and does not touch the store, on a lease that was already acquired or
+// has been retired or released: a handle carries one acquisition.
 func (l *Lease) Acquire(ctx context.Context) (*Lease, error) {
+	l.mu.Lock()
+	if l.started || l.stopped() {
+		l.mu.Unlock()
+		return nil, fmt.Errorf("lease %s: Acquire called twice, or after Retire; use a fresh New", l.key)
+	}
+	l.started = true
+	l.mu.Unlock()
 	if err := l.Take(ctx); err != nil {
+		l.mu.Lock()
+		l.started = false
+		if l.stopped() { // retired meanwhile, expecting a renewer to close done
+			l.finish()
+		}
+		l.mu.Unlock()
 		return nil, err
 	}
 	go l.renew()
 	return l, nil
 }
+
+// SetLogger directs renewal failures and fences to log; nil (the default)
+// is silent. Safe to call at any time, including while renewing.
+func (l *Lease) SetLogger(log *slog.Logger) {
+	l.mu.Lock()
+	l.log = log
+	l.mu.Unlock()
+}
+
+func (l *Lease) logger() *slog.Logger {
+	l.mu.Lock()
+	defer l.mu.Unlock()
+	return l.log
+}
+
+// stopped reports whether Retire has begun.
+func (l *Lease) stopped() bool {
+	select {
+	case <-l.stop:
+		return true
+	default:
+		return false
+	}
+}
+
+// finish closes done, once, whichever path ends the lease.
+func (l *Lease) finish() { l.doneOnce.Do(func() { close(l.done) }) }
 
 // Start installs the fence callback, running it immediately if the lease
 // was already lost in the meantime. Call it once, after Acquire.
@@ -124,9 +173,11 @@ func (l *Lease) Start(fence func()) {
 }
 
 // CheckHeadOnRenewal installs a probe that runs after every successful
-// renewal (not the initial acquisition). Its error is the renewal's error:
-// a holder can use it to notice a foreign write before its next admitted
-// one.
+// renewal CAS (not the initial acquisition), so a holder can notice a
+// foreign write before its next admitted one. Its error becomes Take's
+// error. The renewer fences at once only on an error wrapping
+// ErrNotOwner. Any other error is logged and retried once; since the CAS
+// before it already extended the lease, it never fences by itself.
 func (l *Lease) CheckHeadOnRenewal(check func(context.Context) error) {
 	l.mu.Lock()
 	l.checkHead = check
@@ -145,6 +196,7 @@ func (l *Lease) Take(ctx context.Context) error {
 	if fenced || (nonce != "" && !Before(now, now.Round(0), deadline)) {
 		return fmt.Errorf("%w: %s cannot renew an abandoned lease", ErrNotOwner, l.key)
 	}
+	initial := nonce == ""
 	ctx = objstore.Urgent(ctx) // the heartbeat never queues behind bulk traffic
 	cur, etag, err := Load(ctx, l.store, l.key)
 	if err != nil {
@@ -154,13 +206,21 @@ func (l *Lease) Take(ctx context.Context) error {
 	// was lost is that attempt landing late (the provider stalled the
 	// request, then completed it). Adopt it: it is this acquisition,
 	// renewed. Seen on Hetzner Object Storage, where the lease fenced
-	// itself as "taken by" its own owner string.
-	if nonce != "" && cur.Owner == l.owner && cur.Nonce != nonce {
+	// itself as "taken by" its own owner string. This holds for a retried
+	// first acquisition too: otherwise our own record locks us out.
+	if cur.Owner == l.owner && cur.Nonce != nonce {
 		if start, ok := l.pendingStart(cur.Nonce); ok {
-			if err := l.hold(start, cur.Nonce); err != nil {
+			err := l.hold(start, cur.Nonce)
+			switch {
+			case err == nil:
+				nonce = cur.Nonce
+			case initial:
+				// Ours, but landed too late to count: an expired record
+				// like any other, taken over below once it is free.
+				l.dropPending(cur.Nonce)
+			default:
 				return err
 			}
-			nonce = cur.Nonce
 		}
 	}
 	// Renewal must extend this exact acquisition, never acquire a free
@@ -179,7 +239,7 @@ func (l *Lease) Take(ctx context.Context) error {
 	if err := l.write(ctx, etag); err != nil {
 		return err
 	}
-	if nonce == "" {
+	if initial {
 		return nil // the caller follows an initial acquisition with its own catch-up
 	}
 	l.mu.Lock()
@@ -217,7 +277,7 @@ func (l *Lease) write(ctx context.Context, etag string) error {
 	back, _, gerr := Load(ctx, l.store, l.key)
 	if gerr != nil {
 		l.notePending(body.Nonce, start)
-		return fmt.Errorf("lease %s: outcome unknown: %v", l.key, gerr)
+		return fmt.Errorf("lease %s: outcome unknown: %w", l.key, gerr)
 	}
 	if back.Nonce == body.Nonce {
 		return l.hold(start, body.Nonce)
@@ -243,6 +303,13 @@ func (l *Lease) notePending(nonce string, start time.Time) {
 		l.pending = map[string]time.Time{}
 	}
 	l.pending[nonce] = start
+}
+
+// dropPending forgets one lost-answer attempt.
+func (l *Lease) dropPending(nonce string) {
+	l.mu.Lock()
+	delete(l.pending, nonce)
+	l.mu.Unlock()
 }
 
 // pendingStart is when the lost-answer attempt with this nonce began.
@@ -287,7 +354,8 @@ func (l *Lease) Valid() error {
 	return nil
 }
 
-// Before reports now < deadline on both clocks. Local elapsed time can
+// Before reports now < deadline on both clocks. Test hook: exported so
+// tests can model a suspended host; production code has no use for it. Local elapsed time can
 // pause during suspend while the persisted wall expiry advances, so both
 // must remain live. Separate readings let tests model suspend without
 // changing the host clock; callers derive both from one sample
@@ -300,7 +368,7 @@ func Before(now, wallNow, deadline time.Time) bool {
 // on proof (a foreign owner) or on a lapse (renewals kept failing until the
 // local deadline passed): one slow call, or two, is just a retry.
 func (l *Lease) renew() {
-	defer close(l.done)
+	defer l.finish()
 	every := l.ttl / 4
 	if every <= 0 {
 		every = time.Millisecond
@@ -318,8 +386,8 @@ func (l *Lease) renew() {
 		// go again, and a renewal that then found the object free would
 		// resume serving state missing those writes. Only a fresh
 		// acquisition, followed by the caller's catch-up, may pick it back up.
-		if l.Valid() != nil {
-			l.Fence()
+		if err := l.Valid(); err != nil {
+			l.fenceFor(err)
 			return
 		}
 		// Bounded: a hung store makes a renewal unresolved, never a pinned
@@ -337,8 +405,8 @@ func (l *Lease) renew() {
 			if err == nil {
 				break
 			}
-			if l.Log != nil {
-				l.Log.Warn("lease renewal failed", "key", l.key, "attempt", attempt+1, "took", time.Since(t0).Round(time.Millisecond), "err", err)
+			if log := l.logger(); log != nil {
+				log.Warn("lease renewal failed", "key", l.key, "attempt", attempt+1, "took", time.Since(t0).Round(time.Millisecond), "err", err)
 			}
 			if errors.Is(err, ErrNotOwner) {
 				break
@@ -347,8 +415,12 @@ func (l *Lease) renew() {
 		if err == nil {
 			continue
 		}
-		if errors.Is(err, ErrNotOwner) || l.Valid() != nil {
-			l.Fence()
+		if errors.Is(err, ErrNotOwner) {
+			l.fenceFor(err)
+			return
+		}
+		if verr := l.Valid(); verr != nil {
+			l.fenceFor(fmt.Errorf("%w (last renewal: %w)", verr, err))
 			return
 		}
 	}
@@ -356,35 +428,55 @@ func (l *Lease) renew() {
 
 // Fence retires the lease in this process for good: Valid refuses until a
 // fresh acquisition. The fence callback runs once, on the first Fence.
-func (l *Lease) Fence() {
+func (l *Lease) Fence() { l.fenceFor(errors.New("fenced by caller")) }
+
+// fenceFor is Fence with the reason logged at Warn.
+func (l *Lease) fenceFor(reason error) {
 	l.mu.Lock()
-	already, fn := l.fenced, l.fence
+	already, fn, log := l.fenced, l.fence, l.log
 	l.fenced, l.interrupted = true, true
 	l.mu.Unlock()
-	if !already && fn != nil {
+	if already {
+		return
+	}
+	if log != nil {
+		log.Warn("lease fenced", "key", l.key, "owner", l.owner, "reason", reason)
+	}
+	if fn != nil {
 		fn()
 	}
 }
 
 // Retire stops renewing without touching the object. The lease then simply
-// expires for whoever wants it next. Never call it from the fence callback:
-// it joins the renewal goroutine. A nil lease is a no-op.
+// expires for whoever wants it next. It waits for a running renewal
+// goroutine to exit (at most about one TTL), so never call it from the
+// fence callback. A nil lease is a no-op.
 func (l *Lease) Retire() {
 	if l == nil {
 		return
 	}
+	l.retire()
+	<-l.done
+}
+
+// retire stops renewal and, when no renewer was ever started, ends the
+// lease itself. It does not wait.
+func (l *Lease) retire() {
 	l.mu.Lock()
 	l.interrupted = true
-	l.mu.Unlock()
 	l.stopOnce.Do(func() { close(l.stop) })
-	<-l.done
+	if !l.started {
+		l.finish()
+	}
+	l.mu.Unlock()
 }
 
 // Continuous reports that this process has held the token without a break
 // since it was acquired: valid now, never fenced, never retired or
 // released, and not waiting to re-prove itself (FloorProven). It is a
 // purely LOCAL question and the only claim a writer can make about its own
-// next sequence without a store read.
+// next sequence without a store read. Also a test hook: no package in this
+// module calls it.
 func (l *Lease) Continuous() bool {
 	if l == nil {
 		return false
@@ -400,7 +492,8 @@ func (l *Lease) Continuous() bool {
 // FloorProven records that the holder checked its position against the
 // durable state and the check passed, which closes an interruption:
 // nothing can have overtaken this holder between that read and its own
-// next sequence without taking the lease, which fences it again.
+// next sequence without taking the lease, which fences it again. Also a
+// test hook: no package in this module calls it.
 func (l *Lease) FloorProven() {
 	if l == nil {
 		return
@@ -412,26 +505,37 @@ func (l *Lease) FloorProven() {
 
 // Release is Retire plus a handover: a CAS writing an already-expired body,
 // so the next process takes over immediately instead of waiting out the TTL.
-// Best effort and bounded by the TTL; a release that does not land just
-// means the lease expires on its own. The ETag CAS is what makes it safe to
-// call on a lease we may have already lost. A nil lease is a no-op.
-func (l *Lease) Release() {
+// Best effort, bounded by ctx and by the TTL; a release that does not land
+// just means the lease expires on its own. If ctx ends while the renewal
+// goroutine is still finishing an attempt, Release stops the lease locally
+// and skips the handover. The ETag CAS is what makes it safe to call on a
+// lease we may have already lost. A nil lease is a no-op.
+func (l *Lease) Release(ctx context.Context) {
 	if l == nil {
 		return
 	}
-	l.Retire()
+	l.retire()
 	// Local first, and unconditionally: having promised the lease to
 	// whoever takes it next, this process must stop acting on it now, not
-	// when the deadline it last renewed happens to run out.
+	// when the deadline it last renewed happens to run out. A renewal still
+	// in flight cannot undo this: hold refuses a lapsed deadline.
 	l.mu.Lock()
 	l.deadline = time.Time{}
 	l.mu.Unlock()
+	select {
+	case <-l.done:
+	case <-ctx.Done():
+		return
+	}
+	l.mu.Lock()
+	nonce := l.nonce
+	l.mu.Unlock()
 	// Urgent like Take: the handover must not queue behind bulk writes, or
 	// the next holder waits the TTL instead of taking over now.
-	ctx, cancel := context.WithTimeout(objstore.Urgent(context.Background()), l.ttl)
+	ctx, cancel := context.WithTimeout(objstore.Urgent(ctx), l.ttl)
 	defer cancel()
 	cur, etag, err := Load(ctx, l.store, l.key)
-	if err != nil || etag == "" || cur.Owner != l.owner || cur.Nonce != l.nonce {
+	if err != nil || etag == "" || cur.Owner != l.owner || cur.Nonce != nonce {
 		return
 	}
 	cur.Expiry = time.Time{}
@@ -446,7 +550,7 @@ func (l *Lease) Release() {
 // nil): free. A CORRUPT lease is (zero, etag, nil): free, but taken over by
 // CAS on the etag just read, so garbage at the key self-heals instead of
 // blocking the key forever.
-func Load(ctx context.Context, s *objstore.Store, key string) (Body, string, error) {
+func Load(ctx context.Context, s Store, key string) (Body, string, error) {
 	data, etag, err := s.GetWithETag(ctx, key)
 	if errors.Is(err, objstore.ErrNotFound) {
 		return Body{}, "", nil
@@ -464,17 +568,18 @@ func Load(ctx context.Context, s *objstore.Store, key string) (Body, string, err
 // Steal writes the lease at key in owner's name, bypassing local
 // continuity, so tests and operators can simulate another process taking
 // it. The victim's next renewal fails with ErrNotOwner. It retries while
-// the victim's own CAS moves the ETag.
-func Steal(ctx context.Context, s *objstore.Store, key, owner string, ttl time.Duration) error {
+// the victim's own CAS moves the ETag. Test hook: it breaks the protocol
+// on purpose.
+func Steal(ctx context.Context, s Store, key, owner string, ttl time.Duration) error {
 	l := New(s, key, owner, ttl)
-	close(l.done) // no renewal goroutine: this lease is scenery
+	l.finish() // no renewal goroutine: this lease is scenery
 	return l.Steal(ctx)
 }
 
 // Steal rewrites l's own record under a fresh nonce, bypassing local
 // continuity: the handle stays valid for its holder while any other
 // holder's next renewal fails. Retried while a concurrent CAS moves the
-// ETag.
+// ETag. Test hook: it breaks the protocol on purpose.
 func (l *Lease) Steal(ctx context.Context) error {
 	var err error
 	for range 20 {
@@ -500,17 +605,19 @@ func (l *Lease) Key() string { return l.key }
 func (l *Lease) Owner() string { return l.owner }
 
 // Store is the store the lease lives in.
-func (l *Lease) Store() *objstore.Store { return l.store }
+func (l *Lease) Store() Store { return l.store }
 
 // TTL is the lease's validity interval.
 func (l *Lease) TTL() time.Duration { return l.ttl }
 
-// Done is closed when the renewal goroutine has exited.
+// Done is closed when the lease has ended in this process: the renewal
+// goroutine exited, or, for a lease with no renewer (driven by Take), it
+// was retired or released.
 func (l *Lease) Done() <-chan struct{} { return l.done }
 
 // Expire moves the lease's local deadline into the past, so its next
-// validity check fails as if the TTL had elapsed. For tests of the fences
-// that rest on the lease.
+// validity check fails as if the TTL had elapsed. Test hook: for tests of
+// the fences that rest on the lease.
 func (l *Lease) Expire() {
 	l.mu.Lock()
 	l.deadline = time.Now().Add(-time.Second)

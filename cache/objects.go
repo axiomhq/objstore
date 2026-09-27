@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"log/slog"
 	"runtime/debug"
 	"sync"
 	"sync/atomic"
@@ -30,11 +31,68 @@ type Cache struct {
 	Resident     *Resident
 	Disk         *Disk
 	keys         Keys
-	flight       singleflight.Group  // coalesces concurrent loads of one key
+	flight       singleflight.Group // coalesces concurrent loads of one key
+	flightMu     sync.Mutex         // guards flights
+	flights      map[string]*flightRef
 	Gate         *semaphore.Weighted // GateWidth store GET slots; occupancy in GateInUse
-	GateInUse    atomic.Int64
+	GateInUse    atomic.Int64        // store GET slots taken (AcquireGet)
 	invalidateMu sync.Mutex
 	classes      classCounters
+}
+
+// flightRef counts the callers waiting on one singleflight key, so a load
+// runs as long as anyone still wants it and no longer: it is detached from
+// the leader's cancellation and cancelled when the last waiter leaves.
+type flightRef struct {
+	n      int
+	cancel context.CancelFunc // the running load's; nil before it starts
+	dead   bool               // every waiter left
+}
+
+// join registers a waiter on key's flight. leave, called once the waiter
+// has its answer or gave up, cancels the load and forgets the flight when
+// it was the last one, so a later caller starts afresh rather than joining
+// a cancelled load.
+func (c *Cache) join(key string) (ref *flightRef, leave func()) {
+	c.flightMu.Lock()
+	defer c.flightMu.Unlock()
+	if c.flights == nil {
+		c.flights = make(map[string]*flightRef)
+	}
+	ref = c.flights[key]
+	if ref == nil {
+		ref = &flightRef{}
+		c.flights[key] = ref
+	}
+	ref.n++
+	return ref, func() {
+		c.flightMu.Lock()
+		defer c.flightMu.Unlock()
+		if ref.n--; ref.n > 0 {
+			return
+		}
+		ref.dead = true
+		if ref.cancel != nil {
+			ref.cancel()
+		}
+		delete(c.flights, key)
+		c.flight.Forget(key)
+	}
+}
+
+// start gives the load of ref's flight a context that keeps the leader's
+// values but not its cancellation; it is cancelled when every waiter has
+// left (at once if they already have). The caller calls done when the
+// load returns.
+func (c *Cache) start(ref *flightRef, leader context.Context) (ctx context.Context, done func()) {
+	ctx, cancel := context.WithCancel(context.WithoutCancel(leader))
+	c.flightMu.Lock()
+	defer c.flightMu.Unlock()
+	if ref.dead {
+		cancel()
+	}
+	ref.cancel = cancel
+	return ctx, cancel
 }
 
 // Keys tells the cache what a key holds. A nil func matches no key.
@@ -83,29 +141,38 @@ func (c *Cache) ByteCacheFor(key string) *ByteCache {
 	return c.Memory
 }
 
+// InvalidateNamespace forgets namespace name (deleted, or recreated under
+// the same name) in every tier: its memory entries go, loads of its keys
+// in flight cannot publish, and its disk entries become unreachable (the
+// disk key carries the new generation) and age out. Other namespaces are
+// untouched. Disk pins name the old disk keys: the caller must Unpin, or
+// re-Pin under the new generation, the namespace's pins.
 func (c *Cache) InvalidateNamespace(name string) {
 	c.invalidateMu.Lock()
 	defer c.invalidateMu.Unlock()
 	// Retire in-flight publications in all budgets before sweeping any.
-	c.Memory.Generation.Add(1)
-	c.WAL.Generation.Add(1)
+	c.Memory.gens.bump(name)
+	c.WAL.gens.bump(name)
 	c.Memory.sweepNamespace(name)
 	c.WAL.sweepNamespace(name)
 	c.Resident.InvalidateNamespace(name)
 }
 
+// Close closes the disk tier.
 func (c *Cache) Close() { c.Disk.Close() }
 
 // Put writes an immutable object and caches it on the way past, in memory
 // and on disk, so the process that published it never re-reads it: the
 // memory entry of a large object may be low priority (Keys.Low) and go
 // first, and the range reads after that (CachedRange) find it on disk.
+// The memory tier aliases data, which must not be mutated after Put.
 func (c *Cache) Put(ctx context.Context, key string, data []byte) error {
+	memory := c.ByteCacheFor(key)
+	// Read before the write: an invalidation during it retires this fill.
+	generation := memory.GenerationOf(key)
 	if err := c.Store.Put(ctx, key, data); err != nil {
 		return err
 	}
-	memory := c.ByteCacheFor(key)
-	generation := memory.Generation.Load()
 	memory.Put(key, data, generation)
 	c.Disk.Put(DiskKey(key, generation), data)
 	return nil
@@ -128,6 +195,7 @@ func (c *Cache) AcquireGet(ctx context.Context) error {
 	return nil
 }
 
+// ReleaseGet returns a slot AcquireGet took.
 func (c *Cache) ReleaseGet() {
 	c.GateInUse.Add(-1)
 	c.Gate.Release(1)
@@ -140,10 +208,12 @@ func (c *Cache) FetchWith(ctx context.Context, key string, load func(context.Con
 	return c.FetchCached(ctx, key, load, true)
 }
 
-// FetchCachedRange caches a decoded single-child range while charging the
-// store tier for its physical length instead of the decoded child's length.
-// It counts nothing: the range reader, which already missed key in both
-// tiers, counts the returned outcome, who answered it in the end.
+// FetchCachedRange fetches a decoded single-child range through the tiers.
+// storedBytes is the child's physical length; any positive value gives it
+// a flight of its own, so a whole-object fetch that loads the same key as
+// a child range cannot wait on itself. It counts nothing: the range
+// reader, which already missed key in both tiers, counts the returned
+// outcome, who answered it in the end.
 func (c *Cache) FetchCachedRange(ctx context.Context, key string, storedBytes int, load func(context.Context) ([]byte, error)) ([]byte, Outcome, error) {
 	b, o, _, err := c.fetchCached(ctx, key, load, false, storedBytes)
 	return b, o, err
@@ -179,7 +249,7 @@ func (c *Cache) fetchCached(ctx context.Context, key string, load func(context.C
 		return b, MemoryHit, false, nil
 	}
 	owner := logical && MarkMissed(ctx, key)
-	generation := memory.Generation.Load()
+	generation := memory.GenerationOf(key)
 	flightKey := DiskKey(key, generation)
 	flightGroupKey := flightKey
 	if storedBytes > 0 {
@@ -193,15 +263,22 @@ func (c *Cache) fetchCached(ctx context.Context, key string, load func(context.C
 		outcome Outcome
 	}
 	var led atomic.Bool // this caller ran the flight: its outcome is the load's
+	ref, leave := c.join(flightGroupKey)
+	defer leave()
 	ch := c.flight.DoChan(flightGroupKey, func() (v any, err error) {
 		led.Store(true)
 		// DoChan re-raises a loader panic on singleflight's own goroutine,
 		// where nothing can recover it: convert it into every waiter's error.
 		defer func() {
 			if p := recover(); p != nil {
-				v, err = nil, fmt.Errorf("cache: fetch %s: panic: %v\n%s", key, p, debug.Stack())
+				slog.Error("cache: loader panic", "key", key, "panic", p, "stack", string(debug.Stack()))
+				v, err = nil, fmt.Errorf("cache: fetch %s: panic: %v", key, p)
 			}
 		}()
+		// The load serves every waiter, not just this one: the leader
+		// leaving must not fail the rest (join).
+		fctx, done := c.start(ref, ctx)
+		defer done()
 		if b, ok := memory.Peek(key); ok { // a concurrent fill
 			return fetched{b, MemoryHit}, nil
 		}
@@ -211,7 +288,7 @@ func (c *Cache) fetchCached(ctx context.Context, key string, load func(context.C
 		}
 		parent, _ := ctx.Value(loadSourceKey{}).(*loadSource)
 		source := &loadSource{parent: parent}
-		b, err := load(context.WithValue(ctx, loadSourceKey{}, source))
+		b, err := load(context.WithValue(fctx, loadSourceKey{}, source))
 		if err != nil {
 			return nil, err
 		}
@@ -252,7 +329,7 @@ func (c *Cache) fetchCached(ctx context.Context, key string, load func(context.C
 // is a memory hit and the disk is read once per eviction, not per query.
 func (c *Cache) FromDisk(ctx context.Context, key string) ([]byte, bool) {
 	memory := c.ByteCacheFor(key)
-	generation := memory.Generation.Load()
+	generation := memory.GenerationOf(key)
 	b, ok := c.Disk.Get(DiskKey(key, generation))
 	if ok {
 		c.Note(ctx, key, DiskHit)
@@ -280,7 +357,7 @@ func (c *Cache) CachedRange(key string, off, n int64) (b []byte, fromDisk, ok bo
 		}
 		return whole[off : off+n : off+n], false, true
 	}
-	if b, ok := c.Disk.GetRange(DiskKey(key, memory.Generation.Load()), off, n); ok {
+	if b, ok := c.Disk.GetRange(DiskKey(key, memory.GenerationOf(key)), off, n); ok {
 		return b, true, true
 	}
 	return nil, false, false
@@ -322,7 +399,8 @@ func markStoreRead(ctx context.Context) {
 	}
 }
 
-// Gated runs one store read under the gate.
+// Gated runs one store read under the gate. Under WithBudget it first
+// spends one request, and refuses with ErrBudget once the budget is gone.
 func (c *Cache) Gated(ctx context.Context, read func(context.Context) ([]byte, error)) ([]byte, error) {
 	if b, ok := ctx.Value(budgetKey{}).(*Budget); ok && b.Spend() {
 		return nil, ErrBudget
@@ -356,18 +434,33 @@ type budgetKey struct{}
 // Budget caps the store requests one BACKGROUND job may issue. Nothing on a
 // request path carries one.
 type Budget struct {
-	max   int64
-	spent atomic.Int64
+	limit int64
+	spent atomic.Int64 // stops at limit+1: one refusal is enough to know
 }
 
 // ErrBudget is the background-read budget's exhaustion.
 var ErrBudget = errors.New("cache: background read budget exhausted")
 
-// WithBudget bounds the store requests reads under ctx may make.
-func WithBudget(ctx context.Context, max int) (context.Context, *Budget) {
-	b := &Budget{max: int64(max)}
+// WithBudget bounds the store requests reads under ctx may make (Gated) to
+// limit.
+func WithBudget(ctx context.Context, limit int) (context.Context, *Budget) {
+	b := &Budget{limit: int64(limit)}
 	return context.WithValue(ctx, budgetKey{}, b), b
 }
 
-func (b *Budget) Spend() bool    { return b.spent.Add(1) > b.max }
-func (b *Budget) Exceeded() bool { return b.spent.Load() > b.max }
+// Spend takes one request from the budget and reports whether it was
+// already exhausted (the request must not be made).
+func (b *Budget) Spend() bool {
+	for {
+		n := b.spent.Load()
+		if n > b.limit {
+			return true
+		}
+		if b.spent.CompareAndSwap(n, n+1) {
+			return n+1 > b.limit
+		}
+	}
+}
+
+// Exceeded reports whether Spend has refused a request.
+func (b *Budget) Exceeded() bool { return b.spent.Load() > b.limit }

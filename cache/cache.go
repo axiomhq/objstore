@@ -1,7 +1,9 @@
 package cache
 
 import (
+	"fmt"
 	"hash/maphash"
+	"math/bits"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -15,6 +17,9 @@ const Stripes = 16
 // ByteCache holds immutable object bytes and decoded values under one budget.
 // Local namespace deletion/recreation invalidates raw and derived entries.
 //
+// Every entry is charged its bytes, its decode, its key and EntryOverhead
+// for its bookkeeping, so even empty values cannot grow the cache past Cap.
+//
 // The budget is split evenly across stripes and LRU is per stripe, so
 // eviction is approximate globally: the victim is the least recently used
 // entry of the stripe the incoming key hashes to. An entry larger than a
@@ -26,11 +31,11 @@ const Stripes = 16
 // regular and low entries both fit keeps both; one that does not loses low
 // entries, never a regular one to a low one.
 type ByteCache struct {
-	Cap        int // total; each stripe holds cap/len(stripes)
-	seed       maphash.Seed
-	stripes    []cacheStripe
-	low        func(key string) bool // nil: every entry is regular
-	Generation atomic.Uint64         // invalidation also retires in-flight publications
+	Cap     int // total; each stripe holds cap/len(stripes)
+	seed    maphash.Seed
+	stripes []cacheStripe
+	low     func(key string) bool // nil: every entry is regular
+	gens    generations           // per namespace; invalidation also retires in-flight publications
 
 	hits, misses       atomic.Int64
 	lowHits, lowMisses atomic.Int64
@@ -50,6 +55,11 @@ type lru struct {
 	head, tail *entry // head = most recently used
 	size       int
 }
+
+// EntryOverhead approximates one entry's bookkeeping (the entry struct and
+// its map slot). ByteCache charges every entry len(key)+EntryOverhead on
+// top of its bytes and decode.
+const EntryOverhead = 64
 
 type entry struct {
 	key        string
@@ -81,11 +91,58 @@ type Sizer interface {
 
 var _ sizedDecoded = concreteDecoded{}
 
+// generations counts invalidations per namespace. A key's generation is
+// its namespace's; keys outside ns/<name>/ are always at generation 0.
+type generations struct {
+	mu   sync.RWMutex
+	gens map[string]uint64
+}
+
+// of is key's current generation.
+func (g *generations) of(key string) uint64 {
+	name := logicalNamespace(key)
+	if name == "" {
+		return 0
+	}
+	g.mu.RLock()
+	defer g.mu.RUnlock()
+	return g.gens[name]
+}
+
+// bump retires every generation of name read so far.
+func (g *generations) bump(name string) {
+	g.mu.Lock()
+	defer g.mu.Unlock()
+	if g.gens == nil {
+		g.gens = make(map[string]uint64)
+	}
+	g.gens[name]++
+}
+
+// logicalNamespace is the <name> of a logical key under ns/<name>/, or "".
+func logicalNamespace(key string) string {
+	rest, ok := strings.CutPrefix(key, "ns/")
+	if !ok {
+		return ""
+	}
+	name, _, ok := strings.Cut(rest, "/")
+	if !ok {
+		return ""
+	}
+	return name
+}
+
+// NewByteCache returns a cache of capBytes split over Stripes stripes.
 func NewByteCache(capBytes int) *ByteCache { return NewByteCacheStripes(capBytes, Stripes) }
 
-// NewByteCacheStripes is NewByteCache with an explicit stripe count. Tests that
+// NewByteCacheStripes is NewByteCache with an explicit stripe count, rounded
+// up to a power of two. It panics if stripes is not positive. Tests that
 // assert exact LRU order use one stripe.
 func NewByteCacheStripes(capBytes, stripes int) *ByteCache {
+	if stripes <= 0 {
+		panic(fmt.Sprintf("cache: NewByteCacheStripes: stripes must be positive, got %d", stripes))
+	}
+	stripes = 1 << bits.Len(uint(stripes-1))
 	c := &ByteCache{Cap: capBytes, seed: maphash.MakeSeed(), stripes: make([]cacheStripe, stripes)}
 	for i := range c.stripes {
 		c.stripes[i] = cacheStripe{cap: capBytes / stripes, items: map[string]*entry{}}
@@ -108,7 +165,13 @@ func (c *ByteCache) stripe(key string) *cacheStripe {
 	return &c.stripes[maphash.String(c.seed, key)&uint64(len(c.stripes)-1)]
 }
 
-// Callers must never mutate the returned slice — it is the shared cached value.
+// GenerationOf is key's namespace generation. Read it before loading key and
+// pass it to Put, PutValue or PutDecoded: an InvalidateNamespace in between
+// makes the publication a no-op.
+func (c *ByteCache) GenerationOf(key string) uint64 { return c.gens.of(key) }
+
+// Get returns key's bytes and counts a hit or a miss. Callers must never
+// mutate the returned slice: it is the shared cached value.
 func (c *ByteCache) Get(key string) ([]byte, bool) {
 	return c.get(key, true)
 }
@@ -144,31 +207,38 @@ func (c *ByteCache) get(key string, stat bool) ([]byte, bool) {
 	return e.val, true
 }
 
-// val must not be mutated after Put — the cache aliases it.
+// Put caches val under key if generation (from GenerationOf, read before
+// val was loaded) is still current. Keys are immutable: a key already
+// cached keeps its first value. A value larger than its stripe is not
+// admitted. The cache aliases val, which must not be mutated after Put.
 func (c *ByteCache) Put(key string, val []byte, generation uint64) {
 	s := c.stripe(key)
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	if generation != c.Generation.Load() {
+	if generation != c.gens.of(key) {
 		return
 	}
 	if _, ok := s.items[key]; ok {
 		return // immutable: same key always means same bytes; first write wins
 	}
-	if len(val) > s.cap {
+	e := &entry{key: key, val: val, low: c.isLow(key)}
+	n := e.base()
+	if n > s.cap {
 		return // would evict the entire stripe for one value; not worth it
 	}
-	e := &entry{key: key, val: val, low: c.isLow(key)}
-	if e.low && len(val) > s.lowFloor && s.lists[0].size+len(val) > s.cap {
+	if e.low && n > s.lowFloor && s.lists[0].size+n > s.cap {
 		// Past the floor and past what regular entries leave free, it would
 		// evict every other low entry of the stripe and then itself.
 		return
 	}
 	s.items[key] = e
 	s.pushFront(e)
-	s.charge(e, len(val))
+	s.charge(e, n)
 	s.evictLocked()
 }
+
+// base is e's charge without its decode: bytes, key and bookkeeping.
+func (e *entry) base() int { return len(e.val) + len(e.key) + EntryOverhead }
 
 // evictLocked drops least-recently-used entries until the stripe is back
 // under cap: low-priority ones while they hold more than their floor (or
@@ -204,7 +274,7 @@ func (s *cacheStripe) list(e *entry) *lru {
 func (s *cacheStripe) remove(e *entry) {
 	s.unlink(e)
 	delete(s.items, e.key)
-	s.charge(e, -(len(e.val) + e.dsize))
+	s.charge(e, -(e.base() + e.dsize))
 }
 
 func (s *cacheStripe) unlink(e *entry) {
@@ -251,19 +321,19 @@ func (c *ByteCache) PutValue(key string, v any, size int, generation uint64) {
 	s := c.stripe(key)
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	if generation != c.Generation.Load() {
+	if generation != c.gens.of(key) {
 		return
 	}
 	if _, ok := s.items[key]; ok {
 		return
 	}
-	if size > s.cap {
+	e := &entry{key: key, low: c.isLow(key), decoded: concreteDecoded{value: v, bytes: size}, dsize: size}
+	if size > s.cap-e.base() {
 		return
 	}
-	e := &entry{key: key, low: c.isLow(key), decoded: concreteDecoded{value: v, bytes: size}, dsize: size}
 	s.items[key] = e
 	s.pushFront(e)
-	s.charge(e, size)
+	s.charge(e, e.base()+size)
 	s.evictLocked()
 }
 
@@ -275,16 +345,13 @@ func (c *ByteCache) PutValue(key string, v any, size int, generation uint64) {
 // sizes are explicit charges, for derived layouts that share
 // already-accounted backing bytes.
 func (c *ByteCache) PutDecoded(key string, v any, size int, generation uint64) {
-	if generation != c.Generation.Load() {
-		return
-	}
 	if size < 0 {
 		return
 	}
 	s := c.stripe(key)
 	if size == 0 {
 		sizer, ok := v.(Sizer)
-		if !ok || sizer == nil {
+		if !ok {
 			return
 		}
 		if size = sizer.CacheBytes(); size <= 0 || size > s.cap {
@@ -293,14 +360,14 @@ func (c *ByteCache) PutDecoded(key string, v any, size int, generation uint64) {
 	}
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	if generation != c.Generation.Load() {
+	if generation != c.gens.of(key) {
 		return
 	}
 	e, ok := s.items[key]
 	if !ok {
 		return
 	}
-	if size > s.cap-len(e.val) {
+	if size > s.cap-e.base() {
 		return
 	}
 	s.charge(e, size-e.dsize) // a re-decode replaces the charge, never doubles it
@@ -308,10 +375,13 @@ func (c *ByteCache) PutDecoded(key string, v any, size int, generation uint64) {
 	s.evictLocked()
 }
 
+// InvalidateNamespace drops every entry under ns/<name>/ and retires the
+// namespace's generation, so a load of one of its keys still in flight
+// cannot publish afterwards. Other namespaces are untouched.
 func (c *ByteCache) InvalidateNamespace(name string) {
 	// Bump first: a Put racing this sweep either lands before it and is
 	// swept, or sees the new generation and is refused.
-	c.Generation.Add(1)
+	c.gens.bump(name)
 	c.sweepNamespace(name)
 }
 

@@ -3,115 +3,258 @@ package kms
 import (
 	"bytes"
 	"context"
-	"crypto/sha256"
 	"errors"
 	"os"
 	"path/filepath"
+	"runtime"
+	"strings"
 	"testing"
-
-	"cloud.google.com/go/kms/apiv1/kmspb"
-	"github.com/aws/aws-sdk-go-v2/aws"
-	"github.com/aws/aws-sdk-go-v2/service/kms"
-	"github.com/googleapis/gax-go/v2"
 )
 
-type fakeAWS struct{ revoked bool }
-
-func (f *fakeAWS) Encrypt(_ context.Context, in *kms.EncryptInput, _ ...func(*kms.Options)) (*kms.EncryptOutput, error) {
-	if f.revoked {
-		return nil, errors.New("revoked")
-	}
-	sum := sha256.Sum256(in.Plaintext)
-	return &kms.EncryptOutput{CiphertextBlob: append(append([]byte("aws"), in.Plaintext...), sum[:]...), KeyId: in.KeyId}, nil
-}
-func (f *fakeAWS) Decrypt(_ context.Context, in *kms.DecryptInput, _ ...func(*kms.Options)) (*kms.DecryptOutput, error) {
-	if f.revoked {
-		return nil, errors.New("revoked")
-	}
-	if !bytes.HasPrefix(in.CiphertextBlob, []byte("aws")) || len(in.CiphertextBlob) != 67 {
-		return nil, errors.New("bad ciphertext")
-	}
-	sum := sha256.Sum256(in.CiphertextBlob[3:35])
-	if !bytes.Equal(sum[:], in.CiphertextBlob[35:]) {
-		return nil, errors.New("bad ciphertext")
-	}
-	return &kms.DecryptOutput{Plaintext: in.CiphertextBlob[3:35], KeyId: aws.String("arn:aws:kms:us-east-1:123:key/test")}, nil
-}
-
-type fakeGCP struct {
-	revoked bool
-	version string
-}
-
-func (f *fakeGCP) Encrypt(_ context.Context, in *kmspb.EncryptRequest, _ ...gax.CallOption) (*kmspb.EncryptResponse, error) {
-	if f.revoked {
-		return nil, errors.New("revoked")
-	}
-	sum := sha256.Sum256(in.Plaintext)
-	ciphertext := append(append([]byte("gcp"), in.Plaintext...), sum[:]...)
-	return &kmspb.EncryptResponse{Name: in.Name + "/cryptoKeyVersions/" + f.version, Ciphertext: ciphertext, VerifiedPlaintextCrc32C: true, CiphertextCrc32C: checksum(ciphertext)}, nil
-}
-func (f *fakeGCP) Decrypt(_ context.Context, in *kmspb.DecryptRequest, _ ...gax.CallOption) (*kmspb.DecryptResponse, error) {
-	if f.revoked {
-		return nil, errors.New("revoked")
-	}
-	if !bytes.HasPrefix(in.Ciphertext, []byte("gcp")) || len(in.Ciphertext) != 67 {
-		return nil, errors.New("bad ciphertext")
-	}
-	sum := sha256.Sum256(in.Ciphertext[3:35])
-	if !bytes.Equal(sum[:], in.Ciphertext[35:]) {
-		return nil, errors.New("bad ciphertext")
-	}
-	return &kmspb.DecryptResponse{Plaintext: in.Ciphertext[3:35], PlaintextCrc32C: checksum(in.Ciphertext[3:35])}, nil
-}
-
-func TestKeyProviders(t *testing.T) {
-	ctx := context.Background()
-	dek := bytes.Repeat([]byte{42}, 32)
-	dir := t.TempDir()
-	if err := os.WriteFile(filepath.Join(dir, "test"), bytes.Repeat([]byte{7}, 32), 0o600); err != nil {
+func writeKey(t *testing.T, dir, name string, b byte, perm os.FileMode) {
+	t.Helper()
+	path := filepath.Join(dir, name)
+	if err := os.WriteFile(path, bytes.Repeat([]byte{b}, DEKSize), perm); err != nil {
 		t.Fatal(err)
 	}
-	awsClient := &fakeAWS{}
-	gcpClient := &fakeGCP{version: "1"}
-	router := Router{Local: LocalFile{Dir: dir}, AWS: AWSKMS{Client: awsClient}, GCP: GCPKMS{Client: gcpClient}}
-	if !router.LeaseCadenced("aws:arn:aws:kms:us-east-1:123:key/test") || router.LeaseCadenced("local:test") {
-		t.Fatal("AWS-only lease cadence selection")
+	if err := os.Chmod(path, perm); err != nil { // defeat umask
+		t.Fatal(err)
 	}
-	if !(Router{Default: router.AWS}).LeaseCadenced("arn:aws:kms:us-east-1:123:key/test") {
-		t.Fatal("default AWS provider must use lease cadence")
-	}
-	router.Default = router.Local
-	if wrapped, _, err := router.Wrap(ctx, "test", dek); err != nil {
-		t.Fatalf("default provider wrap: %v", err)
-	} else if got, err := router.Unwrap(ctx, "test", wrapped); err != nil || !bytes.Equal(got, dek) {
-		t.Fatalf("default provider unwrap: %v", err)
-	}
-	for _, keyName := range []string{"local:test", "aws:arn:aws:kms:us-east-1:123:key/test", "gcp:projects/p/locations/l/keyRings/r/cryptoKeys/k"} {
-		t.Run(keyName, func(t *testing.T) {
-			wrapped, version, err := router.Wrap(ctx, keyName, dek)
-			if err != nil || version == "" || bytes.Equal(wrapped, dek) {
-				t.Fatalf("wrap: version=%q err=%v", version, err)
+}
+
+func TestLocalFile(t *testing.T) {
+	ctx := t.Context()
+	dek := bytes.Repeat([]byte{42}, DEKSize)
+
+	t.Run("RoundTrip", func(t *testing.T) {
+		dir := t.TempDir()
+		writeKey(t, dir, "k", 7, 0o600)
+		p := LocalFile{Dir: dir}
+		wrapped, version, err := p.Wrap(ctx, "local:k", dek)
+		if err != nil || len(version) != versionLen || len(wrapped) != wrappedLen {
+			t.Fatalf("wrap: version=%q len=%d err=%v", version, len(wrapped), err)
+		}
+		got, err := p.Unwrap(ctx, "local:k", wrapped)
+		if err != nil || !bytes.Equal(got, dek) {
+			t.Fatalf("unwrap: %v", err)
+		}
+	})
+
+	t.Run("Tamper", func(t *testing.T) {
+		dir := t.TempDir()
+		writeKey(t, dir, "k", 7, 0o600)
+		p := LocalFile{Dir: dir}
+		wrapped, _, err := p.Wrap(ctx, "local:k", dek)
+		if err != nil {
+			t.Fatal(err)
+		}
+		for _, i := range []int{versionLen, len(wrapped) - 1} {
+			bad := bytes.Clone(wrapped)
+			bad[i] ^= 1
+			if _, err := p.Unwrap(ctx, "local:k", bad); !errors.Is(err, ErrKeyUnavailable) {
+				t.Fatalf("byte %d tampered: %v", i, err)
 			}
-			got, err := router.Unwrap(ctx, keyName, wrapped)
-			if err != nil || !bytes.Equal(got, dek) {
-				t.Fatalf("unwrap: %v", err)
+		}
+		if _, err := p.Unwrap(ctx, "local:k", wrapped[:len(wrapped)-1]); !errors.Is(err, ErrKeyUnavailable) {
+			t.Fatalf("truncated: %v", err)
+		}
+	})
+
+	t.Run("Traversal", func(t *testing.T) {
+		dir := t.TempDir()
+		writeKey(t, dir, "k", 7, 0o600)
+		p := LocalFile{Dir: filepath.Join(dir, "sub")}
+		if err := os.Mkdir(p.Dir, 0o700); err != nil {
+			t.Fatal(err)
+		}
+		for _, name := range []string{"local:../k", "local:..", "local:.", "local:", "local:a/b", `local:a\b`, "k"} {
+			if _, _, err := p.Wrap(ctx, name, dek); !errors.Is(err, ErrKeyUnavailable) {
+				t.Errorf("%q: %v", name, err)
 			}
-			wrapped[len(wrapped)-1] ^= 1
-			if _, err := router.Unwrap(ctx, keyName, wrapped); err == nil {
-				t.Fatal("tampered ciphertext accepted")
+		}
+	})
+
+	t.Run("SymlinkRefused", func(t *testing.T) {
+		if runtime.GOOS == "windows" {
+			t.Skip("symlinks need privileges on windows")
+		}
+		dir := t.TempDir()
+		writeKey(t, dir, "k", 7, 0o600)
+		if err := os.Symlink("k", filepath.Join(dir, "link")); err != nil {
+			t.Fatal(err)
+		}
+		_, _, err := LocalFile{Dir: dir}.Wrap(ctx, "local:link", dek)
+		if !errors.Is(err, ErrKeyUnavailable) || !strings.Contains(err.Error(), "symlink") {
+			t.Fatalf("symlink: %v", err)
+		}
+	})
+
+	t.Run("RotationFallback", func(t *testing.T) {
+		dir := t.TempDir()
+		writeKey(t, dir, "k", 7, 0o600)
+		p := LocalFile{Dir: dir}
+		old, oldVersion, err := p.Wrap(ctx, "local:k", dek)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if err := os.Rename(filepath.Join(dir, "k"), filepath.Join(dir, "k."+oldVersion)); err != nil {
+			t.Fatal(err)
+		}
+		writeKey(t, dir, "k", 8, 0o600)
+		_, newVersion, err := p.Wrap(ctx, "local:k", dek)
+		if err != nil || newVersion == oldVersion {
+			t.Fatalf("wrap after rotation: version=%q err=%v", newVersion, err)
+		}
+		if got, err := p.Unwrap(ctx, "local:k", old); err != nil || !bytes.Equal(got, dek) {
+			t.Fatalf("unwrap via k.%s: %v", oldVersion, err)
+		}
+		if err := os.Remove(filepath.Join(dir, "k."+oldVersion)); err != nil {
+			t.Fatal(err)
+		}
+		_, err = p.Unwrap(ctx, "local:k", old)
+		if !errors.Is(err, ErrKeyUnavailable) || !errors.Is(err, os.ErrNotExist) {
+			t.Fatalf("missing rotated key must keep its reason: %v", err)
+		}
+	})
+
+	t.Run("PermissiveModeRefused", func(t *testing.T) {
+		if runtime.GOOS == "windows" {
+			t.Skip("no unix permissions on windows")
+		}
+		dir := t.TempDir()
+		writeKey(t, dir, "k", 7, 0o644)
+		if _, _, err := (LocalFile{Dir: dir}).Wrap(ctx, "local:k", dek); !errors.Is(err, ErrKeyUnavailable) {
+			t.Fatalf("0644 key: %v", err)
+		}
+	})
+
+	t.Run("WrongLength", func(t *testing.T) {
+		dir := t.TempDir()
+		writeKey(t, dir, "k", 7, 0o600)
+		if err := os.WriteFile(filepath.Join(dir, "short"), []byte("short"), 0o600); err != nil {
+			t.Fatal(err)
+		}
+		p := LocalFile{Dir: dir}
+		if _, _, err := p.Wrap(ctx, "local:short", dek); !errors.Is(err, ErrKeyUnavailable) {
+			t.Fatalf("short key file: %v", err)
+		}
+		_, _, err := p.Wrap(ctx, "local:k", dek[:16])
+		if err == nil || errors.Is(err, ErrKeyUnavailable) {
+			t.Fatalf("short DEK must be a plain caller error: %v", err)
+		}
+	})
+
+	t.Run("AADMismatch", func(t *testing.T) {
+		dir := t.TempDir()
+		writeKey(t, dir, "a", 7, 0o600)
+		writeKey(t, dir, "b", 7, 0o600) // same material, different name
+		p := LocalFile{Dir: dir}
+		wrapped, _, err := p.Wrap(ctx, "local:a", dek)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if _, err := p.Unwrap(ctx, "local:b", wrapped); !errors.Is(err, ErrKeyUnavailable) {
+			t.Fatalf("unwrap under another key name: %v", err)
+		}
+	})
+}
+
+// fake records the key name it was called with.
+type fake struct {
+	name    string
+	cadence bool
+	got     string
+}
+
+func (f *fake) Wrap(_ context.Context, keyName string, _ []byte) ([]byte, string, error) {
+	f.got = keyName
+	return []byte(f.name), f.name, nil
+}
+
+func (f *fake) Unwrap(_ context.Context, keyName string, _ []byte) ([]byte, error) {
+	f.got = keyName
+	return []byte(f.name), nil
+}
+
+type cadenced struct{ *fake }
+
+func (c cadenced) LeaseCadenced(string) bool { return c.cadence }
+
+func TestRouter(t *testing.T) {
+	ctx := t.Context()
+	dek := make([]byte, DEKSize)
+
+	t.Run("LongestPrefix", func(t *testing.T) {
+		short, long := &fake{name: "short"}, &fake{name: "long"}
+		r := Router{Routes: map[string]KeyProvider{"aws:": short, "aws:arn:": long}}
+		if _, v, err := r.Wrap(ctx, "aws:arn:x", dek); err != nil || v != "long" || long.got != "aws:arn:x" {
+			t.Fatalf("aws:arn:x: v=%q got=%q err=%v", v, long.got, err)
+		}
+		if _, v, err := r.Wrap(ctx, "aws:other", dek); err != nil || v != "short" {
+			t.Fatalf("aws:other: v=%q err=%v", v, err)
+		}
+		if got, err := r.Unwrap(ctx, "aws:arn:y", nil); err != nil || string(got) != "long" || long.got != "aws:arn:y" {
+			t.Fatalf("unwrap: %q %v", got, err)
+		}
+	})
+
+	t.Run("Default", func(t *testing.T) {
+		def := &fake{name: "def"}
+		r := Router{Routes: map[string]KeyProvider{"gcp:": &fake{}}, Default: def, DefaultScheme: "local:"}
+		if _, v, err := r.Wrap(ctx, "k", dek); err != nil || v != "def" || def.got != "local:k" {
+			t.Fatalf("default: v=%q got=%q err=%v", v, def.got, err)
+		}
+	})
+
+	t.Run("DefaultLocalFile", func(t *testing.T) {
+		dir := t.TempDir()
+		writeKey(t, dir, "k", 7, 0o600)
+		r := Router{Default: LocalFile{Dir: dir}, DefaultScheme: "local:"}
+		wrapped, _, err := r.Wrap(ctx, "k", dek)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if got, err := r.Unwrap(ctx, "k", wrapped); err != nil || !bytes.Equal(got, dek) {
+			t.Fatalf("unwrap: %v", err)
+		}
+	})
+
+	t.Run("NoProvider", func(t *testing.T) {
+		for name, r := range map[string]Router{
+			"zero":      {},
+			"nil route": {Routes: map[string]KeyProvider{"local:": nil}, Default: &fake{}},
+			"empty key": {Default: &fake{}},
+		} {
+			key := "local:k"
+			if name == "empty key" {
+				key = ""
 			}
-		})
-	}
-	awsClient.revoked = true
-	if _, _, err := router.Wrap(ctx, "aws:arn:aws:kms:us-east-1:123:key/test", dek); !errors.Is(err, ErrKeyUnavailable) {
-		t.Fatalf("revoked AWS: %v", err)
-	}
-	gcpClient.revoked = true
-	if _, _, err := router.Wrap(ctx, "gcp:projects/p/locations/l/keyRings/r/cryptoKeys/k", dek); !errors.Is(err, ErrKeyUnavailable) {
-		t.Fatalf("revoked GCP: %v", err)
-	}
-	if _, _, err := router.Wrap(ctx, "local:../escape", dek); !errors.Is(err, ErrKeyUnavailable) {
-		t.Fatalf("path traversal: %v", err)
-	}
+			if _, _, err := r.Wrap(ctx, key, dek); !errors.Is(err, ErrKeyUnavailable) {
+				t.Errorf("%s wrap: %v", name, err)
+			}
+			if _, err := r.Unwrap(ctx, key, nil); !errors.Is(err, ErrKeyUnavailable) {
+				t.Errorf("%s unwrap: %v", name, err)
+			}
+			if r.LeaseCadenced(key) {
+				t.Errorf("%s: lease cadenced without a provider", name)
+			}
+		}
+	})
+
+	t.Run("LeaseCadenced", func(t *testing.T) {
+		r := Router{
+			Routes: map[string]KeyProvider{
+				"aws:":   cadenced{&fake{cadence: true}},
+				"gcp:":   cadenced{&fake{cadence: false}},
+				"local:": &fake{},
+			},
+			Default:       cadenced{&fake{cadence: true}},
+			DefaultScheme: "aws:",
+		}
+		for key, want := range map[string]bool{"aws:arn:x": true, "gcp:projects/p": false, "local:k": false, "arn:x": true} {
+			if got := r.LeaseCadenced(key); got != want {
+				t.Errorf("LeaseCadenced(%q) = %v, want %v", key, got, want)
+			}
+		}
+	})
 }

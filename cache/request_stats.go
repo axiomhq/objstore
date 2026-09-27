@@ -2,6 +2,7 @@ package cache
 
 import (
 	"context"
+	"strconv"
 	"sync"
 	"sync/atomic"
 )
@@ -52,6 +53,8 @@ func loadedByRequest(ctx context.Context, object string) bool {
 	return ok
 }
 
+// WithRequestStats returns a context whose cache lookups are also counted
+// for this request, and the stats they are counted in.
 func WithRequestStats(ctx context.Context) (context.Context, *RequestStats) {
 	s := &RequestStats{}
 	return context.WithValue(ctx, requestStatsKey{}, s), s
@@ -71,11 +74,22 @@ func (s *RequestStats) Classes() ClassCounts { return s.classes.snapshot() }
 // Class is what a cache key holds, for the per-class lookup counters.
 type Class int
 
+// The key classes. NumClasses is their count, not a class.
 const (
 	ClassBlock  Class = iota // a ranged read (Keys.Ranged)
 	ClassObject              // a whole object
 	NumClasses
 )
+
+func (k Class) String() string {
+	switch k {
+	case ClassBlock:
+		return "block"
+	case ClassObject:
+		return "object"
+	}
+	return "Class(" + strconv.Itoa(int(k)) + ")"
+}
 
 func (k Keys) class(key string) Class {
 	if k.ranged(key) {
@@ -98,7 +112,20 @@ const (
 	// Load: neither tier answered; the bytes came from object storage (or
 	// from an object this same request had read from it).
 	Load
+	numOutcomes
 )
+
+func (o Outcome) String() string {
+	switch o {
+	case MemoryHit:
+		return "memory-hit"
+	case DiskHit:
+		return "disk-hit"
+	case Load:
+		return "load"
+	}
+	return "Outcome(" + strconv.Itoa(int(o)) + ")"
+}
 
 // ClassCounts are logical cache lookups by class, as three disjoint counts
 // that sum to the lookups: the memory tier's hits, the disk tier's hits,
@@ -123,7 +150,7 @@ func (c ClassCounts) HitRatio() float64 {
 }
 
 type classCounters struct {
-	n [3][NumClasses]atomic.Int64 // by Outcome
+	n [numOutcomes][NumClasses]atomic.Int64 // by Outcome
 }
 
 func (cc *classCounters) add(c ClassCounts) {
@@ -141,8 +168,12 @@ func (cc *classCounters) add(c ClassCounts) {
 func (c *Cache) Note(ctx context.Context, key string, o Outcome) { c.NoteAs(ctx, key, o, false) }
 
 // NoteAs is Note for the lookup that marked key missed (owner, from
-// MarkMissed): its own outcome stands.
+// MarkMissed): its own outcome stands. An outcome that is none of
+// MemoryHit, DiskHit and Load counts nothing.
 func (c *Cache) NoteAs(ctx context.Context, key string, o Outcome, owner bool) {
+	if o < 0 || o >= numOutcomes {
+		return
+	}
 	class := c.keys.class(key)
 	c.classes.n[o][class].Add(1)
 	if s, _ := ctx.Value(requestStatsKey{}).(*RequestStats); s != nil {

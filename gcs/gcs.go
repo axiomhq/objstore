@@ -10,15 +10,17 @@ import (
 	"strconv"
 
 	"cloud.google.com/go/storage"
-	"github.com/axiomhq/objstore"
 	"golang.org/x/sync/errgroup"
 	"google.golang.org/api/googleapi"
 	"google.golang.org/api/iterator"
 	"google.golang.org/api/option"
+
+	"github.com/axiomhq/objstore"
 )
 
 // Config selects the bucket and how to reach it.
 type Config struct {
+	// Bucket is the bucket every key lives in.
 	Bucket string
 	// ProjectID is needed only by EnsureBucket, to create a missing bucket.
 	ProjectID string
@@ -80,6 +82,10 @@ func isNotFound(err error) bool {
 	return errors.Is(err, storage.ErrObjectNotExist) || httpCode(err) == http.StatusNotFound
 }
 
+func bucketMissing(err error) bool {
+	return errors.Is(err, storage.ErrBucketNotExist) || httpCode(err) == http.StatusNotFound
+}
+
 func generation(etag string) (int64, bool) {
 	gen, err := strconv.ParseInt(etag, 10, 64)
 	return gen, err == nil && gen > 0
@@ -104,6 +110,7 @@ func write(ctx context.Context, obj *storage.ObjectHandle, data []byte) error {
 	return w.Close()
 }
 
+// Put writes key unconditionally.
 func (g *Backend) Put(ctx context.Context, key string, data []byte) error {
 	return objstore.OpErr("put", key, write(ctx, g.bucket.Object(key), data))
 }
@@ -174,6 +181,7 @@ func (g *Backend) get(ctx context.Context, op, key string) ([]byte, string, erro
 	return data, etagOf(gen), nil
 }
 
+// Get reads the whole object at key.
 func (g *Backend) Get(ctx context.Context, key string) ([]byte, error) {
 	data, _, err := g.get(ctx, "get", key)
 	return data, err
@@ -249,6 +257,7 @@ func (g *Backend) GetRange(ctx context.Context, key string, offset, length int64
 	return data, nil
 }
 
+// ListPage lists up to limit keys under prefix after after.
 func (g *Backend) ListPage(ctx context.Context, prefix, after string, limit int) ([]string, string, error) {
 	q := &storage.Query{Prefix: prefix, StartOffset: after}
 	if err := q.SetAttrSelection([]string{"Name"}); err != nil {
@@ -261,7 +270,7 @@ func (g *Backend) ListPage(ctx context.Context, prefix, after string, limit int)
 	keys := make([]string, 0, limit)
 	for {
 		attrs, err := it.Next()
-		if err == iterator.Done {
+		if errors.Is(err, iterator.Done) {
 			return keys, "", nil
 		}
 		if err != nil {
@@ -290,7 +299,7 @@ func (g *Backend) ListPrefixesPage(ctx context.Context, prefix, after string, li
 	out := make([]string, 0, limit)
 	for {
 		attrs, err := it.Next()
-		if err == iterator.Done {
+		if errors.Is(err, iterator.Done) {
 			return out, "", nil
 		}
 		if err != nil {
@@ -340,7 +349,7 @@ func (g *Backend) EnsureBucket(ctx context.Context) error {
 	if err == nil {
 		return nil
 	}
-	if !errors.Is(err, storage.ErrBucketNotExist) && httpCode(err) != http.StatusNotFound {
+	if !bucketMissing(err) {
 		return objstore.OpErr("head-bucket", g.name, err)
 	}
 	if g.project == "" {
@@ -359,7 +368,7 @@ func (g *Backend) DropBucket(ctx context.Context) error {
 	for {
 		keys, _, err := g.ListPage(ctx, "", "", objstore.MaxListPage)
 		if err != nil {
-			if errors.Is(err, storage.ErrBucketNotExist) || httpCode(err) == http.StatusNotFound {
+			if bucketMissing(err) {
 				return nil
 			}
 			return objstore.OpErr("drop-bucket", g.name, err)
@@ -372,7 +381,7 @@ func (g *Backend) DropBucket(ctx context.Context) error {
 		}
 	}
 	err := g.bucket.Delete(ctx)
-	if errors.Is(err, storage.ErrBucketNotExist) || httpCode(err) == http.StatusNotFound {
+	if bucketMissing(err) {
 		return nil
 	}
 	return objstore.OpErr("drop-bucket", g.name, err)

@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"slices"
+	"strings"
 	"testing"
 
 	"github.com/axiomhq/objstore/storetest"
@@ -69,8 +70,8 @@ func TestWalkVisitsEntriesInOrderAndStopsAtThrough(t *testing.T) {
 }
 
 // TestWalkStreamsOnePageAtATime pins the walker's memory contract: each
-// visited entry is released before the next page is read, so peak live
-// entries stay at one regardless of suffix length.
+// entry is visited before the next page is read, so a walk never holds
+// more than one page regardless of suffix length.
 func TestWalkStreamsOnePageAtATime(t *testing.T) {
 	ctx := context.Background()
 	s := storetest.New(t)
@@ -80,33 +81,43 @@ func TestWalkStreamsOnePageAtATime(t *testing.T) {
 			t.Fatalf("append %d: %v, %v", i+1, ok, err)
 		}
 	}
-	live := 0
-	peak := 0
-	var readAt []int
-	faulty, f := storetest.NewFault(s)
-	err := Walk(ctx, faulty, testPrefix, 0, 0, Decode, func(e entry) error {
-		live++
-		if live > peak {
-			peak = live
-		}
-		readAt = append(readAt, len(f.ReadKeys()))
-		live--
+	visited := 0
+	var readAt []int // visits completed when each page was read
+	err := WalkWithGet(ctx, func(ctx context.Context, key string) ([]byte, error) {
+		readAt = append(readAt, visited)
+		return s.Get(ctx, key)
+	}, testPrefix, 0, 0, Decode, func(entry) error {
+		visited++
 		return nil
 	})
 	if err != nil {
 		t.Fatal(err)
 	}
-	if peak != 1 {
-		t.Fatalf("peak live entries %d, want 1", peak)
-	}
-	// Every page was read exactly once, in order, and the reads interleave
-	// with visits: no full-suffix materialization happens before visiting.
-	if len(readAt) != pages {
-		t.Fatalf("visited %d entries, want %d", len(readAt), pages)
+	if visited != pages || len(readAt) != pages+1 { // +1: the miss that ends the log
+		t.Fatalf("visited %d entries over %d reads, want %d over %d", visited, len(readAt), pages, pages+1)
 	}
 	for i, n := range readAt {
-		if n != i+1 {
-			t.Fatalf("visit %d saw %d completed page reads, want %d", i, n, i+1)
+		if n != i {
+			t.Fatalf("page %d was read after %d visits, want %d: the walk read ahead", i+1, n, i)
+		}
+	}
+}
+
+func TestKeyAcceptsAnyPrefix(t *testing.T) {
+	for _, prefix := range []string{"", "log/", "no-slash", "a/b/c-", "ns/x/wal/0"} {
+		for _, seq := range []uint64{0, 1, 42, 1 << 40, ^uint64(0)} {
+			key := Key(prefix, seq)
+			if len(key) != len(prefix)+20 || !strings.HasPrefix(key, prefix) {
+				t.Fatalf("Key(%q, %d) = %q", prefix, seq, key)
+			}
+			if got, err := SeqFromKey(key); err != nil || got != seq {
+				t.Fatalf("SeqFromKey(%q) = %d, %v", key, got, err)
+			}
+		}
+	}
+	for _, bad := range []string{"", "log/42", "log/0000000000000000000x", "log/99999999999999999999"} {
+		if _, err := SeqFromKey(bad); err == nil {
+			t.Fatalf("SeqFromKey(%q) accepted", bad)
 		}
 	}
 }

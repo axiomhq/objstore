@@ -16,7 +16,6 @@ import (
 
 	"github.com/axiomhq/objstore"
 	"github.com/axiomhq/objstore/fs"
-	"github.com/axiomhq/objstore/s3"
 	"github.com/axiomhq/objstore/storetest"
 )
 
@@ -110,7 +109,8 @@ func assertContiguous(t *testing.T, s *objstore.Store, prefix string, want int) 
 func TestCrashedWriterLeavesNoHole(t *testing.T) {
 	s, f := storetest.NewFaulty(t)
 	ctx := context.Background()
-	w := NewWriter[Bytes](s, testPrefix, 1, nil)
+	fast := WithCommitInterval(10 * time.Millisecond) // the cadence is not under test
+	w := NewWriter[Bytes](s, testPrefix, 1, nil, fast)
 	if err := w.Append(ctx, rows("a")); err != nil {
 		t.Fatal(err)
 	}
@@ -137,7 +137,7 @@ func TestCrashedWriterLeavesNoHole(t *testing.T) {
 
 	// A second writer on the same log: it loses at the contested sequence
 	// and writes nothing above it.
-	loser := NewWriter[Bytes](s, testPrefix, 3, nil)
+	loser := NewWriter[Bytes](s, testPrefix, 3, nil, fast)
 	if err := loser.Append(ctx, rows("z")); !errors.Is(err, ErrLostRace) {
 		t.Fatalf("want ErrLostRace, got %v", err)
 	}
@@ -152,7 +152,7 @@ func TestCrashedWriterLeavesNoHole(t *testing.T) {
 		t.Fatalf("replay after the crash: %+v (%v)", entries, err)
 	}
 	next := entries[len(entries)-1].Seq + 1
-	w2 := NewWriter[Bytes](s, testPrefix, next, nil)
+	w2 := NewWriter[Bytes](s, testPrefix, next, nil, fast)
 	defer w2.Close()
 	if err := w2.Append(ctx, rows("d")); err != nil {
 		t.Fatal(err)
@@ -237,7 +237,7 @@ func TestWriterSplitsAtomicBatchAndResolvesAmbiguousPages(t *testing.T) {
 		t.Run(fmt.Sprint(nth), func(t *testing.T) {
 			s, f := storetest.NewFaulty(t)
 			f.Set(storetest.Plan{Op: storetest.OpPutIfAbsent, N: nth, Mode: storetest.Ambiguous, Key: testPrefix})
-			w := NewWriter[Bytes](s, testPrefix, 1, nil)
+			w := NewWriter[Bytes](s, testPrefix, 1, nil, WithCommitInterval(10*time.Millisecond))
 			defer w.Close()
 			// Each record is past the entry budget, together past one page.
 			records := []Bytes{filled('x', 40<<20), filled('y', 40<<20)}
@@ -376,29 +376,31 @@ func TestRestartAfterCrashBetweenPagesAbandonsPartialBatch(t *testing.T) {
 
 func TestWriterUnresolvedOnClose(t *testing.T) {
 	// Storage that never answers: a batch's outcome is unknowable. The
-	// writer must neither lie nor hang — Close reports ErrUnresolved.
-	t.Setenv("AWS_ACCESS_KEY_ID", "x")
-	t.Setenv("AWS_SECRET_ACCESS_KEY", "x")
-	t.Setenv("AWS_REGION", "us-east-1")
-	s, err := s3.Open(context.Background(), s3.Config{Endpoint: "http://127.0.0.1:1", Bucket: "nowhere"}, objstore.Config{})
+	// writer must neither lie nor hang — Close reports ErrUnresolved. The
+	// first PUT hangs until its attempt deadline; every call after it fails.
+	s, f := storetest.NewFaulty(t)
+	f.Set(storetest.Plan{Op: storetest.OpPutIfAbsent, N: 1, Mode: storetest.Hang})
+	f.SetShape(storetest.Shape{ErrorRate: 1, Seed: 1})
+	w := NewWriter[Bytes](s, testPrefix, 1, nil, WithCommitInterval(20*time.Millisecond))
+	w.SetAttemptTimeout(20 * time.Millisecond)
+	receipt, err := w.Enqueue(context.Background(), rows("limbo"))
 	if err != nil {
 		t.Fatal(err)
 	}
-	w := NewWriter[Bytes](s, testPrefix, 1, nil)
-	done := make(chan error, 1)
-	go func() { done <- w.Append(context.Background(), rows("limbo")) }()
-	time.Sleep(150 * time.Millisecond) // let at least one flush attempt fail
-	go w.Close()
+	w.Close()
 	select {
-	case err := <-done:
+	case err := <-receipt:
 		if !errors.Is(err, ErrUnresolved) {
 			t.Fatalf("want ErrUnresolved, got %v", err)
 		}
-	case <-time.After(120 * time.Second):
-		// Generous: the unreachable-endpoint drain rides the SDK's full
-		// retry/backoff schedule, which under full-suite -race load can
-		// exceed 30s. A genuine hang is infinite; 120s still catches it.
-		t.Fatal("writer hung instead of reporting unresolved")
+	default:
+		t.Fatal("Close returned before answering the batch it could not resolve")
+	}
+	if f.Fired() != 1 {
+		t.Fatal("the hang never fired: the writer never attempted a commit")
+	}
+	if st := w.Stats(); st.Unresolved != 1 {
+		t.Fatalf("stats: %+v, want Unresolved=1", st)
 	}
 }
 
@@ -409,12 +411,12 @@ func TestWriterUnresolvedOnClose(t *testing.T) {
 func TestWriterRejectsPastUnackedBound(t *testing.T) {
 	s, f := storetest.NewFaulty(t)
 	const bound = 8
-	w := NewWriter[Bytes](s, testPrefix, 1, nil)
+	w := NewWriter[Bytes](s, testPrefix, 1, nil, WithCommitInterval(50*time.Millisecond))
 	w.SetMaxUnacked(bound)
 	// Bounds the hang below, and with it this test's Close: the wedged
 	// attempt resolves at the deadline and the retry (the plan is spent by
 	// then) succeeds.
-	w.SetAttemptTimeout(3 * time.Second)
+	w.SetAttemptTimeout(time.Second)
 	defer w.Close()
 
 	// Wedge the writer mid-commit: nothing acks from here on.
@@ -511,7 +513,7 @@ func (h *lineHandler) snapshot() []string {
 func TestWriterReportsBackendCause(t *testing.T) {
 	s, f := storetest.NewFaulty(t)
 	h := &lineHandler{}
-	w := NewWriter[Bytes](s, testPrefix, 1, nil)
+	w := NewWriter[Bytes](s, testPrefix, 1, nil, WithCommitInterval(10*time.Millisecond))
 	w.SetLogger(slog.New(h))
 	defer w.Close()
 	f.SetShape(storetest.Shape{ErrorRate: 1, Seed: 1}) // every call fails, until cleared
@@ -633,9 +635,10 @@ func TestWriterCloseDrains(t *testing.T) {
 	// caller may delete the prefix right after Close.
 	s := storetest.New(t)
 	w := NewWriter[Bytes](s, testPrefix, 1, nil)
-	errCh := make(chan error, 1)
-	go func() { errCh <- w.Append(context.Background(), rows("last")) }()
-	time.Sleep(50 * time.Millisecond) // let Append park in the buffer
+	errCh, err := w.Enqueue(context.Background(), rows("last")) // accepted once Enqueue returns
+	if err != nil {
+		t.Fatal(err)
+	}
 	w.Close()
 	// By the time Close returned, the batch must be durable.
 	entries, err := replay(context.Background(), s, testPrefix, 0)
@@ -721,23 +724,33 @@ func TestCommitIntervalCoalescesIntoOnePage(t *testing.T) {
 	}
 }
 
-// TestWithCommitIntervalRefusesValuesOutOfRange: the option is the writer's
+// TestWithCommitIntervalClampsValuesOutOfRange: the option is the writer's
 // last line of defence. A caller should refuse a bad value up front; a
-// writer handed one anyway keeps the default rather than spinning (below
-// the minimum) or parking a lone write for a minute (above the maximum).
-func TestWithCommitIntervalRefusesValuesOutOfRange(t *testing.T) {
-	for _, d := range []time.Duration{0, -time.Second, MinCommitInterval - time.Nanosecond, MaxCommitInterval + time.Nanosecond} {
+// writer handed one anyway keeps the default for <= 0 and clamps the rest,
+// rather than spinning (below the minimum) or parking a lone write for a
+// minute (above the maximum).
+func TestWithCommitIntervalClampsValuesOutOfRange(t *testing.T) {
+	for d, want := range map[time.Duration]time.Duration{
+		0:                                   DefaultCommitInterval,
+		-time.Second:                        DefaultCommitInterval,
+		MinCommitInterval - time.Nanosecond: MinCommitInterval,
+		MaxCommitInterval + time.Nanosecond: MaxCommitInterval,
+		MinCommitInterval:                   MinCommitInterval,
+		time.Second:                         time.Second,
+		MaxCommitInterval:                   MaxCommitInterval,
+	} {
 		o := options{commitInterval: DefaultCommitInterval}
 		WithCommitInterval(d)(&o)
-		if o.commitInterval != DefaultCommitInterval {
-			t.Fatalf("WithCommitInterval(%s) set %s; out-of-range values must keep the default", d, o.commitInterval)
+		if o.commitInterval != want {
+			t.Fatalf("WithCommitInterval(%s) set %s, want %s", d, o.commitInterval, want)
 		}
 	}
-	for _, d := range []time.Duration{MinCommitInterval, time.Second, MaxCommitInterval} {
-		o := options{commitInterval: DefaultCommitInterval}
-		WithCommitInterval(d)(&o)
-		if o.commitInterval != d {
-			t.Fatalf("WithCommitInterval(%s) did not take: %s", d, o.commitInterval)
+	w := NewWriter[Bytes](storetest.New(t), testPrefix, 1, nil, WithCommitInterval(200*time.Millisecond))
+	defer w.Close()
+	for d, want := range map[time.Duration]time.Duration{0: defaultAttemptTimeout, time.Millisecond: 200 * time.Millisecond, time.Minute: time.Minute} {
+		w.SetAttemptTimeout(d)
+		if w.attemptTimeout != want {
+			t.Fatalf("SetAttemptTimeout(%s) set %s, want %s", d, w.attemptTimeout, want)
 		}
 	}
 }

@@ -10,14 +10,35 @@ import (
 	"github.com/axiomhq/objstore"
 )
 
+// seqDigits is the width of a key's sequence: uint64 max has 20 digits.
+const seqDigits = 20
+
 // Key is the object key of page seq under prefix. The sequence is
 // zero-padded to 20 digits (uint64 max), so lexical order is numeric order.
-func Key(prefix string, seq uint64) string { return fmt.Sprintf("%s%020d", prefix, seq) }
+func Key(prefix string, seq uint64) string {
+	var d [seqDigits]byte
+	digits := strconv.AppendUint(d[:0], seq, 10)
+	var b strings.Builder
+	b.Grow(len(prefix) + seqDigits)
+	b.WriteString(prefix)
+	b.WriteString("00000000000000000000"[len(digits):])
+	b.Write(digits)
+	return b.String()
+}
 
-// SeqFromKey parses the sequence out of a Key whose prefix ends in "/".
+// SeqFromKey parses the sequence out of a key Key made, whatever its prefix:
+// the key's last 20 characters.
 func SeqFromKey(key string) (uint64, error) {
-	i := strings.LastIndex(key, "/")
-	return strconv.ParseUint(key[i+1:], 10, 64)
+	if len(key) < seqDigits {
+		return 0, fmt.Errorf("wal: %q is not a WAL key", key)
+	}
+	digits := key[len(key)-seqDigits:]
+	for i := range len(digits) {
+		if digits[i] < '0' || digits[i] > '9' {
+			return 0, fmt.Errorf("wal: %q is not a WAL key", key)
+		}
+	}
+	return strconv.ParseUint(digits, 10, 64)
 }
 
 // Entry is one committed entry as a walk sees it: a single page, or every
@@ -95,17 +116,17 @@ type coalescer[T any] struct {
 }
 
 func (c *coalescer[T]) add(h Header, key string, body T) error {
-	if h.BatchPages == 0 {
-		if len(c.batch) != 0 {
-			return fmt.Errorf("%w: wal entry %q: incomplete batch", ErrCorrupt, key)
-		}
-		return c.visit(Entry[T]{Header: h, Key: key, Pages: []T{body}})
-	}
 	if len(c.batch) != 0 && h.BatchIndex == 0 {
+		// A new entry after a batch that never finished: the writer
+		// abandoned it (a terminal failure after some pages landed, or a
+		// crash) and moved on.
 		if err := c.visit(marker(c.batch[len(c.batch)-1], false)); err != nil {
 			return err
 		}
 		c.batch = nil
+	}
+	if h.BatchPages <= 1 { // 0 (Encode) and 1 (Writer) both mean a single page
+		return c.visit(Entry[T]{Header: h, Key: key, Pages: []T{body}})
 	}
 	if h.BatchIndex != uint64(len(c.batch)) || (len(c.batch) > 0 && (h.Nonce != c.batch[0].Nonce || h.BatchPages != c.batch[0].BatchPages)) {
 		return fmt.Errorf("%w: wal entry %q: invalid batch header", ErrCorrupt, key)

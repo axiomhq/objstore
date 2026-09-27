@@ -14,7 +14,8 @@
 //
 // ConfigureCMEK adds envelope encryption of every object under
 // ns/<name>/ with a per-name data key wrapped by a customer key (see
-// package kms for the providers).
+// package kms; the AWS and GCP providers are packages kms/awskms and
+// kms/gcpkms).
 //
 // Package wal is a write-ahead log on a Store, package cache a memory and
 // disk cache in front of one, package rangeread a coalescing ranged reader

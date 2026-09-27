@@ -3,9 +3,12 @@ package cache
 import (
 	"bytes"
 	"context"
+	"errors"
 	"fmt"
+	"log/slog"
 	"math/rand"
 	"os"
+	"runtime"
 	"slices"
 	"strconv"
 	"strings"
@@ -91,20 +94,28 @@ func runCacheScenarios(tb testing.TB) []cacheScenarioResult {
 		{name: "thrashing", diskBytes: workingBytes / 10},
 		{name: "cache-loss", diskBytes: workingBytes, warm: true, wipe: true},
 	}
+	load := func(key string) func(context.Context) ([]byte, error) {
+		return func(ctx context.Context) ([]byte, error) {
+			if os.Getenv("OBJSTORE_CACHE_BENCH_LONG") == "1" {
+				time.Sleep(20 * time.Millisecond)
+			}
+			return s.Get(ctx, key)
+		}
+	}
 	results := make([]cacheScenarioResult, 0, len(scenarios))
 	for _, sc := range scenarios {
 		disk, err := NewDisk(tb.TempDir(), sc.diskBytes)
 		if err != nil {
 			tb.Fatal(err)
 		}
-		memory := NewByteCache(1) // force this matrix to exercise the SSD tier
+		c := New(s, 1, disk, Keys{}) // a memory tier that holds nothing: exercise the SSD tier
 		if sc.warm {
 			warmKeys := keys
 			if sc.name == "partial" {
 				warmKeys = keys[:len(keys)/2]
 			}
 			for _, key := range warmKeys {
-				disk.Put(DiskKey(key, 0), oracle[key])
+				disk.Put(DiskKey(key, c.Memory.GenerationOf(key)), oracle[key])
 			}
 		}
 		fault.ResetOps()
@@ -121,20 +132,9 @@ func runCacheScenarios(tb testing.TB) []cacheScenarioResult {
 			}
 			key := keys[keyIndex]
 			start := time.Now()
-			got, ok := memory.Get(key)
-			if !ok {
-				got, ok = disk.Get(DiskKey(key, 0))
-				if !ok {
-					if os.Getenv("OBJSTORE_CACHE_BENCH_LONG") == "1" {
-						time.Sleep(20 * time.Millisecond)
-					}
-					got, err = s.Get(ctx, key)
-					if err != nil {
-						tb.Fatal(err)
-					}
-					disk.Put(DiskKey(key, 0), got)
-				}
-				memory.Put(key, got, 0)
+			got, err := c.FetchWith(ctx, key, load(key))
+			if err != nil {
+				tb.Fatal(err)
 			}
 			if !slices.Equal(got, oracle[key]) {
 				tb.Fatalf("%s query %d differs from oracle", sc.name, i)
@@ -143,9 +143,12 @@ func runCacheScenarios(tb testing.TB) []cacheScenarioResult {
 		}
 		slices.Sort(latencies)
 		ops, stats := fault.Ops(), disk.Stats()
-		mh, mm := memory.Stats()
+		mh, mm := c.Memory.Stats()
 		results = append(results, cacheScenarioResult{name: sc.name, bytes: fault.ReadBytes(), gets: ops[storetest.OpGet], ranges: ops[storetest.OpGetRange], p50: latencies[len(latencies)/2], p99: latencies[len(latencies)*99/100], memoryHits: mh, memoryMisses: mm, diskHits: stats.Hits, diskMisses: stats.Misses, evictions: stats.Evictions})
-		disk.Close()
+		if counts := c.ClassCounts(); counts.MemoryHits[ClassObject]+counts.DiskHits[ClassObject]+counts.Loads[ClassObject] != queries {
+			tb.Fatalf("%s: %+v do not sum to %d lookups", sc.name, counts, queries)
+		}
+		c.Close()
 	}
 	return results
 }
@@ -156,10 +159,10 @@ func TestWALPagesHaveTheirOwnBudget(t *testing.T) {
 		t.Fatal("WAL page did not select its bounded cache")
 	}
 	probe := "ns/x/probe"
-	cache.Memory.Put(probe, []byte("probe"), cache.Memory.Generation.Load())
+	cache.Memory.Put(probe, []byte("probe"), cache.Memory.GenerationOf(probe))
 	for i := range 80 {
 		key := "ns/x/wal/page-" + strconv.Itoa(i)
-		cache.WAL.Put(key, bytes.Repeat([]byte{1}, 1<<20), cache.WAL.Generation.Load())
+		cache.WAL.Put(key, bytes.Repeat([]byte{1}, 1<<20), cache.WAL.GenerationOf(key))
 	}
 	if got := cache.WAL.Charge(); got > cache.WAL.Cap {
 		t.Fatalf("WAL charge %d exceeds cap %d", got, cache.WAL.Cap)
@@ -195,5 +198,160 @@ func TestPutFillsTheDiskTier(t *testing.T) {
 	b, fromDisk, ok := c.CachedRange(key, 100, 50)
 	if !ok || !fromDisk || !bytes.Equal(b, data[100:150]) {
 		t.Fatalf("CachedRange after a Put = %q disk %v ok %v, want a disk hit", b, fromDisk, ok)
+	}
+}
+
+// waiters is the number of callers joined to key's flight.
+func (c *Cache) waiters(key string) int {
+	c.flightMu.Lock()
+	defer c.flightMu.Unlock()
+	if ref := c.flights[key]; ref != nil {
+		return ref.n
+	}
+	return 0
+}
+
+func waitFor(t *testing.T, cond func() bool) {
+	t.Helper()
+	deadline := time.Now().Add(10 * time.Second)
+	for !cond() {
+		if time.Now().After(deadline) {
+			t.Fatal("condition not reached")
+		}
+		runtime.Gosched()
+	}
+}
+
+// TestLeaderCancellationDoesNotFailFollowers: the shared load serves every
+// waiter, so the caller that happened to start it leaving does not cancel
+// it for the rest.
+func TestLeaderCancellationDoesNotFailFollowers(t *testing.T) {
+	c := New(nil, 1<<20, nil, Keys{})
+	entered, release := make(chan struct{}), make(chan struct{})
+	load := func(ctx context.Context) ([]byte, error) {
+		close(entered)
+		select {
+		case <-release:
+			return []byte("obj"), nil
+		case <-ctx.Done():
+			return nil, ctx.Err()
+		}
+	}
+	leaderCtx, cancelLeader := context.WithCancel(context.Background())
+	leaderErr := make(chan error, 1)
+	go func() {
+		_, err := c.FetchWith(leaderCtx, "k", load)
+		leaderErr <- err
+	}()
+	<-entered
+	follower := make(chan error, 1)
+	go func() {
+		b, err := c.FetchWith(context.Background(), "k", load)
+		if err == nil && string(b) != "obj" {
+			err = fmt.Errorf("got %q", b)
+		}
+		follower <- err
+	}()
+	waitFor(t, func() bool { return c.waiters("k") == 2 })
+	cancelLeader()
+	if err := <-leaderErr; !errors.Is(err, context.Canceled) {
+		t.Fatalf("leader: %v, want context.Canceled", err)
+	}
+	close(release)
+	if err := <-follower; err != nil {
+		t.Fatalf("follower failed with the leader: %v", err)
+	}
+}
+
+// TestLastWaiterLeavingCancelsLoad: once nobody waits, the load is
+// cancelled and the flight forgotten, so the next caller starts afresh
+// instead of joining a load nobody wants.
+func TestLastWaiterLeavingCancelsLoad(t *testing.T) {
+	c := New(nil, 1<<20, nil, Keys{})
+	entered, release := make(chan struct{}), make(chan struct{})
+	cancelled := make(chan error, 1)
+	ctx, cancel := context.WithCancel(context.Background())
+	done := make(chan error, 1)
+	go func() {
+		_, err := c.FetchWith(ctx, "k", func(ctx context.Context) ([]byte, error) {
+			close(entered)
+			<-release // ignores cancellation for now
+			cancelled <- ctx.Err()
+			return nil, ctx.Err()
+		})
+		done <- err
+	}()
+	<-entered
+	cancel()
+	if err := <-done; !errors.Is(err, context.Canceled) {
+		t.Fatalf("caller: %v, want context.Canceled", err)
+	}
+	b, err := c.FetchWith(context.Background(), "k", func(context.Context) ([]byte, error) {
+		return []byte("fresh"), nil
+	})
+	if err != nil || string(b) != "fresh" {
+		t.Fatalf("next caller joined the abandoned load: %q, %v", b, err)
+	}
+	close(release)
+	if err := <-cancelled; !errors.Is(err, context.Canceled) {
+		t.Fatalf("abandoned load's context: %v, want context.Canceled", err)
+	}
+}
+
+func TestLoaderPanicIsAnError(t *testing.T) {
+	defer slog.SetDefault(slog.Default())
+	slog.SetDefault(slog.New(slog.DiscardHandler)) // the stack goes to the log
+	c := New(nil, 1<<20, nil, Keys{})
+	_, err := c.FetchWith(context.Background(), "k", func(context.Context) ([]byte, error) { panic("boom") })
+	if err == nil || !strings.Contains(err.Error(), "panic: boom") || strings.Contains(err.Error(), "goroutine") {
+		t.Fatalf("err = %v, want the panic message without a stack", err)
+	}
+}
+
+func TestGatedSpendsTheBudget(t *testing.T) {
+	c := New(nil, 1<<20, nil, Keys{})
+	ctx, budget := WithBudget(context.Background(), 2)
+	reads := 0
+	read := func(context.Context) ([]byte, error) {
+		reads++
+		if c.GateInUse.Load() != 1 {
+			t.Errorf("read outside the gate: %d slots in use", c.GateInUse.Load())
+		}
+		return nil, nil
+	}
+	for i := range 2 {
+		if _, err := c.Gated(ctx, read); err != nil {
+			t.Fatalf("read %d: %v", i, err)
+		}
+	}
+	if budget.Exceeded() {
+		t.Fatal("budget exceeded within its limit")
+	}
+	for range 5 {
+		if _, err := c.Gated(ctx, read); !errors.Is(err, ErrBudget) {
+			t.Fatalf("over budget: %v, want ErrBudget", err)
+		}
+	}
+	if reads != 2 || !budget.Exceeded() || budget.spent.Load() != 3 {
+		t.Fatalf("reads %d, exceeded %v, spent %d", reads, budget.Exceeded(), budget.spent.Load())
+	}
+	cancelled, cancel := context.WithCancel(context.Background())
+	cancel()
+	if _, err := c.Gated(cancelled, read); !errors.Is(err, context.Canceled) || c.GateInUse.Load() != 0 {
+		t.Fatalf("cancelled: %v, %d slots in use", err, c.GateInUse.Load())
+	}
+}
+
+func TestOutcomeAndClassStrings(t *testing.T) {
+	for v, want := range map[fmt.Stringer]string{MemoryHit: "memory-hit", DiskHit: "disk-hit", Load: "load", Outcome(9): "Outcome(9)", ClassBlock: "block", ClassObject: "object"} {
+		if got := v.String(); got != want {
+			t.Errorf("%d: %q, want %q", v, got, want)
+		}
+	}
+	c := New(nil, 1<<20, nil, Keys{})
+	c.NoteAs(context.Background(), "k", Outcome(-1), true) // out of range: counts nothing, does not panic
+	c.NoteAs(context.Background(), "k", Outcome(3), true)
+	if got := c.ClassCounts(); got.HitRatio() != 1 {
+		t.Fatalf("out-of-range outcomes counted: %+v", got)
 	}
 }

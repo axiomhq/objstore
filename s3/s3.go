@@ -18,6 +18,7 @@ import (
 	awss3 "github.com/aws/aws-sdk-go-v2/service/s3"
 	"github.com/aws/aws-sdk-go-v2/service/s3/types"
 	"github.com/aws/smithy-go"
+
 	"github.com/axiomhq/objstore"
 )
 
@@ -43,9 +44,12 @@ type Config struct {
 	// an S3-compatible service (MinIO, Ceph, Hetzner, R2), addressed
 	// path-style.
 	Endpoint string
-	Bucket   string
+	// Bucket is the bucket every key lives in.
+	Bucket string
 	// AllowedEndpoints, when set, lists the only endpoints (scheme://host)
-	// New accepts; any other is ErrEndpointDenied.
+	// New accepts; any other is ErrEndpointDenied. With a list set, the
+	// empty Endpoint (AWS's default) and anything not parsing as
+	// scheme://host (file://, a bare path) are denied too.
 	AllowedEndpoints []string
 	// SSE is the server-side encryption mode: "", "AES256" or "aws:kms".
 	SSE string
@@ -171,6 +175,7 @@ func readBody(op, key string, body io.ReadCloser, contentLength *int64) ([]byte,
 	return data, nil
 }
 
+// Put writes key unconditionally.
 func (s *Backend) Put(ctx context.Context, key string, data []byte) error {
 	_, err := s.client.PutObject(ctx, s.putInput(key, data))
 	return objstore.OpErr("put", key, err)
@@ -199,6 +204,7 @@ func (s *Backend) PutIfAbsent(ctx context.Context, key string, data []byte) (boo
 	return true, nil
 }
 
+// apiErrorCode is the S3 error code err carries ("NoSuchKey", ...), or "".
 func apiErrorCode(err error) string {
 	var apiErr smithy.APIError
 	if errors.As(err, &apiErr) {
@@ -207,6 +213,7 @@ func apiErrorCode(err error) string {
 	return ""
 }
 
+// Get reads the whole object at key.
 func (s *Backend) Get(ctx context.Context, key string) ([]byte, error) {
 	out, err := s.client.GetObject(ctx, &awss3.GetObjectInput{Bucket: &s.bucket, Key: &key})
 	if err != nil {
@@ -218,6 +225,7 @@ func (s *Backend) Get(ctx context.Context, key string) ([]byte, error) {
 	return readBody("get", key, out.Body, out.ContentLength)
 }
 
+// ListPage is one ListObjectsV2 request with StartAfter = after.
 func (s *Backend) ListPage(ctx context.Context, prefix, after string, limit int) ([]string, string, error) {
 	in := &awss3.ListObjectsV2Input{Bucket: &s.bucket, Prefix: &prefix, MaxKeys: aws.Int32(int32(limit))}
 	if after != "" {
@@ -237,7 +245,7 @@ func (s *Backend) ListPage(ctx context.Context, prefix, after string, limit int)
 	return keys, "", nil
 }
 
-// ListPrefixes asks S3 for the common prefixes one level under prefix: with
+// ListPrefixesPage asks S3 for the common prefixes one level under prefix: with
 // Delimiter "/" the server collapses everything below each child prefix, so
 // discovery costs one request per 1000 namespaces instead of one key per
 // object in the bucket. MaxKeys counts objects AT the prefix level too, so
@@ -270,10 +278,14 @@ func (s *Backend) ListPrefixesPage(ctx context.Context, prefix, after string, li
 	}
 }
 
+// Delete removes key. A missing key is not an error.
 func (s *Backend) Delete(ctx context.Context, key string) error {
 	_, err := s.client.DeleteObject(ctx, &awss3.DeleteObjectInput{Bucket: &s.bucket, Key: &key})
 	return objstore.OpErr("delete", key, err)
 }
+
+// deleteBatch is the most keys one DeleteObjects request may carry.
+const deleteBatch = 1000
 
 // DeleteMany removes keys. Missing keys are not an error. Empty input is a no-op.
 // A batch DELETE answers 200 even when individual keys failed; Quiet mode only
@@ -284,12 +296,10 @@ func (s *Backend) DeleteMany(ctx context.Context, keys ...string) error {
 	}
 	objs := make([]types.ObjectIdentifier, len(keys))
 	for i, k := range keys {
-		k := k
 		objs[i] = types.ObjectIdentifier{Key: &k}
 	}
-	const batch = 1000
-	for i := 0; i < len(objs); i += batch {
-		end := min(i+batch, len(objs))
+	for i := 0; i < len(objs); i += deleteBatch {
+		end := min(i+deleteBatch, len(objs))
 		out, err := s.client.DeleteObjects(ctx, &awss3.DeleteObjectsInput{
 			Bucket: &s.bucket,
 			Delete: &types.Delete{Objects: objs[i:end], Quiet: aws.Bool(true)},
@@ -326,11 +336,14 @@ func (s *Backend) EnsureBucket(ctx context.Context) error {
 }
 
 // DropBucket empties the bucket (List + DeleteMany, both already bounded
-// by the client timeout) and deletes it. A bucket that is already gone is
-// not an error.
+// by the client timeout) and deletes it. A bucket that is already gone
+// (NoSuchBucket on either step) is not an error.
 func (s *Backend) DropBucket(ctx context.Context) error {
 	for {
-		keys, _, err := s.ListPage(ctx, "", "", 1000)
+		keys, _, err := s.ListPage(ctx, "", "", objstore.MaxListPage)
+		if apiErrorCode(err) == "NoSuchBucket" {
+			return nil
+		}
 		if err != nil {
 			return objstore.OpErr("drop-bucket", s.bucket, err)
 		}
@@ -342,8 +355,7 @@ func (s *Backend) DropBucket(ctx context.Context) error {
 		}
 	}
 	_, err := s.client.DeleteBucket(ctx, &awss3.DeleteBucketInput{Bucket: &s.bucket})
-	var nsb *types.NoSuchBucket
-	if errors.As(err, &nsb) {
+	if apiErrorCode(err) == "NoSuchBucket" {
 		return nil
 	}
 	return objstore.OpErr("drop-bucket", s.bucket, err)
@@ -422,6 +434,9 @@ func (s *Backend) PutIfMatch(ctx context.Context, key string, data []byte, etag 
 	return true, nil
 }
 
+// GetRange reads exactly length bytes of key at offset. The response's
+// Content-Range and Content-Length must match the request: a server that
+// ignores Range is ErrRange, not a whole-object download.
 func (s *Backend) GetRange(ctx context.Context, key string, offset, length int64) ([]byte, error) {
 	span := fmt.Sprintf("bytes=%d-%d", offset, offset+length-1)
 	out, err := s.client.GetObject(ctx, &awss3.GetObjectInput{Bucket: &s.bucket, Key: &key, Range: &span})

@@ -3,6 +3,7 @@ package objstore_test
 import (
 	"context"
 	"errors"
+	"fmt"
 	"testing"
 	"time"
 
@@ -55,5 +56,33 @@ func TestWriteGateBoundsBulkWritesButNotUrgent(t *testing.T) {
 	}
 	if got, err := s.Get(ctx, "bulk-2"); err != nil || string(got) != "b" {
 		t.Fatalf("bulk-2 after release: %q, %v", got, err)
+	}
+}
+
+// TestNegativeMaxInflightWritesIsUnbounded: a negative bound means no
+// bound, not a gate nobody can pass.
+func TestNegativeMaxInflightWritesIsUnbounded(t *testing.T) {
+	ctx := context.Background()
+	base := fs.Open(t.TempDir(), "b", objstore.Config{MaxInflightWrites: -1})
+	if err := base.EnsureBucket(ctx); err != nil {
+		t.Fatal(err)
+	}
+	s, f := storetest.NewFault(base)
+	f.Set(storetest.Plan{Op: storetest.OpPut, N: 1, Mode: storetest.Pause, Key: "held"})
+	first := make(chan error, 1)
+	go func() { first <- s.Put(ctx, "held", []byte("a")) }()
+	for f.Fired() == 0 {
+		time.Sleep(time.Millisecond)
+	}
+	bounded, cancel := context.WithTimeout(ctx, 5*time.Second)
+	defer cancel()
+	for i := range 4 {
+		if err := s.Put(bounded, fmt.Sprintf("k%d", i), []byte("b")); err != nil {
+			t.Fatalf("put %d beside a held write: %v", i, err)
+		}
+	}
+	f.Resume()
+	if err := <-first; err != nil {
+		t.Fatal(err)
 	}
 }

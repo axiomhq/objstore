@@ -5,12 +5,11 @@ import (
 	"strings"
 	"sync"
 	"testing"
-	"time"
 )
 
 func TestConcurrentRequestStatsStayIsolated(t *testing.T) {
-	c := New(nil, 1024, nil, Keys{})
-	c.Memory.Put("hot", []byte("cached"), c.Memory.Generation.Load())
+	c := New(nil, 4096, nil, Keys{})
+	c.Memory.Put("hot", []byte("cached"), c.Memory.GenerationOf("hot"))
 	hotCtx, hot := WithRequestStats(context.Background())
 	coldCtx, cold := WithRequestStats(context.Background())
 	start := make(chan struct{})
@@ -25,7 +24,7 @@ func TestConcurrentRequestStatsStayIsolated(t *testing.T) {
 			<-start
 			for range 100 {
 				if _, err := c.FetchWith(tc.ctx, tc.key, func(context.Context) ([]byte, error) {
-					return make([]byte, 2048), nil // larger than cache capacity
+					return make([]byte, 8192), nil // larger than cache capacity
 				}); err != nil {
 					t.Errorf("fetch %s: %v", tc.key, err)
 					return
@@ -190,7 +189,7 @@ func TestFlightFollowerCountsAMemoryHit(t *testing.T) {
 			t.Error(err)
 		}
 	}()
-	time.Sleep(50 * time.Millisecond) // the follower joins the flight (or, late, hits memory: the same count)
+	waitFor(t, func() bool { return c.waiters("k") == 2 }) // the follower joined the flight
 	close(release)
 	wg.Wait()
 	if reads != 1 {
@@ -234,7 +233,7 @@ func TestRequestChargesItsOwnLoadsAndViews(t *testing.T) {
 // worker's lookup came first; another request, and another key, hit it.
 func TestARequestsOwnFillIsNoHit(t *testing.T) {
 	c := New(nil, 1<<20, nil, Keys{})
-	c.Memory.Put("warm", []byte("cached"), c.Memory.Generation.Load())
+	c.Memory.Put("warm", []byte("cached"), c.Memory.GenerationOf("warm"))
 	ctx, own := WithRequestStats(context.Background())
 	load := func(context.Context) ([]byte, error) { return []byte("block"), nil }
 	for range 3 {

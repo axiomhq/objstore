@@ -7,6 +7,7 @@ import (
 	"io"
 	"net/http"
 	"net/http/httptest"
+	"slices"
 	"strings"
 	"sync/atomic"
 	"testing"
@@ -272,6 +273,9 @@ func TestS3ListPrefixesPageSkipsPrefixlessPages(t *testing.T) {
 	if err != nil || len(page) != 1 || page[0] != "ns/one/" || next != "ns/one/" {
 		t.Fatalf("page=%v next=%q err=%v", page, next, err)
 	}
+	if !slices.Equal(tokens, []string{"", "t1"}) {
+		t.Fatalf("continuation tokens sent %q, want [\"\" t1]", tokens)
+	}
 }
 
 func TestS3ConditionalRead(t *testing.T) {
@@ -323,6 +327,112 @@ func TestS3ConditionalRead(t *testing.T) {
 				if err == nil || unchanged || data != nil || etag != "" {
 					t.Fatalf("%q %q %v %v", data, etag, unchanged, err)
 				}
+			}
+		})
+	}
+}
+
+func TestSSEPutInput(t *testing.T) {
+	for _, tc := range []struct {
+		mode, key string
+	}{
+		{"AES256", ""},
+		{"aws:kms", "arn:aws:kms:us-east-1:1:key/x"},
+	} {
+		s := &Backend{sse: tc.mode, kmsKeyID: tc.key}
+		in := s.putInput("k", []byte("v"))
+		if string(in.ServerSideEncryption) != tc.mode || tc.key != "" && *in.SSEKMSKeyId != tc.key {
+			t.Fatalf("mode %q input = %+v", tc.mode, in)
+		}
+	}
+}
+
+// TestS3GetRangeContentRangeGuard: a ranged GET is accepted only when the
+// server answered that exact range. A server ignoring Range (200, whole
+// body) or answering another range must be ErrRange, never data.
+func TestS3GetRangeContentRangeGuard(t *testing.T) {
+	const object = "0123456789"
+	for _, tc := range []struct {
+		name   string
+		answer func(w http.ResponseWriter)
+		ok     bool
+	}{
+		{"exact", func(w http.ResponseWriter) {
+			w.Header().Set("Content-Range", "bytes 2-5/10")
+			w.WriteHeader(http.StatusPartialContent)
+			fmt.Fprint(w, object[2:6])
+		}, true},
+		{"range ignored", func(w http.ResponseWriter) {
+			w.WriteHeader(http.StatusOK)
+			fmt.Fprint(w, object)
+		}, false},
+		{"other range", func(w http.ResponseWriter) {
+			w.Header().Set("Content-Range", "bytes 3-6/10")
+			w.WriteHeader(http.StatusPartialContent)
+			fmt.Fprint(w, object[3:7])
+		}, false},
+		{"garbled", func(w http.ResponseWriter) {
+			w.Header().Set("Content-Range", "items 2-5/10")
+			w.WriteHeader(http.StatusPartialContent)
+			fmt.Fprint(w, object[2:6])
+		}, false},
+		{"invalid range", func(w http.ResponseWriter) {
+			s3Error(w, http.StatusRequestedRangeNotSatisfiable, "InvalidRange")
+		}, false},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			s := fakeS3(t, func(w http.ResponseWriter, r *http.Request) {
+				if got := r.Header.Get("Range"); got != "bytes=2-5" {
+					t.Errorf("Range header %q", got)
+				}
+				tc.answer(w)
+			})
+			data, err := s.GetRange(context.Background(), "k", 2, 4)
+			if tc.ok {
+				if err != nil || string(data) != "2345" {
+					t.Fatalf("got %q, %v", data, err)
+				}
+				return
+			}
+			if !errors.Is(err, objstore.ErrRange) || data != nil {
+				t.Fatalf("got %q, %v; want ErrRange", data, err)
+			}
+		})
+	}
+}
+
+// TestS3DropBucketMissingBucket: DropBucket on a bucket that is already
+// gone succeeds, whether the list or the final DeleteBucket finds it
+// missing; any other failure still surfaces.
+func TestS3DropBucketMissingBucket(t *testing.T) {
+	for _, tc := range []struct {
+		name         string
+		list, delete int
+		code         string
+		wantErr      bool
+	}{
+		{"gone before list", http.StatusNotFound, 0, "NoSuchBucket", false},
+		{"gone before delete", http.StatusOK, http.StatusNotFound, "NoSuchBucket", false},
+		{"denied", http.StatusOK, http.StatusForbidden, "AccessDenied", true},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			s := fakeS3(t, func(w http.ResponseWriter, r *http.Request) {
+				switch {
+				case r.Method == http.MethodGet && r.URL.Query().Get("list-type") == "2":
+					if tc.list != http.StatusOK {
+						s3Error(w, tc.list, tc.code)
+						return
+					}
+					fmt.Fprint(w, `<?xml version="1.0"?><ListBucketResult><IsTruncated>false</IsTruncated></ListBucketResult>`)
+				case r.Method == http.MethodDelete:
+					s3Error(w, tc.delete, tc.code)
+				default:
+					t.Errorf("unexpected request %s %s", r.Method, r.URL)
+					w.WriteHeader(http.StatusBadRequest)
+				}
+			})
+			if err := s.DropBucket(context.Background()); (err != nil) != tc.wantErr {
+				t.Fatalf("DropBucket: %v, want error %v", err, tc.wantErr)
 			}
 		})
 	}

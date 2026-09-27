@@ -4,8 +4,8 @@ import (
 	"context"
 	"crypto/sha256"
 	"errors"
-	"math/rand"
-	"sort"
+	"math/rand/v2"
+	"slices"
 	"strings"
 	"sync"
 	"time"
@@ -15,11 +15,12 @@ import (
 
 // ErrFault is the transport error an armed Plan returns. Tests match on it;
 // production code never sees it (nothing constructs a Fault outside tests).
-var ErrFault = errors.New("store: injected fault")
+var ErrFault = errors.New("storetest: injected fault")
 
 // Op names the backend operation a Plan targets. OpDelete matches both
 // Delete and DeleteMany, since callers use both; a Plan.Key filter is the
-// way to tell them apart.
+// way to tell them apart. OpGet matches all three whole-object reads: Get,
+// GetWithETag and GetIfChanged.
 type Op string
 
 const (
@@ -32,9 +33,10 @@ const (
 	OpDelete      Op = "Delete"
 )
 
-// OpListPrefixes is the delimited listing (Store.ListPrefixes). It counts
-// separately from OpList so a test can assert "no prefix LIST on this path"
-// while discovery's delimited listing still happens.
+// OpListPrefixes is the delimited listing (Store.ListPrefixes and
+// ListPrefixesPage). It counts, and is planned, separately from OpList so a
+// test can assert "no prefix LIST on this path" while discovery's
+// delimited listing still happens.
 const OpListPrefixes Op = "ListPrefixes"
 
 // Mode is what the Nth matching call does instead of succeeding.
@@ -50,14 +52,17 @@ const (
 	Ambiguous
 	// Hang blocks until the call's context is cancelled.
 	Hang
-	// Pause stops immediately before storage until Fault.Resume. It models a
-	// process pause, including an operation already past its lease check.
+	// Pause stops immediately before storage until Fault.Resume, or until
+	// the call's context ends (the call then returns the context's error).
+	// It models a process pause, including an operation already past its
+	// lease check.
 	Pause
 )
 
 // Plan arms exactly one fault: the N'th call to Op whose key contains Key.
-// The zero Plan (N == 0) is disarmed. One plan at a time is deliberate — a
-// crash point is one point.
+// The zero Plan (N == 0) is disarmed. One plan at a time is deliberate: a
+// crash point is one point. For listings, Key is matched against the
+// prefix.
 type Plan struct {
 	Op   Op
 	N    int // fire on the N'th matching call, 1-based; <=0 never fires
@@ -65,16 +70,27 @@ type Plan struct {
 	Key  string // substring a key must contain to match; "" matches any
 	// From narrows OpGetRange to reads starting at exactly this offset, so
 	// a test can target one part of an object read by byte range without
-	// hitting its header or its neighbours. 0 matches any offset.
-	From int64
+	// hitting its header or its neighbours. It applies when MatchFrom is
+	// set, or when From is non-zero (so From: 0 alone matches any offset;
+	// set MatchFrom to target offset 0).
+	From      int64
+	MatchFrom bool
 }
 
 // Shape adds deterministic transport conditions to every operation. A zero
 // Shape disables shaping and leaves the normal Fault path unchanged.
+//
+// Shape and Plan compose. The plan is checked first; a call it fires on
+// is not shaped. Every other call waits Latency plus its size over
+// BytesPerSecond, then fails with ErrFault at ErrorRate (drawn from a
+// generator seeded with Seed, so a sequential test sees the same failures
+// on every run). Writes are shaped before they reach the backend (a shaped
+// failure never lands); reads are shaped after it answers, and a shaped
+// failure returns no data.
 type Shape struct {
 	Latency        time.Duration
-	BytesPerSecond int64
-	ErrorRate      float64
+	BytesPerSecond int64   // 0 = unlimited
+	ErrorRate      float64 // in [0, 1]
 	Seed           int64
 }
 
@@ -87,7 +103,8 @@ type faultShape struct {
 
 // Fault wraps a backend and injects one planned failure. Counting is under a
 // mutex and the wrapped call runs outside it, so a plan is deterministic
-// even when the caller fans out.
+// even when the caller fans out. Build one with NewFault; the zero Fault
+// has no backend, though its Set, Ops and ledger methods are safe to call.
 type Fault struct {
 	b      objstore.Backend
 	mu     sync.Mutex
@@ -118,19 +135,19 @@ type Fault struct {
 }
 
 // WatchRewrites starts the write-once ledger: from here on the injector
-// remembers a digest per key and records any key whose bytes CHANGE under it.
+// keeps a SHA-256 digest of the bytes last written under each key, and
+// Rewrites reports every key later written with DIFFERENT bytes. Rewriting
+// identical bytes is not a rewrite.
 //
-// Almost everything in this bucket is write-once, and a read cache
-// may rest on it — it never invalidates, so a key rewritten with different bytes
-// is served stale for the life of the process and leaves no trace to find
-// afterwards. This is the only way to catch one. A key that is DELETED is
-// forgotten: retiring a key and minting it again is not a rewrite, it is what
-// Drop does.
+// A read cache that never invalidates (cache.ByteCache keyed by object
+// name, say) is only correct if its keys are write-once: a key rewritten
+// with different bytes is served stale for the life of the process and
+// leaves no trace. This ledger is how a test catches one. A deleted key is
+// forgotten: deleting a key and writing it again is not a rewrite.
 //
-// It watches EVERYTHING, including the three objects that are mutable by
-// design, such as a manifest head or a lease. Filtering is the caller's,
-// because which keys a given test considers write-once is a statement about
-// the caller, not about the store.
+// It watches every key, including ones mutable by design (a lease, a
+// manifest head). Filter Rewrites by the keys your test considers
+// write-once.
 func (f *Fault) WatchRewrites() {
 	f.mu.Lock()
 	defer f.mu.Unlock()
@@ -145,13 +162,12 @@ func (f *Fault) Rewrites() []string {
 	for k := range f.rewritten {
 		out = append(out, k)
 	}
-	sort.Strings(out)
+	slices.Sort(out)
 	return out
 }
 
 // wrote records one landed write against the ledger.
 func (f *Fault) wrote(key string, data []byte) {
-	sum := sha256.Sum256(data)
 	f.mu.Lock()
 	defer f.mu.Unlock()
 	if f.writeKeys == nil {
@@ -162,6 +178,7 @@ func (f *Fault) wrote(key string, data []byte) {
 	if f.digest == nil {
 		return
 	}
+	sum := sha256.Sum256(data)
 	if had, ok := f.digest[key]; ok && had != sum {
 		f.rewritten[key] = true
 	}
@@ -186,15 +203,17 @@ func NewFault(s *objstore.Store) (*objstore.Store, *Fault) {
 	// encryption, or a fault-injected test would see a different namespace
 	// metadata than the store it wraps.
 	return s.WithBackend(func(b objstore.Backend) objstore.Backend {
-		f = &Fault{b: b, ops: map[Op]int{}}
+		f = &Fault{b: b}
 		return f
 	}), f
 }
 
+// SetShape replaces the transport shape; the zero Shape turns shaping
+// off. Calls already in flight keep the shape they started with.
 func (f *Fault) SetShape(s Shape) {
 	var shape *faultShape
 	if s != (Shape{}) {
-		shape = &faultShape{Shape: s, rng: rand.New(rand.NewSource(s.Seed))}
+		shape = &faultShape{Shape: s, rng: rand.New(rand.NewPCG(uint64(s.Seed), 0))}
 	}
 	f.mu.Lock()
 	f.shape = shape
@@ -209,6 +228,7 @@ func (f *Fault) shapeSnapshot() *faultShape {
 	return f.shape
 }
 
+// ShapeErrors is how many calls the current Shape failed.
 func (f *Fault) ShapeErrors() int {
 	s := f.shapeSnapshot()
 	if s == nil {
@@ -262,6 +282,8 @@ func (f *Fault) Ops() map[Op]int {
 	return out
 }
 
+// ResetOps zeroes the call counts and the read and write ledgers (not the
+// WatchRewrites ledger).
 func (f *Fault) ResetOps() {
 	f.mu.Lock()
 	defer f.mu.Unlock()
@@ -330,12 +352,6 @@ func (f *Fault) read(b []byte) {
 	f.mu.Unlock()
 }
 
-func (f *Fault) count(op Op) {
-	f.mu.Lock()
-	f.ops[op]++
-	f.mu.Unlock()
-}
-
 // Set arms p and resets the match counter.
 func (f *Fault) Set(p Plan) {
 	f.mu.Lock()
@@ -356,8 +372,9 @@ func (f *Fault) Fired() int {
 	return f.fired
 }
 
-// Resume releases an operation stopped by Pause. Like a process resuming,
-// the operation then runs normally; the lease may have expired meanwhile.
+// Resume releases every operation stopped by Pause. Like a process
+// resuming, the operation then runs normally; the lease may have expired
+// meanwhile. Resume with nothing paused is a no-op.
 func (f *Fault) Resume() {
 	f.mu.Lock()
 	paused := f.paused
@@ -368,42 +385,46 @@ func (f *Fault) Resume() {
 	}
 }
 
-// hit advances the counter and reports whether this call is the planned one.
-func (f *Fault) hit(op Op, keys ...string) (Mode, bool) {
-	return f.hitAt(op, 0, keys...)
+// hit counts the call and reports whether it is the planned one. A Pause
+// plan blocks here and then reports no hit, unless ctx ends first: that
+// reports a Hang hit, which returns ctx's error at once.
+func (f *Fault) hit(ctx context.Context, op Op, keys ...string) (Mode, bool) {
+	return f.hitAt(ctx, op, -1, keys...)
 }
 
 // hitAt is hit for a ranged read starting at off; Plan.From narrows it.
-func (f *Fault) hitAt(op Op, off int64, keys ...string) (Mode, bool) {
+func (f *Fault) hitAt(ctx context.Context, op Op, off int64, keys ...string) (Mode, bool) {
 	f.mu.Lock()
+	if f.ops == nil {
+		f.ops = map[Op]int{}
+	}
 	f.ops[op]++
-	if f.plan.N <= 0 || f.plan.Op != op {
-		f.mu.Unlock()
-		return 0, false
-	}
-	if f.plan.Key != "" && !anyContains(keys, f.plan.Key) {
-		f.mu.Unlock()
-		return 0, false
-	}
-	if f.plan.From != 0 && f.plan.From != off {
+	p := f.plan
+	if p.N <= 0 || p.Op != op ||
+		(p.Key != "" && !anyContains(keys, p.Key)) ||
+		((p.MatchFrom || p.From != 0) && p.From != off) {
 		f.mu.Unlock()
 		return 0, false
 	}
 	f.seen++
-	if f.seen != f.plan.N {
+	if f.seen != p.N {
 		f.mu.Unlock()
 		return 0, false
 	}
 	f.fired++
-	mode, paused := f.plan.Mode, f.paused
+	paused := f.paused
 	f.mu.Unlock()
-	if mode == Pause {
-		if paused != nil {
-			<-paused
-		}
-		return 0, false
+	if p.Mode != Pause {
+		return p.Mode, true
 	}
-	return mode, true
+	if paused != nil {
+		select {
+		case <-paused:
+		case <-ctx.Done():
+			return Hang, true
+		}
+	}
+	return 0, false
 }
 
 func anyContains(keys []string, sub string) bool {
@@ -424,8 +445,9 @@ func pre(ctx context.Context, m Mode) error {
 	return ErrFault
 }
 
+// Put is the backend's Put, counted and planned as OpPut.
 func (f *Fault) Put(ctx context.Context, key string, data []byte) error {
-	m, hit := f.hit(OpPut, key)
+	m, hit := f.hit(ctx, OpPut, key)
 	if hit && m != Ambiguous {
 		return pre(ctx, m)
 	}
@@ -442,8 +464,9 @@ func (f *Fault) Put(ctx context.Context, key string, data []byte) error {
 	return err
 }
 
+// PutIfAbsent is the backend's, counted and planned as OpPutIfAbsent.
 func (f *Fault) PutIfAbsent(ctx context.Context, key string, data []byte) (bool, error) {
-	m, hit := f.hit(OpPutIfAbsent, key)
+	m, hit := f.hit(ctx, OpPutIfAbsent, key)
 	if hit && m != Ambiguous {
 		return false, pre(ctx, m)
 	}
@@ -460,8 +483,9 @@ func (f *Fault) PutIfAbsent(ctx context.Context, key string, data []byte) (bool,
 	return ok, err
 }
 
+// PutIfMatch is the backend's, counted and planned as OpPutIfMatch.
 func (f *Fault) PutIfMatch(ctx context.Context, key string, data []byte, etag string) (bool, error) {
-	m, hit := f.hit(OpPutIfMatch, key)
+	m, hit := f.hit(ctx, OpPutIfMatch, key)
 	if hit && m != Ambiguous {
 		return false, pre(ctx, m)
 	}
@@ -478,22 +502,28 @@ func (f *Fault) PutIfMatch(ctx context.Context, key string, data []byte, etag st
 	return ok, err
 }
 
+// Get is the backend's Get, counted and planned as OpGet.
 func (f *Fault) Get(ctx context.Context, key string) ([]byte, error) {
 	f.noteRead(key)
 	// A read has no ambiguous outcome: nothing changed either way.
-	if m, hit := f.hit(OpGet, key); hit {
+	if m, hit := f.hit(ctx, OpGet, key); hit {
 		return nil, pre(ctx, m)
 	}
 	b, err := f.b.Get(ctx, key)
-	if err == nil {
-		err = f.shapeCall(ctx, len(b))
+	if err != nil {
+		return nil, err
+	}
+	if err := f.shapeCall(ctx, len(b)); err != nil {
+		return nil, err
 	}
 	f.read(b)
-	return b, err
+	return b, nil
 }
 
+// ListPage is the backend's, counted and planned as OpList (Plan.Key
+// matches the prefix).
 func (f *Fault) ListPage(ctx context.Context, prefix, after string, limit int) ([]string, string, error) {
-	if m, hit := f.hit(OpList, prefix); hit {
+	if m, hit := f.hit(ctx, OpList, prefix); hit {
 		return nil, "", pre(ctx, m)
 	}
 	if err := f.shapeCall(ctx, 0); err != nil {
@@ -502,8 +532,9 @@ func (f *Fault) ListPage(ctx context.Context, prefix, after string, limit int) (
 	return f.b.ListPage(ctx, prefix, after, limit)
 }
 
+// Delete is the backend's, counted and planned as OpDelete.
 func (f *Fault) Delete(ctx context.Context, key string) error {
-	m, hit := f.hit(OpDelete, key)
+	m, hit := f.hit(ctx, OpDelete, key)
 	if hit && m != Ambiguous {
 		return pre(ctx, m)
 	}
@@ -520,8 +551,10 @@ func (f *Fault) Delete(ctx context.Context, key string) error {
 	return err
 }
 
+// DeleteMany is the backend's, counted and planned as OpDelete; a plan
+// fires when any of keys matches.
 func (f *Fault) DeleteMany(ctx context.Context, keys ...string) error {
-	m, hit := f.hit(OpDelete, keys...)
+	m, hit := f.hit(ctx, OpDelete, keys...)
 	if hit && m != Ambiguous {
 		return pre(ctx, m)
 	}
@@ -538,45 +571,53 @@ func (f *Fault) DeleteMany(ctx context.Context, keys ...string) error {
 	return err
 }
 
-// ListPrefixes is a pass-through: no plan targets it (no crash-point test
-// has needed a delimited listing to fail), but it is counted.
+// ListPrefixesPage is the backend's, counted and planned as
+// OpListPrefixes (Plan.Key matches the prefix).
 func (f *Fault) ListPrefixesPage(ctx context.Context, prefix, after string, limit int) ([]string, string, error) {
-	f.count(OpListPrefixes)
+	if m, hit := f.hit(ctx, OpListPrefixes, prefix); hit {
+		return nil, "", pre(ctx, m)
+	}
 	if err := f.shapeCall(ctx, 0); err != nil {
 		return nil, "", err
 	}
 	return f.b.ListPrefixesPage(ctx, prefix, after, limit)
 }
 
+// GetWithETag is the backend's, counted and planned as OpGet.
 func (f *Fault) GetWithETag(ctx context.Context, key string) ([]byte, string, error) {
 	f.noteRead(key)
-	if m, hit := f.hit(OpGet, key); hit {
+	if m, hit := f.hit(ctx, OpGet, key); hit {
 		return nil, "", pre(ctx, m)
 	}
 	b, etag, err := f.b.GetWithETag(ctx, key)
-	if err == nil {
-		err = f.shapeCall(ctx, len(b))
+	if err != nil {
+		return nil, "", err
+	}
+	if err := f.shapeCall(ctx, len(b)); err != nil {
+		return nil, "", err
 	}
 	f.read(b)
-	return b, etag, err
+	return b, etag, nil
 }
 
+// GetIfChanged is the backend's, counted and planned as OpGet.
 func (f *Fault) GetIfChanged(ctx context.Context, key, etag string) ([]byte, string, bool, error) {
 	f.noteRead(key)
-	if m, hit := f.hit(OpGet, key); hit {
+	if m, hit := f.hit(ctx, OpGet, key); hit {
 		return nil, "", false, pre(ctx, m)
 	}
 	b, current, unchanged, err := f.b.GetIfChanged(ctx, key, etag)
-	if err == nil {
-		err = f.shapeCall(ctx, len(b))
-	}
-	f.read(b)
 	if err != nil {
 		return nil, "", false, err
 	}
+	if err := f.shapeCall(ctx, len(b)); err != nil {
+		return nil, "", false, err
+	}
+	f.read(b)
 	return b, current, unchanged, nil
 }
 
+// EnsureBucket is the backend's, shaped but never planned or counted.
 func (f *Fault) EnsureBucket(ctx context.Context) error {
 	if err := f.shapeCall(ctx, 0); err != nil {
 		return err
@@ -584,6 +625,7 @@ func (f *Fault) EnsureBucket(ctx context.Context) error {
 	return f.b.EnsureBucket(ctx)
 }
 
+// DropBucket is the backend's, shaped but never planned or counted.
 func (f *Fault) DropBucket(ctx context.Context) error {
 	if err := f.shapeCall(ctx, 0); err != nil {
 		return err
@@ -591,15 +633,20 @@ func (f *Fault) DropBucket(ctx context.Context) error {
 	return f.b.DropBucket(ctx)
 }
 
+// GetRange is the backend's, counted and planned as OpGetRange
+// (Plan.From can narrow it to one offset).
 func (f *Fault) GetRange(ctx context.Context, key string, offset, length int64) ([]byte, error) {
 	f.noteRead(key)
-	if m, hit := f.hitAt(OpGetRange, offset, key); hit {
+	if m, hit := f.hitAt(ctx, OpGetRange, offset, key); hit {
 		return nil, pre(ctx, m)
 	}
 	b, err := f.b.GetRange(ctx, key, offset, length)
-	if err == nil {
-		err = f.shapeCall(ctx, len(b))
+	if err != nil {
+		return nil, err
+	}
+	if err := f.shapeCall(ctx, len(b)); err != nil {
+		return nil, err
 	}
 	f.read(b)
-	return b, err
+	return b, nil
 }

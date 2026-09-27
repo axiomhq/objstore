@@ -5,28 +5,47 @@ import (
 	"context"
 	"errors"
 	"fmt"
-	"golang.org/x/sync/semaphore"
+	"math"
+	"sync/atomic"
 	"time"
+
+	"golang.org/x/sync/semaphore"
 )
 
-var ErrNotFound = errors.New("object not found")
-var ErrRange = errors.New("invalid object range")
+// ErrNotFound is wrapped by every error for a missing object or bucket.
+var ErrNotFound = errors.New("store: object not found")
+
+// ErrRange is wrapped by every error for a range outside the object, or an
+// offset or length that is not a valid range at all.
+var ErrRange = errors.New("store: invalid object range")
+
+// ErrInvalidKey is wrapped by every error for a key a backend refuses to
+// store (the file backend rejects empty elements, "." and "..", and its own
+// reserved file names).
+var ErrInvalidKey = errors.New("store: invalid key")
 
 // ErrConflict is a conditional write whose outcome the backend never
 // decided: another conditional write on the same key was in flight (S3's
 // 409 ConditionalRequestConflict). The object may or may not have been
 // written; the caller retries. It is never a lost race, which is
 // (false, nil).
-var ErrConflict = errors.New("conditional write conflict, retry")
+var ErrConflict = errors.New("store: conditional write conflict, retry")
 
+// MaxListPage is the largest limit ListPage and ListPrefixesPage accept,
+// S3's own page size.
 const MaxListPage = 1000
 
 // Backend is the object-store contract every provider package satisfies
-// (fs, s3, gcs); storetest.Conformance runs against each. Every error a
-// backend returns is wrapped by OpErr. A failed condition is (false, nil),
-// a missing object wraps ErrNotFound, a bad range wraps ErrRange. ETags
-// are opaque. Listing is lexical, after is exclusive, next is the last
-// key returned when more remain and "" otherwise. The file backend
+// (fs, s3, gcs); storetest.Conformance runs against each. It may grow.
+//
+// Every error a backend returns is wrapped by OpErr. A failed condition is
+// (false, nil), a missing object wraps ErrNotFound, a bad range wraps
+// ErrRange. The ok of a conditional write is meaningful only when err ==
+// nil, except that a backend may report (true, err) when the object is
+// visible but not proven durable (the file backend, when the directory
+// sync after the publish fails); a retry of the same write settles it.
+// ETags are opaque. Listing is lexical, after is exclusive, next is the
+// last key returned when more remain and "" otherwise. The file backend
 // reserves terminal .lock and .tmp-* files; dot-prefixed directory
 // elements remain valid so documented namespace names work.
 type Backend interface {
@@ -48,28 +67,44 @@ type Backend interface {
 // Store is one bucket of write-once objects with the OCC primitives a
 // log and a manifest build on (PutIfAbsent to append, PutIfMatch to swap).
 type Store struct {
-	b    Backend
-	cmek *cmekState
+	b Backend
+	// cmek is shared with every Store WithBackend derives, so a key cached
+	// or configured through one is seen through all. nil (a zero Store)
+	// means no encryption.
+	cmek *atomic.Pointer[cmekState]
+	// plaintext is Config.PlaintextKeys, or DefaultPlaintextKeys.
+	plaintext func(key string, data []byte) bool
 	// writes bounds non-urgent object writes and deletes in flight; see
 	// Config.MaxInflightWrites. nil (a zero Store) means unbounded.
 	writes *semaphore.Weighted
 }
 
-// Open returns a Store over b with cfg's pacing and write bound. The
-// provider packages (fs, s3, gcs) each have an Open that builds the
-// backend and calls this.
+// Open returns a Store over b with cfg's pacing, write bound and
+// encryption. The provider packages (fs, s3, gcs) each have an Open that
+// builds the backend and calls this.
 func Open(b Backend, cfg Config) *Store {
 	if cfg.RequestsPerSecond > 0 {
 		b = &paced{Backend: b, pace: newPacer(cfg.RequestsPerSecond)}
 	}
-	writes := semaphore.NewWeighted(int64(cmp.Or(cfg.MaxInflightWrites, defaultMaxInflightWrites)))
-	return &Store{b: b, writes: writes}
+	s := &Store{b: b, cmek: new(atomic.Pointer[cmekState]), plaintext: cfg.PlaintextKeys}
+	if s.plaintext == nil {
+		s.plaintext = DefaultPlaintextKeys
+	}
+	if cfg.MaxInflightWrites >= 0 {
+		s.writes = semaphore.NewWeighted(int64(cmp.Or(cfg.MaxInflightWrites, defaultMaxInflightWrites)))
+	}
+	if cfg.KeyProvider != nil {
+		s.cmek.Store(newCMEKState(cfg.KeyProvider))
+	}
+	return s
 }
 
 // WithBackend returns a Store over wrap(s's backend) with s's encryption
 // and write bound: the same bucket seen through a wrapper.
 func (s *Store) WithBackend(wrap func(Backend) Backend) *Store {
-	return &Store{b: wrap(s.b), writes: s.writes, cmek: s.cmek}
+	c := *s
+	c.b = wrap(s.b)
+	return &c
 }
 
 // OpErr attaches the operation and the key to every error leaving a
@@ -99,16 +134,25 @@ func (s *Store) enterWrite(ctx context.Context) (func(), error) {
 	return func() { s.writes.Release(1) }, nil
 }
 
-func (s *Store) Put(ctx context.Context, key string, data []byte) error {
+// seal returns data as it is stored: encrypted when key lies in a
+// namespace with a key record.
+func (s *Store) seal(ctx context.Context, op, key string, data []byte) ([]byte, error) {
 	dek, err := s.objectKey(ctx, key)
 	if err != nil {
-		return err
+		return nil, OpErr(op, key, err)
 	}
-	if dek != nil {
-		data, err = encryptObject(key, data, dek)
-		if err != nil {
-			return err
-		}
+	if dek == nil {
+		return data, nil
+	}
+	sealed, err := encryptObject(key, data, dek)
+	return sealed, OpErr(op, key, err)
+}
+
+// Put writes key unconditionally, replacing any object there.
+func (s *Store) Put(ctx context.Context, key string, data []byte) error {
+	data, err := s.seal(ctx, "put", key, data)
+	if err != nil {
+		return err
 	}
 	release, err := s.enterWrite(ctx)
 	if err != nil {
@@ -119,17 +163,12 @@ func (s *Store) Put(ctx context.Context, key string, data []byte) error {
 }
 
 // PutIfAbsent writes key only if it does not already exist. Returns false
-// when the key existed. This is the OCC primitive a write-ahead log builds on.
+// when the key existed. This is the OCC primitive a write-ahead log builds
+// on. See Backend for the one case where ok is true alongside an error.
 func (s *Store) PutIfAbsent(ctx context.Context, key string, data []byte) (bool, error) {
-	dek, err := s.objectKey(ctx, key)
+	data, err := s.seal(ctx, "put-if-absent", key, data)
 	if err != nil {
 		return false, err
-	}
-	if dek != nil {
-		data, err = encryptObject(key, data, dek)
-		if err != nil {
-			return false, err
-		}
 	}
 	release, err := s.enterWrite(ctx)
 	if err != nil {
@@ -139,25 +178,23 @@ func (s *Store) PutIfAbsent(ctx context.Context, key string, data []byte) (bool,
 	return s.b.PutIfAbsent(ctx, key, data)
 }
 
+// Get returns the whole object at key; a missing object wraps ErrNotFound.
 func (s *Store) Get(ctx context.Context, key string) ([]byte, error) {
 	dek, err := s.objectKey(ctx, key)
 	if err != nil {
-		return nil, err
+		return nil, OpErr("get", key, err)
 	}
 	data, err := s.b.Get(ctx, key)
-	if err != nil || dek == nil {
-		return data, err
+	if err != nil {
+		return nil, err
 	}
-	if plaintextDeletedManifest(key, data) || plaintextFence(key, data) {
-		return data, nil
-	}
-	return decryptObject(key, data, dek)
+	return s.open(ctx, "get", key, data, dek)
 }
 
 // GetRange reads exactly length bytes starting at offset. Short/out-of-bounds
 // ranges fail instead of returning a plausible partial index block.
 func (s *Store) GetRange(ctx context.Context, key string, offset, length int64) ([]byte, error) {
-	if offset < 0 || length <= 0 || offset > int64(^uint64(0)>>1)-length {
+	if offset < 0 || length <= 0 || offset > math.MaxInt64-length {
 		return nil, OpErr("get-range", key, ErrRange)
 	}
 	if err := ctx.Err(); err != nil {
@@ -165,7 +202,7 @@ func (s *Store) GetRange(ctx context.Context, key string, offset, length int64) 
 	}
 	dek, err := s.objectKey(ctx, key)
 	if err != nil {
-		return nil, err
+		return nil, OpErr("get-range", key, err)
 	}
 	if dek == nil {
 		return s.b.GetRange(ctx, key, offset, length)
@@ -177,17 +214,17 @@ func (s *Store) GetRange(ctx context.Context, key string, offset, length int64) 
 func (s *Store) GetWithETag(ctx context.Context, key string) ([]byte, string, error) {
 	dek, err := s.objectKey(ctx, key)
 	if err != nil {
-		return nil, "", err
+		return nil, "", OpErr("get-with-etag", key, err)
 	}
 	data, tag, err := s.b.GetWithETag(ctx, key)
-	if err != nil || dek == nil {
-		return data, tag, err
+	if err != nil {
+		return nil, "", err
 	}
-	if plaintextDeletedManifest(key, data) || plaintextFence(key, data) {
-		return data, tag, nil
+	plain, err := s.open(ctx, "get-with-etag", key, data, dek)
+	if err != nil {
+		return nil, "", err
 	}
-	plain, err := decryptObject(key, data, dek)
-	return plain, tag, err
+	return plain, tag, nil
 }
 
 // GetIfChanged conditionally reads one revision. Empty etag is unconditional.
@@ -200,32 +237,27 @@ func (s *Store) GetIfChanged(ctx context.Context, key, etag string) ([]byte, str
 	}
 	dek, err := s.objectKey(ctx, key)
 	if err != nil {
-		return nil, "", false, err
+		return nil, "", false, OpErr("get-if-changed", key, err)
 	}
 	data, tag, unchanged, err := s.b.GetIfChanged(ctx, key, etag)
-	if err != nil || unchanged || dek == nil {
+	if err != nil || unchanged {
 		return data, tag, unchanged, err
 	}
-	if plaintextDeletedManifest(key, data) || plaintextFence(key, data) {
-		return data, tag, false, nil
+	plain, err := s.open(ctx, "get-if-changed", key, data, dek)
+	if err != nil {
+		return nil, "", false, err
 	}
-	plain, err := decryptObject(key, data, dek)
-	return plain, tag, false, err
+	return plain, tag, false, nil
 }
 
 // PutIfMatch replaces key only if its current ETag equals etag — compare-and-
 // swap, the manifest-swap primitive. (false, nil) = precondition failed: the
-// object changed under us, or no longer exists.
+// object changed under us, or no longer exists. See Backend for the one
+// case where ok is true alongside an error.
 func (s *Store) PutIfMatch(ctx context.Context, key string, data []byte, etag string) (bool, error) {
-	dek, err := s.objectKey(ctx, key)
+	data, err := s.seal(ctx, "put-if-match", key, data)
 	if err != nil {
 		return false, err
-	}
-	if dek != nil {
-		data, err = encryptObject(key, data, dek)
-		if err != nil {
-			return false, err
-		}
 	}
 	release, err := s.enterWrite(ctx)
 	if err != nil {
@@ -235,11 +267,14 @@ func (s *Store) PutIfMatch(ctx context.Context, key string, data []byte, etag st
 	return s.b.PutIfMatch(ctx, key, data, etag)
 }
 
-// ListPage returns at most limit keys under prefix, lexically after after.
-// next is the last returned key when another page remains, otherwise empty.
+var errListLimit = fmt.Errorf("limit must be between 1 and %d", MaxListPage)
+
+// ListPage returns at most limit (1 to MaxListPage) keys under prefix,
+// lexically after after. next is the last returned key when another page
+// remains, otherwise empty.
 func (s *Store) ListPage(ctx context.Context, prefix, after string, limit int) ([]string, string, error) {
 	if limit < 1 || limit > MaxListPage {
-		return nil, "", OpErr("list-page", prefix, errors.New("limit must be between 1 and 1000"))
+		return nil, "", OpErr("list-page", prefix, errListLimit)
 	}
 	return s.b.ListPage(ctx, prefix, after, limit)
 }
@@ -248,7 +283,7 @@ func (s *Store) ListPage(ctx context.Context, prefix, after string, limit int) (
 func (s *Store) List(ctx context.Context, prefix string) ([]string, error) {
 	var keys []string
 	for after := ""; ; {
-		page, next, err := s.ListPage(ctx, prefix, after, 1000)
+		page, next, err := s.ListPage(ctx, prefix, after, MaxListPage)
 		if err != nil {
 			return nil, err
 		}
@@ -264,11 +299,11 @@ func (s *Store) List(ctx context.Context, prefix string) ([]string, error) {
 // CommonPrefixes with Delimiter "/", each ending in "/", lexically sorted.
 // Discovering top-level names costs one request per page of names
 // instead of one key per object in the bucket. A prefix appears
-// only if at least one object lives under it, on both backends.
+// only if at least one object lives under it, on every backend.
 func (s *Store) ListPrefixes(ctx context.Context, prefix string) ([]string, error) {
 	var prefixes []string
 	for after := ""; ; {
-		page, next, err := s.ListPrefixesPage(ctx, prefix, after, 1000)
+		page, next, err := s.ListPrefixesPage(ctx, prefix, after, MaxListPage)
 		if err != nil {
 			return nil, err
 		}
@@ -280,17 +315,19 @@ func (s *Store) ListPrefixes(ctx context.Context, prefix string) ([]string, erro
 	}
 }
 
+// ListPrefixesPage is one page of ListPrefixes: at most limit (1 to
+// MaxListPage) prefixes lexically after after, and the cursor as in
+// ListPage.
 func (s *Store) ListPrefixesPage(ctx context.Context, prefix, after string, limit int) ([]string, string, error) {
 	if limit < 1 || limit > MaxListPage {
-		return nil, "", OpErr("list-prefixes-page", prefix, errors.New("limit must be between 1 and 1000"))
+		return nil, "", OpErr("list-prefixes-page", prefix, errListLimit)
 	}
 	return s.b.ListPrefixesPage(ctx, prefix, after, limit)
 }
 
+// Delete removes key. A missing key is not an error. It never needs the
+// namespace key, so deleting (crypto-shredding) works after revocation.
 func (s *Store) Delete(ctx context.Context, key string) error {
-	if _, err := s.objectKey(ctx, key); err != nil {
-		return err
-	}
 	release, err := s.enterWrite(ctx)
 	if err != nil {
 		return err
@@ -299,13 +336,9 @@ func (s *Store) Delete(ctx context.Context, key string) error {
 	return s.b.Delete(ctx, key)
 }
 
-// DeleteMany removes keys. Missing keys are not an error. Empty input is a no-op.
+// DeleteMany removes keys. Missing keys are not an error. Empty input is a
+// no-op. Like Delete it never needs the namespace key.
 func (s *Store) DeleteMany(ctx context.Context, keys ...string) error {
-	for _, key := range keys {
-		if _, err := s.objectKey(ctx, key); err != nil {
-			return err
-		}
-	}
 	release, err := s.enterWrite(ctx)
 	if err != nil {
 		return err
@@ -319,4 +352,5 @@ func (s *Store) EnsureBucket(ctx context.Context) error { return s.b.EnsureBucke
 
 // DropBucket deletes every object and then the bucket itself (test
 // teardown; the harness's fresh bucket per test must not outlive the test).
+// A bucket that is already gone is not an error.
 func (s *Store) DropBucket(ctx context.Context) error { return s.b.DropBucket(ctx) }

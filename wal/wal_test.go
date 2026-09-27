@@ -6,9 +6,12 @@ import (
 	"encoding/binary"
 	"errors"
 	"hash/crc32"
+	"math/rand/v2"
+	"reflect"
 	"slices"
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/axiomhq/objstore"
 	"github.com/axiomhq/objstore/storetest"
@@ -272,5 +275,114 @@ func TestDecodeRejectsHugeDeclaredCountWithoutAllocation(t *testing.T) {
 		}
 	}); allocs > 5 {
 		t.Fatalf("huge count used %.0f allocations, want constant-size rejection", allocs)
+	}
+}
+
+// fuzzSeeds are pages of every shape the codec writes.
+func fuzzSeeds(f *testing.F) {
+	for _, h := range []Header{{}, {Seq: 7, Nonce: "n"}, {Seq: 1 << 40, Nonce: "batch", At: time.UnixMilli(1234).UTC(), BatchPages: 3, BatchIndex: 2}} {
+		for _, records := range [][]Bytes{nil, rows(""), rows("a", "bc", "def")} {
+			data, err := Encode(h, records)
+			if err != nil {
+				f.Fatal(err)
+			}
+			f.Add(data)
+		}
+	}
+	f.Add([]byte(pageMagic))
+	f.Add([]byte{})
+}
+
+// FuzzDecode: no input panics, and a page Decode accepts re-encodes into
+// one that decodes to the same header and records.
+func FuzzDecode(f *testing.F) {
+	fuzzSeeds(f)
+	f.Fuzz(func(t *testing.T, data []byte) {
+		h, records, err := Decode(data)
+		if err != nil {
+			if !errors.Is(err, ErrCorrupt) {
+				t.Fatalf("error %v does not wrap ErrCorrupt", err)
+			}
+			return
+		}
+		again, err := Encode(h, pageRecords(records))
+		if err != nil {
+			t.Fatalf("re-encode: %v", err)
+		}
+		h2, records2, err := Decode(again)
+		if err != nil || !reflect.DeepEqual(h2, h) || !slices.EqualFunc(records2, records, bytes.Equal) {
+			t.Fatalf("round trip: %+v %q, want %+v %q (%v)", h2, records2, h, records, err)
+		}
+	})
+}
+
+// FuzzScan: Scan agrees with Decode on every input.
+func FuzzScan(f *testing.F) {
+	fuzzSeeds(f)
+	f.Fuzz(func(t *testing.T, data []byte) {
+		var scanned [][]byte
+		h, err := Scan(data, func(r []byte) error { scanned = append(scanned, r); return nil })
+		hd, records, derr := Decode(data)
+		if (err == nil) != (derr == nil) {
+			t.Fatalf("Scan %v, Decode %v", err, derr)
+		}
+		if err == nil && (!reflect.DeepEqual(h, hd) || !slices.EqualFunc(scanned, records, bytes.Equal)) {
+			t.Fatal("Scan and Decode disagree")
+		}
+	})
+}
+
+// TestEncodeDecodeRoundTrip: random headers and records survive the codec.
+func TestEncodeDecodeRoundTrip(t *testing.T) {
+	rng := rand.New(rand.NewPCG(1, 2))
+	for range 500 {
+		h := Header{Seq: rng.Uint64(), Nonce: string(randomBytes(rng, rng.IntN(40)))}
+		if rng.IntN(2) == 0 {
+			h.At = time.UnixMilli(rng.Int64N(1 << 45)).UTC()
+		}
+		if n := rng.Uint64N(4); n > 0 {
+			h.BatchPages, h.BatchIndex = n, rng.Uint64N(n)
+		}
+		records := make([]Bytes, rng.IntN(20))
+		for i := range records {
+			records[i] = randomBytes(rng, rng.IntN(300))
+		}
+		data, err := Encode(h, records)
+		if err != nil {
+			t.Fatal(err)
+		}
+		got, decoded, err := Decode(data)
+		if err != nil || !reflect.DeepEqual(got, h) || !slices.EqualFunc(decoded, records, func(a []byte, b Bytes) bool { return bytes.Equal(a, b) }) {
+			t.Fatalf("round trip of %+v: %+v, %v", h, got, err)
+		}
+		if sh, err := Scan(data, nil); err != nil || !reflect.DeepEqual(sh, h) {
+			t.Fatalf("scan of %+v: %+v, %v", h, sh, err)
+		}
+	}
+}
+
+func randomBytes(rng *rand.Rand, n int) Bytes {
+	b := make(Bytes, n)
+	for i := range b {
+		b[i] = byte(rng.Uint32())
+	}
+	return b
+}
+
+func BenchmarkDecode(b *testing.B) {
+	records := make([]Bytes, 1024)
+	for i := range records {
+		records[i] = filled(byte(i), 512)
+	}
+	data, err := Encode(Header{Seq: 1, Nonce: "benchmark"}, records)
+	if err != nil {
+		b.Fatal(err)
+	}
+	b.SetBytes(int64(len(data)))
+	b.ReportAllocs()
+	for b.Loop() {
+		if _, _, err := Decode(data); err != nil {
+			b.Fatal(err)
+		}
 	}
 }

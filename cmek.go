@@ -16,6 +16,8 @@ import (
 	"sync/atomic"
 	"time"
 
+	"golang.org/x/sync/singleflight"
+
 	"github.com/axiomhq/objstore/kms"
 )
 
@@ -35,11 +37,22 @@ type Envelope struct {
 const encryptedBlockSize = 64 << 10
 const encryptedHeaderSize = 25 // magic(4), version(1), plaintext length(8), nonce(12)
 const encryptedTagSize = 16
+
+// keyCacheTTL is how long an unwrapped data key, or the absence of a key
+// record, is trusted before the record is read again.
 const keyCacheTTL = time.Second
 const keyRecordPrefix = "cmek/"
 
+// Backoff after a failed key lookup: doubles from min to max per name.
+const (
+	minKeyBackoff = 100 * time.Millisecond
+	maxKeyBackoff = 5 * time.Second
+)
+
 var encryptedMagic = [4]byte{'D', 'W', 'E', 'K'}
 
+// cachedKey is a namespace's data key, or with key nil the namespace's
+// lack of a key record (a plaintext namespace), trusted until until.
 type cachedKey struct {
 	key     []byte
 	until   time.Time
@@ -58,6 +71,11 @@ type cmekState struct {
 	failures map[string]keyFailure
 	aws      map[string]*awsRefresh
 	interval atomic.Int64
+	// flight collapses concurrent record reads and unwraps per namespace.
+	flight singleflight.Group
+	// now and ttl are time.Now and keyCacheTTL outside tests.
+	now func() time.Time
+	ttl time.Duration
 }
 
 type awsRefresh struct {
@@ -66,21 +84,47 @@ type awsRefresh struct {
 	rotatedUntil time.Time
 }
 
-// ConfigureCMEK enables transparent encryption of ns/<name>/ objects. A
-// small envelope record outside that prefix bootstraps the encrypted manifest
-// and metadata. The record contains a wrapped DEK, never plaintext key bytes.
+func newCMEKState(provider kms.KeyProvider) *cmekState {
+	return &cmekState{
+		provider: provider,
+		keys:     make(map[string]cachedKey),
+		failures: make(map[string]keyFailure),
+		aws:      make(map[string]*awsRefresh),
+		now:      time.Now,
+		ttl:      keyCacheTTL,
+	}
+}
+
+// crypt returns the encryption state, nil when none is configured.
+func (s *Store) crypt() *cmekState {
+	if s.cmek == nil {
+		return nil
+	}
+	return s.cmek.Load()
+}
+
+// ConfigureCMEK enables transparent encryption of ns/<name>/ objects, as
+// Config.KeyProvider does. Call it before first use of s: requests already
+// in flight may run with the previous setting. A small envelope record
+// outside that prefix bootstraps the encrypted manifest and metadata. The
+// record contains a wrapped DEK, never plaintext key bytes. A nil
+// provider is ignored.
 func (s *Store) ConfigureCMEK(provider kms.KeyProvider) {
 	if provider == nil {
 		return
 	}
-	s.cmek = &cmekState{provider: provider, keys: make(map[string]cachedKey), failures: make(map[string]keyFailure), aws: make(map[string]*awsRefresh)}
+	if s.cmek == nil {
+		s.cmek = new(atomic.Pointer[cmekState])
+	}
+	s.cmek.Store(newCMEKState(provider))
 }
 
-// SetCMEKRefreshInterval ties AWS access and rotation probes to the lease
-// heartbeat cadence. Set it once, before use.
+// SetCMEKRefreshInterval ties access and rotation probes for keys whose
+// provider is lease-cadenced (AWS KMS) to the lease heartbeat cadence. Set
+// it once, before use.
 func (s *Store) SetCMEKRefreshInterval(interval time.Duration) {
-	if s.cmek != nil {
-		s.cmek.interval.Store(int64(interval))
+	if c := s.crypt(); c != nil {
+		c.interval.Store(int64(interval))
 	}
 }
 
@@ -103,25 +147,51 @@ func (c *cmekState) awsState(name, keyName string) *awsRefresh {
 
 func (c *cmekState) cacheTTL(name, keyName string) time.Duration {
 	if c.awsState(name, keyName) != nil {
-		return max(keyCacheTTL, c.refreshInterval())
+		return max(c.ttl, c.refreshInterval())
 	}
-	return keyCacheTTL
+	return c.ttl
 }
 
 func (c *cmekState) retryReady(name string) bool {
 	c.mu.Lock()
 	defer c.mu.Unlock()
-	return !time.Now().Before(c.failures[name].next)
+	return !c.now().Before(c.failures[name].next)
 }
 
 func (c *cmekState) failed(name string) {
 	c.mu.Lock()
 	defer c.mu.Unlock()
 	f := c.failures[name]
-	f.delay = min(5*time.Second, max(100*time.Millisecond, f.delay*2))
-	f.next = time.Now().Add(f.delay)
+	f.delay = min(maxKeyBackoff, max(minKeyBackoff, f.delay*2))
+	f.next = c.now().Add(f.delay)
 	c.failures[name] = f
 	delete(c.keys, name)
+}
+
+// fail classifies a key-lookup error. A context error is the caller's, not
+// the key's: it is returned as is and opens no backoff. Anything else opens
+// the name's backoff and wraps both kms.ErrKeyUnavailable and err.
+func (c *cmekState) fail(name string, err error) error {
+	if errors.Is(err, context.Canceled) || errors.Is(err, context.DeadlineExceeded) {
+		return err
+	}
+	c.failed(name)
+	return fmt.Errorf("%w: %w", kms.ErrKeyUnavailable, err)
+}
+
+// cached returns name's cached lookup, if still fresh.
+func (c *cmekState) cached(name string) (cachedKey, bool) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	k, ok := c.keys[name]
+	return k, ok && c.now().Before(k.until)
+}
+
+func (c *cmekState) remember(name string, dek []byte, version string, ttl time.Duration) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	c.keys[name] = cachedKey{key: dek, until: c.now().Add(ttl), version: version}
+	delete(c.failures, name)
 }
 
 func namespaceObject(key string) string {
@@ -139,7 +209,8 @@ func namespaceObject(key string) string {
 // InstallNamespaceKey publishes the recovery envelope before the first
 // encrypted object. The caller holds the namespace lifecycle lease.
 func (s *Store) InstallNamespaceKey(ctx context.Context, name string, envelope Envelope) error {
-	if s.cmek == nil {
+	c := s.crypt()
+	if c == nil {
 		return kms.ErrKeyUnavailable
 	}
 	if envelope.Mode != EncryptionCustomerManaged || envelope.KeyName == "" || len(envelope.DEKWrapped) == 0 {
@@ -163,10 +234,10 @@ func (s *Store) InstallNamespaceKey(ctx context.Context, name string, envelope E
 			return errors.New("namespace key record already exists")
 		}
 	}
-	s.cmek.mu.Lock()
-	delete(s.cmek.keys, name)
-	delete(s.cmek.aws, name)
-	s.cmek.mu.Unlock()
+	c.mu.Lock()
+	delete(c.keys, name)
+	delete(c.aws, name)
+	c.mu.Unlock()
 	return nil
 }
 
@@ -174,7 +245,7 @@ func (s *Store) InstallNamespaceKey(ctx context.Context, name string, envelope E
 // fence, then removes its wrapped DEK. The lifecycle caller holds the lease.
 // Repeating this after a crash between the CAS and delete is safe.
 func (s *Store) RetireNamespaceKey(ctx context.Context, name, incarnation string) error {
-	if s.cmek == nil {
+	if s.crypt() == nil {
 		return nil
 	}
 	record := keyRecordPrefix + name
@@ -259,11 +330,17 @@ func plaintextFence(key string, data []byte) bool {
 }
 
 func (s *Store) forgetNamespaceKey(name string) {
-	s.cmek.mu.Lock()
-	delete(s.cmek.keys, name)
-	delete(s.cmek.failures, name)
-	delete(s.cmek.aws, name)
-	s.cmek.mu.Unlock()
+	if c := s.crypt(); c != nil {
+		c.forget(name)
+	}
+}
+
+func (c *cmekState) forget(name string) {
+	c.mu.Lock()
+	delete(c.keys, name)
+	delete(c.failures, name)
+	delete(c.aws, name)
+	c.mu.Unlock()
 }
 
 func deletedHead(data []byte, incarnation string) bool {
@@ -285,8 +362,13 @@ func plaintextDeletedManifest(key string, data []byte) bool {
 	return json.Unmarshal(data, &head) == nil && head.State == "deleted" && head.Incarnation != ""
 }
 
+// objectKey returns the data key for object: nil for an object outside
+// ns/<name>/ or in a namespace without a key record. Lookups (hits and
+// misses alike) are cached for the key cache TTL, and concurrent lookups
+// of one namespace share one record read and one unwrap.
 func (s *Store) objectKey(ctx context.Context, object string) ([]byte, error) {
-	if s.cmek == nil {
+	c := s.crypt()
+	if c == nil {
 		return nil, nil
 	}
 	if err := ctx.Err(); err != nil {
@@ -296,112 +378,97 @@ func (s *Store) objectKey(ctx context.Context, object string) ([]byte, error) {
 	if name == "" {
 		return nil, nil
 	}
-	s.cmek.mu.Lock()
-	cached, ok := s.cmek.keys[name]
-	if ok && time.Now().Before(cached.until) {
-		key := cached.key
-		s.cmek.mu.Unlock()
-		return key, nil
+	if k, ok := c.cached(name); ok {
+		return k.key, nil
 	}
-	s.cmek.mu.Unlock()
-	if !s.cmek.retryReady(name) {
+	return s.lookup(ctx, c, name, false)
+}
+
+// lookup runs load for name once for all concurrent callers. The shared
+// load does not inherit a caller's cancellation, so one caller giving up
+// neither fails the others nor opens the name's backoff; each caller still
+// returns on its own ctx.
+func (s *Store) lookup(ctx context.Context, c *cmekState, name string, check bool) ([]byte, error) {
+	if !c.retryReady(name) {
 		return nil, kms.ErrKeyUnavailable
 	}
-	data, err := s.b.Get(ctx, keyRecordPrefix+name)
+	flight := name
+	if check {
+		flight = "check\x00" + name
+	}
+	detached := context.WithoutCancel(ctx)
+	ch := c.flight.DoChan(flight, func() (any, error) {
+		return c.load(detached, s.b, name, check)
+	})
+	select {
+	case <-ctx.Done():
+		return nil, ctx.Err()
+	case r := <-ch:
+		dek, _ := r.Val.([]byte)
+		return dek, r.Err
+	}
+}
+
+// load reads name's key record and unwraps its data key, caching the
+// result: nil, nil (also cached) for a namespace without a record. check
+// is the request-boundary revalidation: a lease-cadenced key skips the
+// unwrap while its last check is fresh, where a plain load skips it while
+// the cached key matches the record's version.
+func (c *cmekState) load(ctx context.Context, b Backend, name string, check bool) ([]byte, error) {
+	data, err := b.Get(ctx, keyRecordPrefix+name)
 	if errors.Is(err, ErrNotFound) {
-		s.forgetNamespaceKey(name)
+		c.forget(name)
+		c.remember(name, nil, "", c.ttl)
 		return nil, nil
 	}
 	if err != nil {
-		s.cmek.failed(name)
-		return nil, fmt.Errorf("%w: %v", kms.ErrKeyUnavailable, err)
+		return nil, c.fail(name, err)
 	}
 	var envelope Envelope
 	if err := json.Unmarshal(data, &envelope); err != nil {
 		return nil, fmt.Errorf("invalid namespace key record: %w", err)
 	}
-	state := s.cmek.awsState(name, envelope.KeyName)
+	state := c.awsState(name, envelope.KeyName)
 	if state != nil {
 		state.mu.Lock()
 		defer state.mu.Unlock()
+		if check && c.now().Before(state.checkedUntil) {
+			return nil, nil
+		}
 		// Another request may have renewed the cached DEK while this one
 		// fetched the envelope.
-		s.cmek.mu.Lock()
-		cached, ok := s.cmek.keys[name]
-		s.cmek.mu.Unlock()
-		if ok && time.Now().Before(cached.until) && cached.version == envelope.KeyVersion {
-			return cached.key, nil
+		if k, ok := c.cached(name); !check && ok && k.key != nil && k.version == envelope.KeyVersion {
+			return k.key, nil
 		}
 	}
-	dek, err := s.cmek.provider.Unwrap(ctx, envelope.KeyName, envelope.DEKWrapped)
+	dek, err := c.provider.Unwrap(ctx, envelope.KeyName, envelope.DEKWrapped)
 	if err != nil {
-		s.cmek.failed(name)
-		return nil, fmt.Errorf("%w: %v", kms.ErrKeyUnavailable, err)
+		return nil, c.fail(name, err)
 	}
 	if len(dek) != 32 {
 		return nil, kms.ErrKeyUnavailable
 	}
-	ttl := s.cmek.cacheTTL(name, envelope.KeyName)
-	s.cmek.mu.Lock()
-	s.cmek.keys[name] = cachedKey{key: dek, until: time.Now().Add(ttl), version: envelope.KeyVersion}
-	delete(s.cmek.failures, name)
-	s.cmek.mu.Unlock()
+	c.remember(name, dek, envelope.KeyVersion, c.cacheTTL(name, envelope.KeyName))
 	if state != nil {
-		state.checkedUntil = time.Now().Add(s.cmek.refreshInterval())
+		state.checkedUntil = c.now().Add(c.refreshInterval())
 	}
 	return dek, nil
 }
 
 // CheckNamespaceKey revalidates KMS access at the API boundary, including
-// cache-only queries. AWS checks share the lease renewal cadence.
+// cache-only queries: it reads the key record and unwraps the data key,
+// shared with concurrent checks of the same name. Lease-cadenced (AWS)
+// keys are checked at most once per refresh interval.
 func (s *Store) CheckNamespaceKey(ctx context.Context, name string) error {
 	if err := ctx.Err(); err != nil {
 		return err
 	}
-	if s.cmek == nil {
+	c := s.crypt()
+	if c == nil {
 		return nil
 	}
-	if !s.cmek.retryReady(name) {
-		return kms.ErrKeyUnavailable
-	}
-	data, err := s.b.Get(ctx, keyRecordPrefix+name)
-	if errors.Is(err, ErrNotFound) {
-		s.forgetNamespaceKey(name)
-		return nil
-	}
-	if err != nil {
-		s.cmek.failed(name)
-		return fmt.Errorf("%w: %v", kms.ErrKeyUnavailable, err)
-	}
-	var envelope Envelope
-	if err := json.Unmarshal(data, &envelope); err != nil {
-		return err
-	}
-	state := s.cmek.awsState(name, envelope.KeyName)
-	if state != nil {
-		state.mu.Lock()
-		defer state.mu.Unlock()
-		if time.Now().Before(state.checkedUntil) {
-			return nil
-		}
-	}
-	dek, err := s.cmek.provider.Unwrap(ctx, envelope.KeyName, envelope.DEKWrapped)
-	if err != nil {
-		s.cmek.failed(name)
-		return fmt.Errorf("%w: %v", kms.ErrKeyUnavailable, err)
-	}
-	if len(dek) != 32 {
-		return kms.ErrKeyUnavailable
-	}
-	ttl := s.cmek.cacheTTL(name, envelope.KeyName)
-	s.cmek.mu.Lock()
-	s.cmek.keys[name] = cachedKey{key: dek, until: time.Now().Add(ttl), version: envelope.KeyVersion}
-	delete(s.cmek.failures, name)
-	s.cmek.mu.Unlock()
-	if state != nil {
-		state.checkedUntil = time.Now().Add(s.cmek.refreshInterval())
-	}
-	return nil
+	_, err := s.lookup(ctx, c, name, true)
+	return err
 }
 
 // CheckNamespaceKeyCached enforces the key-cache lease for internal
@@ -417,7 +484,8 @@ func (s *Store) CheckNamespaceKeyCached(ctx context.Context, name string) error 
 // be repaired on the next write.
 func (s *Store) RotateNamespaceKey(ctx context.Context, name string) (*Envelope, error) {
 	rotated := false
-	if s.cmek != nil {
+	c := s.crypt()
+	if c != nil {
 		data, err := s.b.Get(ctx, keyRecordPrefix+name)
 		if err != nil && !errors.Is(err, ErrNotFound) {
 			return nil, err
@@ -427,15 +495,15 @@ func (s *Store) RotateNamespaceKey(ctx context.Context, name string) (*Envelope,
 			if err := json.Unmarshal(data, &envelope); err != nil {
 				return nil, err
 			}
-			if state := s.cmek.awsState(name, envelope.KeyName); state != nil {
+			if state := c.awsState(name, envelope.KeyName); state != nil {
 				state.mu.Lock()
 				defer state.mu.Unlock()
-				if time.Now().Before(state.rotatedUntil) {
+				if c.now().Before(state.rotatedUntil) {
 					return &envelope, nil
 				}
 				defer func() {
 					if rotated {
-						state.rotatedUntil = time.Now().Add(s.cmek.refreshInterval())
+						state.rotatedUntil = c.now().Add(c.refreshInterval())
 					}
 				}()
 			}
@@ -452,7 +520,8 @@ func (s *Store) RotateNamespaceKey(ctx context.Context, name string) (*Envelope,
 }
 
 func (s *Store) rotateNamespaceKeyOnce(ctx context.Context, name string) (*Envelope, bool, error) {
-	if s.cmek == nil {
+	c := s.crypt()
+	if c == nil {
 		return nil, false, nil
 	}
 	key := keyRecordPrefix + name
@@ -468,25 +537,22 @@ func (s *Store) rotateNamespaceKeyOnce(ctx context.Context, name string) (*Envel
 		return nil, false, err
 	}
 	var dek []byte
-	if s.cmek.awsState(name, old.KeyName) != nil {
-		s.cmek.mu.Lock()
-		cached := s.cmek.keys[name]
-		s.cmek.mu.Unlock()
-		if time.Now().Before(cached.until) && cached.version == old.KeyVersion {
-			dek = cached.key
+	if c.awsState(name, old.KeyName) != nil {
+		if k, ok := c.cached(name); ok && k.version == old.KeyVersion {
+			dek = k.key
 		}
 	}
 	if dek == nil {
-		dek, err = s.cmek.provider.Unwrap(ctx, old.KeyName, old.DEKWrapped)
+		dek, err = c.provider.Unwrap(ctx, old.KeyName, old.DEKWrapped)
 		if err != nil {
-			return nil, false, fmt.Errorf("%w: %v", kms.ErrKeyUnavailable, err)
+			return nil, false, fmt.Errorf("%w: %w", kms.ErrKeyUnavailable, err)
 		}
 	}
-	wrapped, version, err := s.cmek.provider.Wrap(ctx, old.KeyName, dek)
+	wrapped, version, err := c.provider.Wrap(ctx, old.KeyName, dek)
 	if err != nil {
-		return nil, false, fmt.Errorf("%w: %v", kms.ErrKeyUnavailable, err)
+		return nil, false, fmt.Errorf("%w: %w", kms.ErrKeyUnavailable, err)
 	}
-	if version == old.KeyVersion && !strings.HasPrefix(old.KeyName, "aws:") && s.cmek.awsState(name, old.KeyName) == nil {
+	if version == old.KeyVersion && !strings.HasPrefix(old.KeyName, "aws:") && c.awsState(name, old.KeyName) == nil {
 		return &old, false, nil
 	}
 	old.KeyVersion, old.DEKWrapped = version, wrapped
@@ -501,10 +567,7 @@ func (s *Store) rotateNamespaceKeyOnce(ctx context.Context, name string) (*Envel
 	if !ok {
 		return nil, true, nil
 	}
-	ttl := s.cmek.cacheTTL(name, old.KeyName)
-	s.cmek.mu.Lock()
-	s.cmek.keys[name] = cachedKey{key: dek, until: time.Now().Add(ttl), version: version}
-	s.cmek.mu.Unlock()
+	c.remember(name, dek, version, c.cacheTTL(name, old.KeyName))
 	return &old, false, nil
 }
 
@@ -629,7 +692,7 @@ func (s *Store) encryptedRange(ctx context.Context, object string, offset, lengt
 	}
 	size, err := parseEncryptedHeader(header)
 	if err != nil {
-		return nil, err
+		return nil, OpErr("get-range", object, err)
 	}
 	if offset > size || length > size-offset {
 		return nil, OpErr("get-range", object, ErrRange)
@@ -637,7 +700,7 @@ func (s *Store) encryptedRange(ctx context.Context, object string, offset, lengt
 	first := offset / encryptedBlockSize
 	last := (offset+length-1)/encryptedBlockSize + 1
 	if last > (math.MaxInt64-encryptedHeaderSize)/(encryptedBlockSize+encryptedTagSize) {
-		return nil, ErrRange
+		return nil, OpErr("get-range", object, ErrRange)
 	}
 	physicalStart := encryptedHeaderSize + first*(encryptedBlockSize+encryptedTagSize)
 	lastPlain := min(size, last*encryptedBlockSize)
@@ -648,8 +711,45 @@ func (s *Store) encryptedRange(ctx context.Context, object string, offset, lengt
 	}
 	plain, err := decryptBlocks(object, header, data, key, first, last)
 	if err != nil {
-		return nil, err
+		return nil, OpErr("get-range", object, err)
 	}
 	start := offset - first*encryptedBlockSize
 	return plain[start : start+length], nil
+}
+
+// looksEncrypted reports whether data starts with the encrypted object
+// header.
+func looksEncrypted(data []byte) bool {
+	return len(data) >= encryptedHeaderSize && string(data[:4]) == string(encryptedMagic[:]) && data[4] == 1
+}
+
+// open returns stored bytes as the caller wrote them. A nil dek means the
+// namespace had no key record when the lookup ran; bytes carrying the
+// encrypted header then force one fresh lookup, because a record another
+// process installed within the negative-cache TTL would otherwise hand back
+// ciphertext as plaintext.
+func (s *Store) open(ctx context.Context, op, key string, data, dek []byte) ([]byte, error) {
+	if dek == nil {
+		c := s.crypt()
+		name := namespaceObject(key)
+		if c == nil || name == "" || !looksEncrypted(data) {
+			return data, nil
+		}
+		var err error
+		if dek, err = s.lookup(ctx, c, name, false); err != nil {
+			return nil, OpErr(op, key, err)
+		}
+		if dek == nil {
+			return data, nil
+		}
+	}
+	plaintext := s.plaintext
+	if plaintext == nil {
+		plaintext = DefaultPlaintextKeys
+	}
+	if plaintext(key, data) {
+		return data, nil
+	}
+	plain, err := decryptObject(key, data, dek)
+	return plain, OpErr(op, key, err)
 }

@@ -179,7 +179,10 @@ func TestFaultShapeIsDeterministicAndBounded(t *testing.T) {
 	if _, err := s.Get(ctx, "shape"); err != nil {
 		t.Fatal(err)
 	}
-	if time.Since(start) > 50*time.Millisecond {
+	// 1 ms latency plus 1 ms of bandwidth per call when shaped: a disabled
+	// shaper must not come near the 300 ms the loop above took. Loose
+	// enough for a loaded -race CI box.
+	if time.Since(start) > time.Second {
 		t.Fatal("disabled shaper retained delay")
 	}
 }
@@ -287,4 +290,187 @@ func TestWriteKeysCountsLandedConditionalPages(t *testing.T) {
 	if len(f.WriteKeys()) != 0 {
 		t.Fatal("failed put counted as landed")
 	}
+}
+
+// TestShapedReadReturnsNothing: a read the shaper fails hands back no data
+// and meters no bytes, like a read the backend failed.
+func TestShapedReadReturnsNothing(t *testing.T) {
+	s, f := storetest.NewFaulty(t)
+	ctx := context.Background()
+	if err := s.Put(ctx, "shaped", []byte("payload")); err != nil {
+		t.Fatal(err)
+	}
+	f.ResetOps()
+	f.SetShape(storetest.Shape{ErrorRate: 1})
+	if b, err := s.Get(ctx, "shaped"); !errors.Is(err, storetest.ErrFault) || b != nil {
+		t.Fatalf("Get: %q %v", b, err)
+	}
+	if b, etag, err := s.GetWithETag(ctx, "shaped"); !errors.Is(err, storetest.ErrFault) || b != nil || etag != "" {
+		t.Fatalf("GetWithETag: %q %q %v", b, etag, err)
+	}
+	if b, err := s.GetRange(ctx, "shaped", 0, 3); !errors.Is(err, storetest.ErrFault) || b != nil {
+		t.Fatalf("GetRange: %q %v", b, err)
+	}
+	if n := f.ReadBytes(); n != 0 {
+		t.Fatalf("shaped failures metered %d bytes", n)
+	}
+}
+
+func TestFaultPauseResume(t *testing.T) {
+	ctx := context.Background()
+
+	t.Run("Resume", func(t *testing.T) {
+		s, f := storetest.NewFaulty(t)
+		f.Set(storetest.Plan{Op: storetest.OpPut, N: 1, Mode: storetest.Pause, Key: "paused"})
+		done := make(chan error, 1)
+		go func() { done <- s.Put(ctx, "paused", []byte("x")) }()
+		for f.Fired() == 0 {
+			time.Sleep(time.Millisecond)
+		}
+		select {
+		case err := <-done:
+			t.Fatalf("paused Put returned before Resume: %v", err)
+		case <-time.After(20 * time.Millisecond):
+		}
+		if _, err := s.Get(ctx, "paused"); !errors.Is(err, objstore.ErrNotFound) {
+			t.Fatalf("paused Put reached storage: %v", err)
+		}
+		f.Resume()
+		if err := <-done; err != nil {
+			t.Fatalf("resumed Put: %v", err)
+		}
+		if _, err := s.Get(ctx, "paused"); err != nil {
+			t.Fatalf("resumed Put did not land: %v", err)
+		}
+		f.Resume() // nothing paused: a no-op
+	})
+
+	t.Run("ContextEnds", func(t *testing.T) {
+		s, f := storetest.NewFaulty(t)
+		f.Set(storetest.Plan{Op: storetest.OpPut, N: 1, Mode: storetest.Pause})
+		pctx, cancel := context.WithTimeout(ctx, 20*time.Millisecond)
+		defer cancel()
+		if err := s.Put(pctx, "paused", []byte("x")); !errors.Is(err, context.DeadlineExceeded) {
+			t.Fatalf("Put paused past its deadline: %v", err)
+		}
+		if _, err := s.Get(ctx, "paused"); !errors.Is(err, objstore.ErrNotFound) {
+			t.Fatalf("a Put abandoned while paused landed: %v", err)
+		}
+	})
+}
+
+func TestFaultMatchFrom(t *testing.T) {
+	s, f := storetest.NewFaulty(t)
+	ctx := context.Background()
+	if err := s.Put(ctx, "ranged", []byte("0123456789")); err != nil {
+		t.Fatal(err)
+	}
+	// From: 0 alone is a wildcard; MatchFrom makes it offset 0 exactly.
+	f.Set(storetest.Plan{Op: storetest.OpGetRange, N: 1, From: 0, MatchFrom: true})
+	if _, err := s.GetRange(ctx, "ranged", 4, 2); err != nil {
+		t.Fatalf("offset 4 matched a From 0 plan: %v", err)
+	}
+	if _, err := s.GetRange(ctx, "ranged", 0, 2); !errors.Is(err, storetest.ErrFault) {
+		t.Fatalf("offset 0: %v", err)
+	}
+	f.Set(storetest.Plan{Op: storetest.OpGetRange, N: 1})
+	if _, err := s.GetRange(ctx, "ranged", 4, 2); !errors.Is(err, storetest.ErrFault) {
+		t.Fatalf("wildcard plan skipped offset 4: %v", err)
+	}
+	f.Set(storetest.Plan{Op: storetest.OpGetRange, N: 1, From: 4})
+	if _, err := s.GetRange(ctx, "ranged", 0, 2); err != nil {
+		t.Fatalf("offset 0 matched a From 4 plan: %v", err)
+	}
+	if _, err := s.GetRange(ctx, "ranged", 4, 2); !errors.Is(err, storetest.ErrFault) {
+		t.Fatalf("offset 4: %v", err)
+	}
+}
+
+func TestFaultWatchRewrites(t *testing.T) {
+	s, f := storetest.NewFaulty(t)
+	ctx := context.Background()
+	if err := s.Put(ctx, "before", []byte("a")); err != nil {
+		t.Fatal(err)
+	}
+	f.WatchRewrites()
+	for _, w := range []struct{ key, data string }{
+		{"before", "b"},              // first write seen by the ledger: not a rewrite
+		{"same", "x"}, {"same", "x"}, // identical bytes: not a rewrite
+		{"changed", "1"}, {"changed", "2"},
+		{"deleted", "1"},
+	} {
+		if err := s.Put(ctx, w.key, []byte(w.data)); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if err := s.Delete(ctx, "deleted"); err != nil {
+		t.Fatal(err)
+	}
+	if err := s.Put(ctx, "deleted", []byte("2")); err != nil { // re-minted after delete
+		t.Fatal(err)
+	}
+	if got := f.Rewrites(); len(got) != 1 || got[0] != "changed" {
+		t.Fatalf("Rewrites = %v, want [changed]", got)
+	}
+}
+
+func TestFaultReadKeys(t *testing.T) {
+	s, f := storetest.NewFaulty(t)
+	ctx := context.Background()
+	for _, k := range []string{"rk/a", "rk/b"} {
+		if err := s.Put(ctx, k, []byte("data")); err != nil {
+			t.Fatal(err)
+		}
+	}
+	f.ResetOps()
+	s.Get(ctx, "rk/a")            //nolint:errcheck
+	s.GetRange(ctx, "rk/a", 0, 1) //nolint:errcheck
+	s.GetWithETag(ctx, "rk/b")    //nolint:errcheck
+	s.Get(ctx, "rk/missing")      //nolint:errcheck
+	got := f.ReadKeys()
+	if len(got) != 3 || got["rk/a"] != 2 || got["rk/b"] != 1 || got["rk/missing"] != 1 {
+		t.Fatalf("ReadKeys = %v", got)
+	}
+	got["rk/a"] = 99
+	if f.ReadKeys()["rk/a"] != 2 {
+		t.Fatal("ReadKeys aliases internal map")
+	}
+	f.ResetOps()
+	if len(f.ReadKeys()) != 0 {
+		t.Fatal("ResetOps kept read keys")
+	}
+}
+
+func TestFaultListPrefixes(t *testing.T) {
+	s, f := storetest.NewFaulty(t)
+	ctx := context.Background()
+	if err := s.Put(ctx, "lp/one/x", []byte("x")); err != nil {
+		t.Fatal(err)
+	}
+	f.ResetOps()
+	if _, err := s.ListPrefixes(ctx, "lp/"); err != nil {
+		t.Fatal(err)
+	}
+	if ops := f.Ops(); ops[storetest.OpListPrefixes] != 1 || ops[storetest.OpList] != 0 {
+		t.Fatalf("ops = %v, want one OpListPrefixes and no OpList", ops)
+	}
+	f.Set(storetest.Plan{Op: storetest.OpListPrefixes, N: 1, Key: "lp/"})
+	if _, err := s.ListPrefixes(ctx, "other/"); err != nil {
+		t.Fatalf("non-matching prefix: %v", err)
+	}
+	if _, err := s.ListPrefixes(ctx, "lp/"); !errors.Is(err, storetest.ErrFault) {
+		t.Fatalf("planned ListPrefixes: %v", err)
+	}
+}
+
+// TestFaultZeroValue: the zero Fault's bookkeeping is usable.
+func TestFaultZeroValue(t *testing.T) {
+	var f storetest.Fault
+	f.Set(storetest.Plan{Op: storetest.OpPut, N: 1})
+	if len(f.Ops()) != 0 || f.Fired() != 0 || len(f.ReadKeys()) != 0 || len(f.Rewrites()) != 0 {
+		t.Fatal("zero Fault is not empty")
+	}
+	f.ResetOps()
+	f.Resume()
+	f.Clear()
 }

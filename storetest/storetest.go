@@ -2,8 +2,10 @@ package storetest
 
 import (
 	"context"
+	"crypto/rand"
 	"fmt"
 	"os"
+	"strings"
 	"testing"
 	"time"
 
@@ -34,10 +36,12 @@ func NewFS(t testing.TB) *objstore.Store {
 	return s
 }
 
-// NewS3 returns a Store on a fresh bucket objstore-test-<nanos> at the S3
-// endpoint, dropped at cleanup. Without AWS_ACCESS_KEY_ID it uses MinIO's
-// default credentials; set, the environment's credentials (R2, AWS) pass
-// through.
+// NewS3 returns a Store on a fresh bucket objstore-test-<nanos>-<random>
+// at the S3 endpoint, dropped at cleanup. Without AWS_ACCESS_KEY_ID it uses
+// MinIO's default credentials, set with t.Setenv (so such a test cannot
+// call t.Parallel); set, the environment's credentials (R2, AWS) pass
+// through untouched. Opening and creating the bucket is bounded by a
+// minute.
 func NewS3(t testing.TB, endpoint string) *objstore.Store {
 	t.Helper()
 	if os.Getenv("AWS_ACCESS_KEY_ID") == "" {
@@ -45,8 +49,11 @@ func NewS3(t testing.TB, endpoint string) *objstore.Store {
 		t.Setenv("AWS_SECRET_ACCESS_KEY", "minioadmin")
 		t.Setenv("AWS_REGION", "us-east-1")
 	}
-	ctx := context.Background()
-	bucket := fmt.Sprintf("objstore-test-%d", time.Now().UnixNano())
+	ctx, cancel := context.WithTimeout(context.Background(), time.Minute)
+	defer cancel()
+	// The random suffix keeps two test binaries started in the same
+	// nanosecond (go test ./... runs packages in parallel) apart.
+	bucket := fmt.Sprintf("objstore-test-%d-%s", time.Now().UnixNano(), strings.ToLower(rand.Text()[:8]))
 	s, err := s3.Open(ctx, s3.Config{Endpoint: endpoint, Bucket: bucket}, objstore.Config{})
 	if err != nil {
 		t.Fatal(err)
@@ -67,8 +74,12 @@ func NewS3(t testing.TB, endpoint string) *objstore.Store {
 }
 
 // NewFaulty returns New(t)'s Store wrapped in a fault injector, for
-// crash-point tests. Disarmed until the caller sets a Plan.
+// crash-point tests. Disarmed until the caller sets a Plan. Cleanup
+// resumes any call still held by a Pause plan, so a failed test does not
+// leak a blocked goroutine.
 func NewFaulty(t testing.TB) (*objstore.Store, *Fault) {
 	t.Helper()
-	return NewFault(New(t))
+	s, f := NewFault(New(t))
+	t.Cleanup(f.Resume)
+	return s, f
 }

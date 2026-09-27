@@ -4,8 +4,8 @@ import (
 	"bytes"
 	"context"
 	"fmt"
-	"math"
 	"runtime/debug"
+	"slices"
 	"strconv"
 	"sync/atomic"
 
@@ -14,10 +14,17 @@ import (
 )
 
 // Load associates one physical extent with a logical decoded cache entry.
-// Decode must validate any stored checksum before its result is cached.
 type Load struct {
 	Extent
-	Key          string
+	// Key is the logical cache key of the decoded child. It must identify
+	// the extent and its decoding: two loads with one Key are the same
+	// child, only the first is read, and a cached entry under Key is
+	// served without reading at all.
+	Key string
+	// Decode turns the stored bytes into the child; nil keeps them as
+	// stored. It must validate any stored checksum, since its result is
+	// cached. It runs for every child read from the store, transient or
+	// not, and never for one served from a cache tier or the scope.
 	Decode       func([]byte) ([]byte, error)
 	DecodedBytes int64 // maximum decoded child bytes, in addition to stored assembly
 	// Transient reads are served from the returned scope only and never
@@ -26,10 +33,19 @@ type Load struct {
 	Transient bool
 }
 
-// FetchRanges executes one dependency stage. It keeps exact children in
-// owned buffers, so a tiny cached child cannot retain a large merged range.
-// The returned scope supplies this query's results even if the LRU is smaller
-// than its selected working set; it dies with the query stage.
+// FetchRanges executes one dependency stage: it reads every load not
+// already cached, coalesced by Plan, and returns ctx carrying all of the
+// stage's children (cache.WithResults; read them with cache.Scoped). It
+// keeps exact children in owned buffers, so a tiny cached child cannot
+// retain a large merged range. The returned scope supplies this query's
+// results even if the LRU is smaller than its selected working set; it
+// dies with the query stage, and a later FetchRanges on the returned ctx
+// replaces it rather than adding to it.
+//
+// A stage whose children would retain more than Config.MaxInFlightBytes is
+// skipped: FetchRanges returns ctx unchanged and nil, and the consumer
+// falls back to its own per-object reads. An invalid load is
+// ErrInvalidExtent; a short read from the store is ErrCorrupt.
 func (r *Reader) FetchRanges(ctx context.Context, loads []Load) (context.Context, error) {
 	if err := ctx.Err(); err != nil {
 		return ctx, err
@@ -45,21 +61,24 @@ func (r *Reader) FetchRanges(ctx context.Context, loads []Load) (context.Context
 	var retained int64
 	seen := make(map[string]bool)
 	for _, load := range loads {
-		if load.Offset < 0 || load.Length <= 0 || load.Offset > math.MaxInt64-load.Length || load.DecodedBytes < 0 {
-			return ctx, fmt.Errorf("%w: invalid prefetch extent", ErrCorrupt)
+		if err := load.valid(); err != nil {
+			return ctx, err
+		}
+		if load.DecodedBytes < 0 {
+			return ctx, fmt.Errorf("%w: %s: negative DecodedBytes %d", ErrInvalidExtent, load.Key, load.DecodedBytes)
 		}
 		if seen[load.Key] {
 			continue
 		}
 		seen[load.Key] = true
 		for _, n := range []int64{load.Length, load.DecodedBytes, int64(len(load.Key)+len(load.Object)) + 128} {
-			if n > r.Cfg.MaxInFlightBytes-retained {
+			if n > r.Config.MaxInFlightBytes-retained {
 				return ctx, nil
 			}
 			retained += n
 		}
 	}
-	generation := r.Objects.Memory.Generation.Load()
+	var gens []uint64 // gens[i]: pending[i]'s namespace generation, read before its I/O
 	results := make(map[string][]byte, len(loads))
 	unique := make(map[string]bool, len(loads))
 	var pending []Load
@@ -85,33 +104,47 @@ func (r *Reader) FetchRanges(ctx context.Context, loads []Load) (context.Context
 			continue
 		}
 		pending = append(pending, load)
+		gens = append(gens, memory.GenerationOf(load.Key))
 		owners = append(owners, cache.MarkMissed(ctx, load.Key))
 		extents = append(extents, load.Extent)
 	}
-	plans, err := Plan(extents, r.Cfg)
+	plans, err := Plan(extents, r.Config)
 	if err != nil {
 		return ctx, err
 	}
-	// A plan that is exactly one child can publish that child's owned buffer
-	// directly. A merged plan still needs separate child assembly buffers.
+	// children[i]: the pending loads plan i overlaps. Plans come back
+	// sorted and disjoint; walk them against the loads in the same order,
+	// so matching is linear in plans plus overlaps.
+	order := make([]int, len(pending))
+	for j := range order {
+		order[j] = j
+	}
+	slices.SortFunc(order, func(a, b int) int { return compareExtents(pending[a].Extent, pending[b].Extent) })
+	children := make([][]int, len(plans))
+	p := 0
+	for _, j := range order {
+		load := pending[j]
+		for p < len(plans) && (plans[p].Object < load.Object || plans[p].Object == load.Object && plans[p].Offset+plans[p].Length <= load.Offset) {
+			p++
+		}
+		for q := p; q < len(plans) && plans[q].Object == load.Object && plans[q].Offset < load.Offset+load.Length; q++ {
+			children[q] = append(children[q], j)
+		}
+	}
+	// A plan that is exactly one cacheable child is read through the cache
+	// under the child's key (FetchCachedRange decodes and publishes it
+	// there). Everything else, a merged plan or a transient child, is
+	// assembled into owned buffers and decoded below.
 	direct := make([]bool, len(pending))
 	planChild := make([]int, len(plans))
 	for i, plan := range plans {
 		planChild[i] = -1
-		for j, load := range pending {
-			if plan.Object != load.Object || plan.Offset >= load.Offset+load.Length || load.Offset >= plan.Offset+plan.Length {
-				continue
-			}
-			if planChild[i] >= 0 {
-				planChild[i] = -2
-				break
-			}
-			planChild[i] = j
+		if len(children[i]) != 1 {
+			continue
 		}
-		if j := planChild[i]; j >= 0 && plan.Extra == 0 && plan.Offset == pending[j].Offset && plan.Length == pending[j].Length {
-			direct[j] = true
-		} else {
-			planChild[i] = -1
+		j := children[i][0]
+		if load := pending[j]; !load.Transient && plan.Extra == 0 && plan.Offset == load.Offset && plan.Length == load.Length {
+			planChild[i], direct[j] = j, true
 		}
 	}
 	// Assemble exact children while each physical buffer holds its memory
@@ -144,7 +177,7 @@ func (r *Reader) FetchRanges(ctx context.Context, loads []Load) (context.Context
 	}
 	var started atomic.Bool
 	g, gctx := errgroup.WithContext(ctx)
-	g.SetLimit(r.Cfg.Concurrency)
+	g.SetLimit(r.Config.Concurrency)
 	for i, plan := range plans {
 		child := planChild[i]
 		g.Go(func() error {
@@ -183,12 +216,7 @@ func (r *Reader) FetchRanges(ctx context.Context, loads []Load) (context.Context
 			var data []byte
 			var src, counted cache.Outcome
 			var err error
-			if child >= 0 && pending[child].Transient {
-				data, src, err = read(gctx)
-				if err == nil {
-					charge(child, src)
-				}
-			} else if child >= 0 {
+			if child >= 0 {
 				load := pending[child]
 				data, src, err = r.Objects.FetchCachedRange(gctx, load.Key, int(plan.Length), func(ctx context.Context) ([]byte, error) {
 					stored, _, err := read(ctx)
@@ -214,10 +242,8 @@ func (r *Reader) FetchRanges(ctx context.Context, loads []Load) (context.Context
 				assembled[child] = data
 				return nil
 			}
-			for j, load := range pending {
-				if plan.Object != load.Object {
-					continue
-				}
+			for _, j := range children[i] {
+				load := pending[j]
 				lo, hi := max(plan.Offset, load.Offset), min(plan.Offset+plan.Length, load.Offset+load.Length)
 				if lo < hi {
 					copy(assembled[j][lo-load.Offset:hi-load.Offset], data[lo-plan.Offset:hi-plan.Offset])
@@ -235,6 +261,8 @@ func (r *Reader) FetchRanges(ctx context.Context, loads []Load) (context.Context
 	}
 	// Decode serially: I/O has completed and the cache itself serializes
 	// insertion. Copies prevent retention of unrelated coalesced bytes.
+	// Every assembled child is decoded here, transient ones included; a
+	// direct child was decoded by FetchCachedRange, which cached it.
 	for i, load := range pending {
 		data := assembled[i]
 		memory := r.Objects.ByteCacheFor(load.Key)
@@ -250,9 +278,9 @@ func (r *Reader) FetchRanges(ctx context.Context, loads []Load) (context.Context
 		}
 		if !direct[i] && !load.Transient {
 			if stored[i].Load() {
-				r.Objects.Disk.Put(cache.DiskKey(load.Key, generation), data)
+				r.Objects.Disk.Put(cache.DiskKey(load.Key, gens[i]), data)
 			}
-			memory.Put(load.Key, data, generation)
+			memory.Put(load.Key, data, gens[i])
 		}
 		results[load.Key] = data
 	}
@@ -291,6 +319,9 @@ func (r *Reader) sharedParentOnce(ctx context.Context, x Extent, read func(conte
 		data, src, err := read(ctx)
 		return parentRead{data, src}, err
 	})
+	if r.joined != nil {
+		r.joined() // the flight is registered: a test's rendezvous
+	}
 	select {
 	case res := <-ch:
 		if res.Err != nil {

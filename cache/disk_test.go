@@ -4,9 +4,11 @@ import (
 	"bytes"
 	"errors"
 	"os"
+	"path/filepath"
 	"strconv"
 	"sync"
 	"testing"
+	"time"
 )
 
 func TestDiskCachePinCapacityAndEviction(t *testing.T) {
@@ -250,4 +252,211 @@ func TestDiskPutReservesBeforeWriting(t *testing.T) {
 	if st := c.Stats(); reserved != 0 || st.UsedBytes > cap || st.Failures != 0 {
 		t.Fatalf("reserved %d, stats %+v", reserved, st)
 	}
+}
+
+func newDisk(t *testing.T, capacity int64, pinCapacity ...int64) *Disk {
+	t.Helper()
+	c, err := NewDisk(t.TempDir(), capacity, pinCapacity...)
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(c.Close)
+	return c
+}
+
+func (c *Disk) pinnedResidentForTest() int64 {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	return c.pinnedResident
+}
+
+// TestMakeRoomRefusesBeforeEvicting: a Put that cannot fit even with every
+// unpinned entry gone evicts nothing: it used to empty the cache and then
+// fail anyway.
+func TestMakeRoomRefusesBeforeEvicting(t *testing.T) {
+	c := newDisk(t, 3*diskBlock, 2*diskBlock)
+	c.Put("ns/p/1", []byte("1"))
+	c.Put("ns/p/2", []byte("2"))
+	if err := c.Pin("p", map[string]int64{"ns/p/1": diskBlock, "ns/p/2": diskBlock}); err != nil {
+		t.Fatal(err)
+	}
+	c.Put("ns/o/1", []byte("o"))
+	if err := c.PutChecked("ns/o/big", make([]byte, 2*diskBlock)); !errors.Is(err, ErrWarmCache) {
+		t.Fatalf("put past the unpinned room = %v, want ErrWarmCache", err)
+	}
+	if st := c.Stats(); st.Evictions != 0 || !c.Has("ns/o/1") {
+		t.Fatalf("a refused put evicted: %+v, other namespace resident %v", st, c.Has("ns/o/1"))
+	}
+	if err := c.PutChecked("ns/o/2", []byte("2")); err != nil { // fits by evicting ns/o/1
+		t.Fatal(err)
+	}
+	if c.Has("ns/o/1") || !c.Has("ns/p/1") || !c.Has("ns/p/2") {
+		t.Fatalf("keys %v, want the unpinned entry evicted", c.KeysForTest())
+	}
+}
+
+func TestPinnedResidentTracksPinsAndResidency(t *testing.T) {
+	c := newDisk(t, 16*diskBlock)
+	want := func(n int64) {
+		t.Helper()
+		if got := c.pinnedResidentForTest(); got != n*diskBlock {
+			t.Fatalf("pinned resident %d, want %d blocks", got, n)
+		}
+	}
+	pin := func(name string, keys ...string) {
+		t.Helper()
+		set := map[string]int64{}
+		for _, k := range keys {
+			set[k] = diskBlock
+		}
+		if err := c.Pin(name, set); err != nil {
+			t.Fatal(err)
+		}
+	}
+	pin("a", "ns/a/1")
+	want(0) // pinned, not resident
+	c.Put("ns/a/1", []byte("1"))
+	want(1)
+	pin("b", "ns/a/1") // pinned twice, charged once
+	want(1)
+	c.Unpin("a")
+	want(1)
+	c.Unpin("b")
+	want(0)
+	snap := c.SnapshotPin("b")
+	pin("b", "ns/a/1")
+	want(1)
+	c.RestorePin("b", snap) // nil: b was not pinned
+	want(0)
+	pin("a", "ns/a/1")
+	if err := c.Wipe(); err != nil {
+		t.Fatal(err)
+	}
+	want(0)
+	c.Put("ns/a/1", []byte("1"))
+	want(1)
+	pin("a") // re-pin to an empty set releases the key
+	want(0)
+}
+
+func TestPinSnapshotRestore(t *testing.T) {
+	c := newDisk(t, 16*diskBlock)
+	keys := map[string]int64{"ns/a/1": diskBlock}
+	if err := c.Pin("a", keys); err != nil {
+		t.Fatal(err)
+	}
+	keys["ns/a/2"] = 8 * diskBlock // Pin copied the caller's map
+	if reserved, _, _, _ := c.PinStatus("a"); reserved != diskBlock {
+		t.Fatalf("reserved %d after mutating the caller's map", reserved)
+	}
+	_, _, at, _ := c.PinStatus("a")
+	snap := c.SnapshotPin("a")
+	time.Sleep(time.Millisecond) // distinguishable timestamps; not synchronization
+	if err := c.Pin("a", map[string]int64{"ns/a/1": diskBlock, "ns/a/2": diskBlock}); err != nil {
+		t.Fatal(err)
+	}
+	c.RestorePin("a", snap)
+	reserved, _, restoredAt, pinned := c.PinStatus("a")
+	if !pinned || reserved != diskBlock || !restoredAt.Equal(at) {
+		t.Fatalf("restored %d bytes at %v (pinned %v), want %d at %v", reserved, restoredAt, pinned, diskBlock, at)
+	}
+	if st := c.Stats(); st.PinnedBytes != diskBlock {
+		t.Fatalf("pinned bytes %d after restore", st.PinnedBytes)
+	}
+	if err := c.Pin("a", map[string]int64{"ns/a/1": -1}); err == nil {
+		t.Fatal("negative charge accepted")
+	}
+}
+
+func TestExpireInactive(t *testing.T) {
+	c := newDisk(t, 16*diskBlock)
+	for _, k := range []string{"ns/a/1", "ns/b/1", "ns/c/1", "other"} {
+		c.Put(k, []byte(k))
+	}
+	if err := c.Pin("c", map[string]int64{"ns/c/1": diskBlock}); err != nil {
+		t.Fatal(err)
+	}
+	now := time.Now()
+	if got := c.ExpireInactive(time.Hour, now); got != nil {
+		t.Fatalf("expired %v within the ttl", got)
+	}
+	c.Touch("unknown") // restarts a known namespace's clock only; never adds one
+	later := time.Now().Add(time.Hour)
+	got := c.ExpireInactive(time.Minute, later)
+	if len(got) != 2 || got[0] != "a" || got[1] != "b" {
+		t.Fatalf("expired %v, want [a b]", got)
+	}
+	if c.Has("ns/a/1") || c.Has("ns/b/1") || !c.Has("ns/c/1") || !c.Has("other") {
+		t.Fatalf("keys after expiry: %v", c.KeysForTest())
+	}
+	if c.Stats().InactiveExpiries != 2 {
+		t.Fatalf("stats %+v", c.Stats())
+	}
+	if got := c.ExpireInactive(time.Minute, later); got != nil {
+		t.Fatalf("expired %v twice", got)
+	}
+}
+
+// TestNewDiskRemovesStaleDirectories: a process that crashed before Close
+// left its directory under root; the next NewDisk over the root removes it.
+func TestNewDiskRemovesStaleDirectories(t *testing.T) {
+	root := t.TempDir()
+	crashed, err := NewDisk(root, 1<<20)
+	if err != nil {
+		t.Fatal(err)
+	}
+	crashed.Put("ns/a/1", []byte("1"))
+	keep := filepath.Join(root, "unrelated")
+	if err := os.Mkdir(keep, 0700); err != nil {
+		t.Fatal(err)
+	}
+	c, err := NewDisk(root, 1<<20)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := os.Stat(crashed.Dir()); !os.IsNotExist(err) {
+		t.Fatalf("stale directory survived: %v", err)
+	}
+	if _, err := os.Stat(keep); err != nil {
+		t.Fatalf("unrelated directory removed: %v", err)
+	}
+	c.Put("ns/a/1", []byte("1"))
+	if err := c.Wipe(); err != nil {
+		t.Fatal(err)
+	}
+	c.Close()
+	entries, _ := os.ReadDir(root)
+	if len(entries) != 1 || entries[0].Name() != "unrelated" {
+		t.Fatalf("root after Wipe and Close: %v", entries)
+	}
+}
+
+func TestNilDiskIsSafe(t *testing.T) {
+	var c *Disk
+	c.Put("k", nil)
+	if c.PutChecked("k", nil) == nil || c.Pin("a", nil) == nil {
+		t.Fatal("nil disk accepted a put or a pin")
+	}
+	if _, ok := c.Get("k"); ok {
+		t.Fatal("nil disk hit")
+	}
+	if _, ok := c.GetRange("k", 0, 1); ok || c.Has("k") || c.PinnedNamespace("a") {
+		t.Fatal("nil disk holds something")
+	}
+	c.Touch("a")
+	c.Unpin("a")
+	c.SetMaxPinnedNamespaces(1)
+	c.RestorePin("a", nil)
+	c.PinLock().Lock()
+	if c.Wipe() != nil || c.ExpireInactive(time.Second, time.Now()) != nil || c.PinHeadroom("a") != 0 ||
+		c.SnapshotPin("a") != nil || c.KeysForTest() != nil || c.Dir() != "" || c.Stats() != (DiskStats{}) {
+		t.Fatal("nil disk reports state")
+	}
+	if _, _, _, pinned := c.PinStatus("a"); pinned {
+		t.Fatal("nil disk pinned")
+	}
+	if k, p := c.FirstFile(); k != "" || p != "" {
+		t.Fatal("nil disk has a file")
+	}
+	c.Close()
 }

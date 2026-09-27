@@ -1,3 +1,5 @@
+//go:build unix
+
 package fs_test
 
 import (

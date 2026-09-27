@@ -47,67 +47,37 @@ func sizedRecord(id string, size int) Bytes {
 	return r
 }
 
-// BenchmarkWALGroupCommit measures sustained, acknowledged writes. Each caller
-// sends batches back-to-back for five seconds; small batches contain 256
-// records and large batches contain 8, keeping the entry-rate target feasible.
-func BenchmarkWALGroupCommit(b *testing.B) {
-	for _, backend := range []string{"file", "fault100ms"} {
-		for _, interval := range []time.Duration{time.Second, 100 * time.Millisecond} {
-			for _, callers := range []int{8, 64} {
-				for _, size := range []int{512, 500_000} {
-					name := fmt.Sprintf("%s/%s/%dcallers/%dB", backend, interval, callers, size)
-					b.Run(name, func(b *testing.B) {
-						for range b.N {
-							benchmarkGroupCommitRun(b, backend, interval, callers, size)
-						}
-					})
-				}
-			}
-		}
-	}
-}
-
-func benchmarkGroupCommitRun(b *testing.B, backend string, interval time.Duration, callers, size int) {
+// appendLoop runs b.N appends spread over callers, each caller sending its
+// next append as soon as the last is acked, and reports throughput and ack
+// latency once. next builds a caller's next batch.
+func appendLoop(b *testing.B, w *Writer[Bytes], callers int, next func(caller int) []Bytes) (written int, latencies []time.Duration, elapsed time.Duration) {
 	b.Helper()
 	ctx := context.Background()
-	s := fs.Open(b.TempDir(), "benchmark", objstore.Config{})
-	if err := s.EnsureBucket(ctx); err != nil {
-		b.Fatal(err)
-	}
-	var fault *storetest.Fault
-	if backend == "fault100ms" {
-		s, fault = storetest.NewFault(s)
-		fault.SetShape(storetest.Shape{Latency: 100 * time.Millisecond})
-	}
-	batchSize := 256
-	if size == 500_000 {
-		batchSize = 8
-	}
-	var wg sync.WaitGroup
+	var remaining atomic.Int64
+	remaining.Store(int64(b.N))
 	var mu sync.Mutex
-	var latencies []time.Duration
-	var written int
-	w := NewWriter[Bytes](s, testPrefix, 1, nil, WithCommitInterval(interval))
+	var wg sync.WaitGroup
+	b.ResetTimer()
 	start := time.Now()
-	stop := start.Add(5 * time.Second)
 	for caller := range callers {
 		wg.Add(1)
 		go func() {
 			defer wg.Done()
-			batch := make([]Bytes, batchSize)
-			for i := range batch {
-				batch[i] = sizedRecord(fmt.Sprintf("%d-%d", caller, i), size)
-			}
 			var own []time.Duration
-			var count int
-			for time.Now().Before(stop) {
+			count := 0
+			for remaining.Add(-1) >= 0 {
+				batch := next(caller)
 				began := time.Now()
-				if err := w.Append(ctx, batch); err != nil {
+				for {
+					err := w.Append(ctx, batch)
 					if errors.Is(err, ErrOverloaded) {
 						time.Sleep(time.Millisecond)
 						continue
 					}
-					b.Errorf("append: %v", err)
+					if err != nil {
+						b.Errorf("append: %v", err)
+						return
+					}
 					break
 				}
 				own = append(own, time.Since(began))
@@ -120,80 +90,126 @@ func benchmarkGroupCommitRun(b *testing.B, backend string, interval time.Duratio
 		}()
 	}
 	wg.Wait()
-	elapsed := time.Since(start).Seconds()
+	elapsed = time.Since(start)
+	b.StopTimer()
+	if len(latencies) == 0 {
+		b.Fatal("no completed appends")
+	}
+	sort.Slice(latencies, func(i, j int) bool { return latencies[i] < latencies[j] })
+	return written, latencies, elapsed
+}
+
+func reportLatencies(b *testing.B, latencies []time.Duration) {
+	b.ReportMetric(float64(latencies[len(latencies)/2].Microseconds())/1e3, "p50_ms")
+	b.ReportMetric(float64(latencies[(len(latencies)*99+99)/100-1].Microseconds())/1e3, "p99_ms")
+}
+
+// BenchmarkWALGroupCommit measures sustained, acknowledged writes: b.N
+// appends spread over the callers, each sending its next batch as soon as
+// the last is acked. Small batches carry 256 records, large ones 8, keeping
+// the entry-rate target feasible.
+func BenchmarkWALGroupCommit(b *testing.B) {
+	for _, backend := range []string{"file", "fault100ms"} {
+		for _, interval := range []time.Duration{time.Second, 100 * time.Millisecond} {
+			for _, callers := range []int{8, 64} {
+				for _, size := range []int{512, 500_000} {
+					name := fmt.Sprintf("%s/%s/%dcallers/%dB", backend, interval, callers, size)
+					b.Run(name, func(b *testing.B) {
+						benchmarkGroupCommit(b, backend, interval, callers, size)
+					})
+				}
+			}
+		}
+	}
+}
+
+func benchmarkGroupCommit(b *testing.B, backend string, interval time.Duration, callers, size int) {
+	ctx := context.Background()
+	s := fs.Open(b.TempDir(), "benchmark", objstore.Config{})
+	if err := s.EnsureBucket(ctx); err != nil {
+		b.Fatal(err)
+	}
+	if backend == "fault100ms" {
+		var fault *storetest.Fault
+		s, fault = storetest.NewFault(s)
+		fault.SetShape(storetest.Shape{Latency: 100 * time.Millisecond})
+	}
+	batchSize := 256
+	if size == 500_000 {
+		batchSize = 8
+	}
+	batches := make([][]Bytes, callers)
+	for caller := range batches {
+		batches[caller] = make([]Bytes, batchSize)
+		for i := range batches[caller] {
+			batches[caller][i] = sizedRecord(fmt.Sprintf("%d-%d", caller, i), size)
+		}
+	}
+	w := NewWriter[Bytes](s, testPrefix, 1, nil, WithCommitInterval(interval))
+	written, latencies, elapsed := appendLoop(b, w, callers, func(caller int) []Bytes { return batches[caller] })
 	w.Close()
 	keys, err := s.List(ctx, testPrefix)
 	if err != nil {
 		b.Fatal(err)
 	}
-	if len(latencies) == 0 {
-		b.Fatal("no completed appends")
-	}
-	sort.Slice(latencies, func(i, j int) bool { return latencies[i] < latencies[j] })
-	b.ReportMetric(float64(written)/elapsed, "records/s")
-	b.ReportMetric(float64(written*size)/elapsed/1e6, "MB/s")
-	b.ReportMetric(float64(len(keys))/elapsed, "entries/s")
-	b.ReportMetric(float64(latencies[len(latencies)/2].Microseconds())/1e3, "p50_ms")
-	b.ReportMetric(float64(latencies[(len(latencies)*99+99)/100-1].Microseconds())/1e3, "p99_ms")
+	seconds := elapsed.Seconds()
+	b.ReportMetric(float64(written)/seconds, "records/s")
+	b.ReportMetric(float64(written*size)/seconds/1e6, "MB/s")
+	b.ReportMetric(float64(len(keys))/seconds, "entries/s")
+	reportLatencies(b, latencies)
 }
 
 // BenchmarkWALGroupCommitUncontended separates idle write latency from the
-// sustained matrix, where a caller immediately queues its next write.
+// sustained matrix, where a caller immediately queues its next write: each
+// append finds the writer idle, a commit interval after the last.
 func BenchmarkWALGroupCommitUncontended(b *testing.B) {
+	const interval = 10 * time.Millisecond
 	for _, size := range []int{512, 500_000} {
 		b.Run(fmt.Sprintf("%dB", size), func(b *testing.B) {
+			s := fs.Open(b.TempDir(), "uncontended", objstore.Config{})
+			if err := s.EnsureBucket(context.Background()); err != nil {
+				b.Fatal(err)
+			}
+			s, f := storetest.NewFault(s)
+			f.SetShape(storetest.Shape{Latency: 100 * time.Millisecond})
+			w := NewWriter[Bytes](s, testPrefix, 1, nil, WithCommitInterval(interval))
+			defer w.Close()
+			record := []Bytes{sizedRecord("row", size)}
+			samples := make([]time.Duration, 0, b.N)
 			for range b.N {
-				s := fs.Open(b.TempDir(), "uncontended", objstore.Config{})
-				if err := s.EnsureBucket(context.Background()); err != nil {
+				b.StopTimer()
+				time.Sleep(interval) // idle again
+				b.StartTimer()
+				start := time.Now()
+				if err := w.Append(context.Background(), record); err != nil {
 					b.Fatal(err)
 				}
-				s, f := storetest.NewFault(s)
-				f.SetShape(storetest.Shape{Latency: 100 * time.Millisecond})
-				w := NewWriter[Bytes](s, testPrefix, 1, nil, WithCommitInterval(time.Second))
-				record := []Bytes{sizedRecord("row", size)}
-				var samples []time.Duration
-				for range 5 {
-					start := time.Now()
-					if err := w.Append(context.Background(), record); err != nil {
-						b.Fatal(err)
-					}
-					samples = append(samples, time.Since(start))
-					time.Sleep(time.Second)
-				}
-				w.Close()
-				sort.Slice(samples, func(i, j int) bool { return samples[i] < samples[j] })
-				b.ReportMetric(float64(samples[len(samples)/2].Microseconds())/1e3, "p50_ms")
-				b.ReportMetric(float64(samples[len(samples)-1].Microseconds())/1e3, "p99_ms")
+				samples = append(samples, time.Since(start))
 			}
+			b.StopTimer()
+			sort.Slice(samples, func(i, j int) bool { return samples[i] < samples[j] })
+			reportLatencies(b, samples)
 		})
 	}
 }
 
 // BenchmarkWALCommitUnderBulkLoad is a streaming writer's commit beside a
-// bulk writer on the same store: `callers` clients each append a 10k-row
-// entry of 128 random int8 bytes plus a small id (~1.4 MB) back to back
+// bulk writer on the same store: `callers` clients append b.N 10k-row
+// entries of 128 random int8 bytes plus a small id (~1.4 MB) back to back
 // while `bulk` goroutines Put 32 MiB objects as fast as the store takes
 // them. Latency is Append to ack. OBJSTORE_WAL_BENCH_DIR puts the store on
-// a real disk; the default temp dir may be tmpfs. OBJSTORE_WAL_BENCH_SECONDS
-// (default 20) is each cell's length.
+// a real disk; the default temp dir may be tmpfs.
 func BenchmarkWALCommitUnderBulkLoad(b *testing.B) {
-	seconds := 20
-	if v, err := strconv.Atoi(os.Getenv("OBJSTORE_WAL_BENCH_SECONDS")); err == nil && v > 0 {
-		seconds = v
-	}
 	for _, callers := range []int{1, 4} {
 		for _, bulk := range []int{0, 2, 6} {
 			b.Run(fmt.Sprintf("%dcallers/%dbulk", callers, bulk), func(b *testing.B) {
-				for range b.N {
-					benchmarkCommitUnderBulkLoad(b, callers, bulk, time.Duration(seconds)*time.Second)
-				}
+				benchmarkCommitUnderBulkLoad(b, callers, bulk)
 			})
 		}
 	}
 }
 
-func benchmarkCommitUnderBulkLoad(b *testing.B, callers, bulk int, length time.Duration) {
-	b.Helper()
+func benchmarkCommitUnderBulkLoad(b *testing.B, callers, bulk int) {
 	ctx := context.Background()
 	dir := os.Getenv("OBJSTORE_WAL_BENCH_DIR")
 	if dir == "" {
@@ -218,7 +234,9 @@ func benchmarkCommitUnderBulkLoad(b *testing.B, callers, bulk int, length time.D
 		object[i] = byte(i * 7)
 	}
 	for f := range bulk {
-		bg.Go(func() {
+		bg.Add(1)
+		go func() {
+			defer bg.Done()
 			for n := 0; ; n++ {
 				select {
 				case <-stop:
@@ -233,45 +251,27 @@ func benchmarkCommitUnderBulkLoad(b *testing.B, callers, bulk int, length time.D
 				bulkBytes.Add(int64(len(object)))
 				_ = s.Delete(ctx, key)
 			}
-		})
+		}()
+	}
+	rngs := make([]*rand.Rand, callers)
+	counts := make([]int, callers)
+	for c := range rngs {
+		rngs[c] = rand.New(rand.NewPCG(uint64(c), 1))
+	}
+	next := func(c int) []Bytes {
+		records := make([]Bytes, rows)
+		for i := range records {
+			r := strconv.AppendInt(make(Bytes, 0, 16+dims), int64(c*1e9+counts[c]+i), 10)
+			for range dims {
+				r = append(r, byte(int8(rngs[c].IntN(255)-127)))
+			}
+			records[i] = r
+		}
+		counts[c] += rows
+		return records
 	}
 	w := NewWriter[Bytes](s, testPrefix, 1, nil)
-	var mu sync.Mutex
-	var latencies []time.Duration
-	var written int
-	var wg sync.WaitGroup
-	start := time.Now()
-	end := start.Add(length)
-	for c := range callers {
-		wg.Go(func() {
-			rng := rand.New(rand.NewPCG(uint64(c), 1))
-			var own []time.Duration
-			count := 0
-			for time.Now().Before(end) {
-				records := make([]Bytes, rows)
-				for i := range records {
-					r := strconv.AppendInt(make(Bytes, 0, 16+dims), int64(c*1e9+count+i), 10)
-					for range dims {
-						r = append(r, byte(int8(rng.IntN(255)-127)))
-					}
-					records[i] = r
-				}
-				began := time.Now()
-				if err := w.Append(ctx, records); err != nil {
-					b.Errorf("append: %v", err)
-					return
-				}
-				own = append(own, time.Since(began))
-				count += rows
-			}
-			mu.Lock()
-			latencies = append(latencies, own...)
-			written += count
-			mu.Unlock()
-		})
-	}
-	wg.Wait()
-	elapsed := time.Since(start).Seconds()
+	written, latencies, elapsed := appendLoop(b, w, callers, next)
 	close(stop)
 	bg.Wait()
 	w.Close()
@@ -279,13 +279,9 @@ func benchmarkCommitUnderBulkLoad(b *testing.B, callers, bulk int, length time.D
 	if err != nil {
 		b.Fatal(err)
 	}
-	if len(latencies) == 0 {
-		b.Fatal("no completed appends")
-	}
-	sort.Slice(latencies, func(i, j int) bool { return latencies[i] < latencies[j] })
-	b.ReportMetric(float64(written)/elapsed, "rows/s")
-	b.ReportMetric(float64(bulkBytes.Load())/elapsed/1e6, "bulk_MB/s")
-	b.ReportMetric(float64(len(keys))/elapsed, "entries/s")
-	b.ReportMetric(float64(latencies[len(latencies)/2].Microseconds())/1e3, "p50_ms")
-	b.ReportMetric(float64(latencies[(len(latencies)*99+99)/100-1].Microseconds())/1e3, "p99_ms")
+	seconds := elapsed.Seconds()
+	b.ReportMetric(float64(written)/seconds, "rows/s")
+	b.ReportMetric(float64(bulkBytes.Load())/seconds/1e6, "bulk_MB/s")
+	b.ReportMetric(float64(len(keys))/seconds, "entries/s")
+	reportLatencies(b, latencies)
 }
