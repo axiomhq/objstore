@@ -474,3 +474,48 @@ func TestFaultZeroValue(t *testing.T) {
 	f.Resume()
 	f.Clear()
 }
+
+// TestFaultPauseRearm: each Set(Pause) arms a fresh pause. A Resume issued
+// before the Set does not release it, and one Resume releases calls paused
+// under earlier plans too.
+func TestFaultPauseRearm(t *testing.T) {
+	ctx := t.Context()
+	s, f := storetest.NewFaulty(t)
+	f.Resume() // before the plan: must not pre-release it
+	f.Set(storetest.Plan{Op: storetest.OpPut, N: 1, Mode: storetest.Pause, Key: "first"})
+	first := make(chan error, 1)
+	go func() { first <- s.Put(ctx, "first", []byte("x")) }()
+	for f.Fired() == 0 {
+		time.Sleep(time.Millisecond)
+	}
+	f.Set(storetest.Plan{Op: storetest.OpPut, N: 1, Mode: storetest.Pause, Key: "second"})
+	second := make(chan error, 1)
+	go func() { second <- s.Put(ctx, "second", []byte("x")) }()
+	for f.Fired() == 0 {
+		time.Sleep(time.Millisecond)
+	}
+	select {
+	case err := <-first:
+		t.Fatalf("first Put returned before Resume: %v", err)
+	case err := <-second:
+		t.Fatalf("second Put returned before Resume: %v", err)
+	case <-time.After(20 * time.Millisecond):
+	}
+	f.Resume()
+	if err := <-first; err != nil {
+		t.Fatal(err)
+	}
+	if err := <-second; err != nil {
+		t.Fatal(err)
+	}
+}
+
+func TestFaultFromOnNonRangeOpPanics(t *testing.T) {
+	var f storetest.Fault
+	defer func() {
+		if recover() == nil {
+			t.Fatal("Set accepted From on OpGet")
+		}
+	}()
+	f.Set(storetest.Plan{Op: storetest.OpGet, N: 1, From: 4})
+}

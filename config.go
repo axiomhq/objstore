@@ -2,6 +2,7 @@ package objstore
 
 import (
 	"context"
+	"time"
 
 	"github.com/axiomhq/objstore/kms"
 )
@@ -51,20 +52,28 @@ type Config struct {
 	// InstallNamespaceKey). It is the same as calling ConfigureCMEK before
 	// first use.
 	KeyProvider kms.KeyProvider
-	// PlaintextKeys reports whether an object read from an encrypted
-	// namespace is a deliberate plaintext object, returned as-is and
-	// unauthenticated instead of decrypted. It sees the key and the stored
-	// bytes. nil = DefaultPlaintextKeys. Whatever it accepts, anyone with
-	// write access to the bucket can forge: keep it as narrow as the
-	// application's layout allows.
-	PlaintextKeys func(key string, data []byte) bool
+	// KeyRefreshInterval ties access and rotation probes for keys whose
+	// provider is lease-cadenced (kms.LeaseCadencer, AWS KMS) to the lease
+	// heartbeat cadence; 0 = no such probes. SetCMEKRefreshInterval sets it
+	// after Open.
+	KeyRefreshInterval time.Duration
+	// AcceptPlaintext decides whether bytes read from an encrypted
+	// namespace that do NOT carry the encrypted-object header are a
+	// deliberate plaintext object, returned as-is and unauthenticated. It
+	// sees the key and the stored bytes. Bytes carrying the header are
+	// always decrypted, whatever it says; bytes it refuses fail to decrypt.
+	// GetRange never consults it: a range of an encrypted namespace is
+	// always decrypted. nil = DefaultAcceptPlaintext. Whatever it accepts,
+	// anyone with write access to the bucket can forge: keep it as narrow
+	// as the application's layout allows.
+	AcceptPlaintext func(key string, data []byte) bool
 }
 
-// DefaultPlaintextKeys accepts the plaintext objects RetireNamespaceKey
+// DefaultAcceptPlaintext accepts the plaintext objects RetireNamespaceKey
 // leaves behind: ns/<name>/manifest holding a JSON head with state
 // "deleted" and a non-empty incarnation (the name-reuse fence), and
 // ns/<name>/lease and ns/<name>/compactor holding any valid JSON. Compose
 // it to add exemptions of your own.
-func DefaultPlaintextKeys(key string, data []byte) bool {
+func DefaultAcceptPlaintext(key string, data []byte) bool {
 	return plaintextDeletedManifest(key, data) || plaintextFence(key, data)
 }

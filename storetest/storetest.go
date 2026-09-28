@@ -3,6 +3,7 @@ package storetest
 import (
 	"context"
 	"crypto/rand"
+	"errors"
 	"fmt"
 	"os"
 	"strings"
@@ -26,11 +27,14 @@ func New(t testing.TB) *objstore.Store {
 	return NewFS(t)
 }
 
-// NewFS returns a Store on a file bucket under t.TempDir().
+// NewFS returns a Store on a file bucket under t.TempDir(). It skips t on
+// a platform the file backend does not support (no flock).
 func NewFS(t testing.TB) *objstore.Store {
 	t.Helper()
 	s := fs.Open(t.TempDir(), "bucket", objstore.Config{})
-	if err := s.EnsureBucket(context.Background()); err != nil {
+	if err := s.EnsureBucket(context.Background()); errors.Is(err, errors.ErrUnsupported) {
+		t.Skip(err)
+	} else if err != nil {
 		t.Fatal(err)
 	}
 	return s
@@ -76,11 +80,19 @@ func NewS3(t testing.TB, endpoint string) *objstore.Store {
 
 // NewFaulty returns New(t)'s Store wrapped in a fault injector, for
 // crash-point tests. Disarmed until the caller sets a Plan. Cleanup
-// resumes any call still held by a Pause plan, so a failed test does not
-// leak a blocked goroutine.
+// resumes any call still held by a Pause plan and waits (up to 5s) for
+// every paused or hung call to return, so a failed test neither leaks a
+// blocked goroutine nor lets one write into a removed TempDir. A Hang call
+// ends only with its context: use t.Context() (cancelled before cleanup),
+// never context.Background().
 func NewFaulty(t testing.TB) (*objstore.Store, *Fault) {
 	t.Helper()
 	s, f := NewFault(New(t))
-	t.Cleanup(f.Resume)
+	t.Cleanup(func() {
+		f.Resume()
+		if !f.drain(5 * time.Second) {
+			t.Logf("storetest: %d paused or hung calls still blocked at cleanup", f.blocked.Load())
+		}
+	})
 	return s, f
 }

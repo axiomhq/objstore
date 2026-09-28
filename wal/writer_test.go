@@ -216,16 +216,30 @@ func TestWriterAmbiguousPutOwnNonce(t *testing.T) {
 	}
 }
 
+// TestWriterCorruptReadbackIsUnknown: a corrupt page at the contested
+// sequence proves nothing, so the batch is ErrUnresolved, and the writer is
+// finished: it cannot tell which sequence is next, so every later Append
+// gets the same error without touching the store.
 func TestWriterCorruptReadbackIsUnknown(t *testing.T) {
-	s := storetest.New(t)
+	s, f := storetest.NewFaulty(t)
 	ctx := context.Background()
 	if err := s.Put(ctx, Key(testPrefix, 1), []byte("corrupt page")); err != nil {
 		t.Fatal(err)
 	}
-	w := NewWriter[Bytes](s, testPrefix, 1, nil)
+	w := NewWriter[Bytes](s, testPrefix, 1, nil, WithCommitInterval(MinCommitInterval))
 	defer w.Close()
 	if err := w.Append(ctx, rows("a")); !errors.Is(err, ErrUnresolved) {
 		t.Fatalf("unreadable nonce cannot prove another writer won: %v", err)
+	}
+	f.ResetOps()
+	if err := w.Append(ctx, rows("b")); !errors.Is(err, ErrUnresolved) || !strings.Contains(err.Error(), "corrupt entry") {
+		t.Fatalf("append after a corrupt read-back: %v, want the latched ErrUnresolved", err)
+	}
+	if ops := f.Ops(); len(ops) != 0 {
+		t.Fatalf("a terminal writer touched the store: %v", ops)
+	}
+	if st := w.Stats(); st.Lost || !errors.Is(st.Terminal, ErrUnresolved) || st.Unresolved != 1 || st.Pending != 0 {
+		t.Fatalf("stats: %+v", st)
 	}
 }
 
@@ -270,7 +284,7 @@ func TestSplitBatchPagesAreCanonical(t *testing.T) {
 		records = append(records, filled(byte('a'+i), size))
 	}
 	b := &batch[Bytes]{records: records, nonce: "nonce", at: time.UnixMilli(1234).UTC()}
-	pages, err := splitBatch(7, b)
+	pages, _, err := splitBatch(7, b)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -302,7 +316,7 @@ func TestSplitBatchPagesAreCanonical(t *testing.T) {
 func TestSplitBatchSinglePageBytesMatchEncode(t *testing.T) {
 	records := []Bytes{Bytes("plain"), Bytes{42, 0, 0x80, 0xff}, Bytes("<escaped>&"), Bytes{}}
 	b := &batch[Bytes]{records: records, nonce: "canonical", at: time.UnixMilli(1234).UTC()}
-	pages, err := splitBatch(7, b)
+	pages, _, err := splitBatch(7, b)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -317,9 +331,9 @@ func TestSplitBatchSinglePageBytesMatchEncode(t *testing.T) {
 // sits in the batch — a page the decoder would reject must never be
 // acknowledged.
 func TestWriterRejectsOversizedRecordBeforePublish(t *testing.T) {
-	small := func(id string) Bytes { return append(Bytes(id), bytes.Repeat([]byte{'x'}, 1<<10)...) }
-	huge := filled('h', maxPageBytes+1)
-	for name, records := range map[string][]Bytes{
+	small := func(id string) testRecord { return testRecord{b: id + strings.Repeat("x", 1<<10)} }
+	huge := testRecord{size: maxPageBytes + 1} // Size alone; refused before AppendTo
+	for name, records := range map[string][]testRecord{
 		"small-then-oversized": {small("a"), huge},
 		"oversized-middle":     {small("a"), huge, small("c")},
 	} {
@@ -329,9 +343,9 @@ func TestWriterRejectsOversizedRecordBeforePublish(t *testing.T) {
 			if err := s.EnsureBucket(ctx); err != nil {
 				t.Fatal(err)
 			}
-			w := NewWriter(s, testPrefix, 1, func(_ uint64, _ time.Time, records []Bytes) {
+			w := NewWriter(s, testPrefix, 1, func(_ uint64, _ time.Time, records []testRecord) {
 				for _, r := range records {
-					if len(r) > maxPageBytes {
+					if r.Size() > maxPageBytes {
 						t.Error("oversized batch was committed")
 					}
 				}
@@ -346,10 +360,10 @@ func TestWriterRejectsOversizedRecordBeforePublish(t *testing.T) {
 				t.Fatalf("WAL was published: %+v, %v", entries, err)
 			}
 			after := small("after")
-			if err := w.Append(ctx, []Bytes{after}); err != nil {
+			if err := w.Append(ctx, []testRecord{after}); err != nil {
 				t.Fatalf("writer unusable after rejection: %v", err)
 			}
-			if entries, err := replay(ctx, s, testPrefix, 0); err != nil || len(entries) != 1 || entries[0].Seq != 1 || !sameRecords(entries[0], []Bytes{after}) {
+			if entries, err := replay(ctx, s, testPrefix, 0); err != nil || len(entries) != 1 || entries[0].Seq != 1 || !sameRecords(entries[0], []Bytes{Bytes(after.b)}) {
 				t.Fatalf("rejected batch consumed a sequence: %+v, %v", entries, err)
 			}
 		})
@@ -747,7 +761,9 @@ func TestWithCommitIntervalClampsValuesOutOfRange(t *testing.T) {
 	}
 	w := NewWriter[Bytes](storetest.New(t), testPrefix, 1, nil, WithCommitInterval(200*time.Millisecond))
 	defer w.Close()
-	for d, want := range map[time.Duration]time.Duration{0: defaultAttemptTimeout, time.Millisecond: 200 * time.Millisecond, time.Minute: time.Minute} {
+	// Pacing precedes the attempt's deadline, so the deadline is not
+	// raised to the commit interval.
+	for d, want := range map[time.Duration]time.Duration{0: defaultAttemptTimeout, time.Millisecond: time.Millisecond, time.Minute: time.Minute} {
 		w.SetAttemptTimeout(d)
 		if w.attemptTimeout != want {
 			t.Fatalf("SetAttemptTimeout(%s) set %s, want %s", d, w.attemptTimeout, want)

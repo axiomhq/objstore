@@ -3,6 +3,7 @@ package rangeread
 import (
 	"bytes"
 	"context"
+	"errors"
 	"fmt"
 	"runtime/debug"
 	"slices"
@@ -16,10 +17,10 @@ import (
 // Load associates one physical extent with a logical decoded cache entry.
 type Load struct {
 	Extent
-	// Key is the logical cache key of the decoded child. It must identify
-	// the extent and its decoding: two loads with one Key are the same
-	// child, only the first is read, and a cached entry under Key is
-	// served without reading at all.
+	// Key is the logical cache key of the decoded child, never empty. It
+	// must identify the extent and its decoding: two loads with one Key
+	// must name the same Extent (else ErrInvalidExtent), only the first is
+	// read, and a cached entry under Key is served without reading at all.
 	Key string
 	// Decode turns the stored bytes into the child; nil keeps them as
 	// stored. It must validate any stored checksum, since its result is
@@ -44,9 +45,13 @@ type Load struct {
 //
 // A stage whose children would retain more than Config.MaxInFlightBytes is
 // skipped: FetchRanges returns ctx unchanged and nil, and the consumer
-// falls back to its own per-object reads. An invalid load is
-// ErrInvalidExtent; a short read from the store is ErrCorrupt.
+// falls back to its own per-object reads. An invalid load, an empty Key, or
+// one Key given two different extents is ErrInvalidExtent; a range the
+// store returns at the wrong length is ErrCorrupt.
 func (r *Reader) FetchRanges(ctx context.Context, loads []Load) (context.Context, error) {
+	if r.memory == nil {
+		return ctx, errors.New("rangeread: Reader not built with New")
+	}
 	if err := ctx.Err(); err != nil {
 		return ctx, err
 	}
@@ -59,7 +64,8 @@ func (r *Reader) FetchRanges(ctx context.Context, loads []Load) (context.Context
 	// cache hits that the scope would keep alive after an LRU eviction. The
 	// consumer falls back to its normal bounded per-object reads.
 	var retained int64
-	seen := make(map[string]bool)
+	seen := make(map[string]Extent, len(loads))
+	var unique []Load // loads, first of each Key
 	for _, load := range loads {
 		if err := load.valid(); err != nil {
 			return ctx, err
@@ -67,28 +73,30 @@ func (r *Reader) FetchRanges(ctx context.Context, loads []Load) (context.Context
 		if load.DecodedBytes < 0 {
 			return ctx, fmt.Errorf("%w: %s: negative DecodedBytes %d", ErrInvalidExtent, load.Key, load.DecodedBytes)
 		}
-		if seen[load.Key] {
+		if load.Key == "" {
+			return ctx, fmt.Errorf("%w: %s: empty Key", ErrInvalidExtent, load.Object)
+		}
+		if x, ok := seen[load.Key]; ok {
+			if x != load.Extent {
+				return ctx, fmt.Errorf("%w: Key %s names two extents", ErrInvalidExtent, load.Key)
+			}
 			continue
 		}
-		seen[load.Key] = true
+		seen[load.Key] = load.Extent
+		unique = append(unique, load)
 		for _, n := range []int64{load.Length, load.DecodedBytes, int64(len(load.Key)+len(load.Object)) + 128} {
-			if n > r.Config.MaxInFlightBytes-retained {
+			if n > r.config.MaxInFlightBytes-retained {
 				return ctx, nil
 			}
 			retained += n
 		}
 	}
 	var gens []uint64 // gens[i]: pending[i]'s namespace generation, read before its I/O
-	results := make(map[string][]byte, len(loads))
-	unique := make(map[string]bool, len(loads))
+	results := make(map[string][]byte, len(unique))
 	var pending []Load
 	var owners []bool // owners[i]: this lookup owns the request's miss of pending[i] (cache.MarkMissed)
 	var extents []Extent
-	for _, load := range loads {
-		if unique[load.Key] {
-			continue
-		}
-		unique[load.Key] = true
+	for _, load := range unique {
 		if b, ok := cache.Scoped(ctx, load.Key); ok {
 			results[load.Key] = b
 			continue
@@ -108,7 +116,7 @@ func (r *Reader) FetchRanges(ctx context.Context, loads []Load) (context.Context
 		owners = append(owners, cache.MarkMissed(ctx, load.Key))
 		extents = append(extents, load.Extent)
 	}
-	plans, err := Plan(extents, r.Config)
+	plans, err := Plan(extents, r.config)
 	if err != nil {
 		return ctx, err
 	}
@@ -147,8 +155,11 @@ func (r *Reader) FetchRanges(ctx context.Context, loads []Load) (context.Context
 			planChild[i], direct[j] = j, true
 		}
 	}
-	// Assemble exact children while each physical buffer holds its memory
-	// reservation. Gaps never remain in an unbounded per-wave buffer list.
+	// Every child not read directly gets an exact-size buffer up front,
+	// counted by the retention check above (not by the memory semaphore,
+	// which covers physical range buffers only). Each worker copies its
+	// child bytes out while it still holds its range's reservation, so no
+	// gap bytes outlive the read.
 	assembled := make([][]byte, len(pending))
 	for i, load := range pending {
 		if !direct[i] {
@@ -177,14 +188,14 @@ func (r *Reader) FetchRanges(ctx context.Context, loads []Load) (context.Context
 	}
 	var started atomic.Bool
 	g, gctx := errgroup.WithContext(ctx)
-	g.SetLimit(r.Config.Concurrency)
+	g.SetLimit(r.config.Concurrency)
 	for i, plan := range plans {
 		child := planChild[i]
 		g.Go(func() error {
-			if err := r.Memory.Acquire(gctx, plan.Length); err != nil {
+			if err := r.memory.Acquire(gctx, plan.Length); err != nil {
 				return err
 			}
-			defer r.Memory.Release(plan.Length)
+			defer r.memory.Release(plan.Length)
 			// read reports who answered: the store (Load), or the memory or
 			// disk tier holding the object its bytes were cut from.
 			read := func(ctx context.Context) ([]byte, cache.Outcome, error) {
@@ -204,7 +215,7 @@ func (r *Reader) FetchRanges(ctx context.Context, loads []Load) (context.Context
 					data, err := r.Store.GetRange(ctx, plan.Object, plan.Offset, plan.Length)
 					r.IO.Bytes.Add(int64(len(data)))
 					if err == nil && int64(len(data)) != plan.Length {
-						err = fmt.Errorf("%w: short range: got %d, want %d", ErrCorrupt, len(data), plan.Length)
+						err = fmt.Errorf("%w: %s: range at %d returned %d bytes, want %d", ErrCorrupt, plan.Object, plan.Offset, len(data), plan.Length)
 					}
 					if err == nil {
 						r.IO.ExtraBytes.Add(plan.Extra)

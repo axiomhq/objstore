@@ -19,4 +19,4 @@
 // such as fake-gcs-server with option.WithEndpoint("http://host:4443/storage/v1/")
 // and option.WithoutAuthentication(); by default the client uses
 // Application Default Credentials.
-package gcs // import "github.com/axiomhq/objstore/gcs"
+package gcs

@@ -18,10 +18,7 @@ import (
 // commit, manifest swap, or lease heartbeat — goes straight through.
 func TestWriteGateBoundsBulkWritesButNotUrgent(t *testing.T) {
 	ctx := context.Background()
-	base := fs.Open(t.TempDir(), "b", objstore.Config{MaxInflightWrites: 1})
-	if err := base.EnsureBucket(ctx); err != nil {
-		t.Fatal(err)
-	}
+	base := openFS(t, objstore.Config{MaxInflightWrites: 1})
 	s, f := storetest.NewFault(base)
 	f.Set(storetest.Plan{Op: storetest.OpPut, N: 1, Mode: storetest.Pause, Key: "bulk-1"})
 
@@ -63,10 +60,7 @@ func TestWriteGateBoundsBulkWritesButNotUrgent(t *testing.T) {
 // bound, not a gate nobody can pass.
 func TestNegativeMaxInflightWritesIsUnbounded(t *testing.T) {
 	ctx := context.Background()
-	base := fs.Open(t.TempDir(), "b", objstore.Config{MaxInflightWrites: -1})
-	if err := base.EnsureBucket(ctx); err != nil {
-		t.Fatal(err)
-	}
+	base := openFS(t, objstore.Config{MaxInflightWrites: -1})
 	s, f := storetest.NewFault(base)
 	f.Set(storetest.Plan{Op: storetest.OpPut, N: 1, Mode: storetest.Pause, Key: "held"})
 	first := make(chan error, 1)
@@ -85,4 +79,17 @@ func TestNegativeMaxInflightWritesIsUnbounded(t *testing.T) {
 	if err := <-first; err != nil {
 		t.Fatal(err)
 	}
+}
+
+// openFS returns a Store on a fresh file bucket, skipping t where the file
+// backend is unsupported.
+func openFS(t *testing.T, cfg objstore.Config) *objstore.Store {
+	t.Helper()
+	s := fs.Open(t.TempDir(), "b", cfg)
+	if err := s.EnsureBucket(context.Background()); errors.Is(err, errors.ErrUnsupported) {
+		t.Skip(err)
+	} else if err != nil {
+		t.Fatal(err)
+	}
+	return s
 }

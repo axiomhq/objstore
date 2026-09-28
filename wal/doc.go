@@ -21,7 +21,10 @@
 // ErrUnresolved means the outcome is unknown: the records may be durable,
 // so recover by replaying the log from the checkpoint rather than by
 // appending them again. An Append whose context ends first returns the
-// context's error, with the same unknown outcome.
+// context's error, with the same unknown outcome. ErrLostRace, and
+// ErrUnresolved from a commit, finish the writer: every queued and later
+// Append gets the same error (Stats.Terminal), and recovery is a new Writer
+// opened from the checkpoint.
 //
 // # One writer per prefix
 //

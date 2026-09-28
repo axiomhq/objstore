@@ -2,30 +2,75 @@ name: CI
 
 on:
   push:
+    branches: [main]
   pull_request:
 
 permissions:
   contents: read
 
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
 jobs:
   test:
     runs-on: ubuntu-latest
+    timeout-minutes: 20
     steps:
-      - uses: actions/checkout@v4
-      - uses: actions/setup-go@v5
+      - uses: actions/checkout@v5
+      - uses: actions/setup-go@v6
         with:
           go-version-file: go.mod
       - name: gofmt
         run: test -z "$(gofmt -l .)" || { gofmt -l .; exit 1; }
+      - name: go mod tidy
+        run: go mod tidy -diff
       - name: go vet
         run: go vet ./...
       - name: staticcheck
-        run: |
-          go install honnef.co/go/tools/cmd/staticcheck@latest
-          "$(go env GOPATH)/bin/staticcheck" ./...
+        run: go run honnef.co/go/tools/cmd/staticcheck@v0.8.1 ./...
       - name: go test
         run: go test -race -count=1 ./...
+      # vet type-checks the tests too, which go build skips.
       - name: cross-compile windows
-        run: GOOS=windows go build ./...
+        run: GOOS=windows go vet ./...
       - name: cross-compile darwin
-        run: GOOS=darwin go build ./...
+        run: GOOS=darwin go vet ./...
+
+  s3:
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v5
+      - uses: actions/setup-go@v6
+        with:
+          go-version-file: go.mod
+      # A step, not a services: container: services cannot pass the
+      # image's command (server /data), and minio/minio ships no curl for a
+      # container health check, so readiness is polled from the host.
+      - name: start MinIO
+        run: |
+          docker run -d --name minio -p 9000:9000 \
+            -e MINIO_ROOT_USER=minioadmin -e MINIO_ROOT_PASSWORD=minioadmin \
+            minio/minio server /data
+          for i in $(seq 60); do
+            curl -fsS http://localhost:9000/minio/health/live && exit 0
+            sleep 1
+          done
+          docker logs minio
+          exit 1
+      - name: go test (MinIO)
+        env:
+          OBJSTORE_TEST_S3: http://localhost:9000
+        run: go test -race -count=1 ./...
+
+  macos:
+    runs-on: macos-latest
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v5
+      - uses: actions/setup-go@v6
+        with:
+          go-version-file: go.mod
+      - name: go test (darwin flock)
+        run: go test -race -count=1 ./fs/... ./

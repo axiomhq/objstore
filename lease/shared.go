@@ -13,9 +13,8 @@ import (
 //
 // No store I/O runs under Shared's mutex: a Join that has to mint, and the
 // last Ref.Release, mark s busy instead, and other Joins wait for them.
-// Held and Ref.Release stay callable throughout, including from a fence
-// callback; Join from a fence callback can deadlock against a Release in
-// progress, as Retire can.
+// Every method is callable from a fence callback, which runs on its own
+// goroutine.
 type Shared struct {
 	mu   sync.Mutex
 	cond *sync.Cond // signals busy -> false; lazily bound to mu
@@ -50,8 +49,8 @@ func (s *Shared) idle() {
 }
 
 // Join returns a reference to the lease s already holds, or calls mint to
-// acquire one and holds that. A held lease that has been fenced is not
-// joined: ErrNotOwner, and mint is not called. Concurrent Joins mint once:
+// acquire one and holds that. A held lease that is no longer valid (fenced,
+// lapsed) is not joined: ErrNotOwner, and mint is not called. Concurrent Joins mint once:
 // the others wait for that mint, and try their own if it failed.
 func (s *Shared) Join(mint func() (*Lease, error)) (*Ref, error) {
 	s.mu.Lock()
@@ -59,23 +58,27 @@ func (s *Shared) Join(mint func() (*Lease, error)) (*Ref, error) {
 	if l := s.held; l != nil {
 		defer s.mu.Unlock()
 		if err := l.Valid(); err != nil {
-			return nil, fmt.Errorf("%w: %s was fenced in this process: %w", ErrNotOwner, l.key, err)
+			return nil, fmt.Errorf("lease: cannot join %s, it is no longer valid: %w", l.key, err)
 		}
 		s.refs++
 		return &Ref{s: s, l: l}, nil
 	}
 	s.busy = true
 	s.mu.Unlock()
+	// Deferred, so a panicking mint does not leave s busy forever.
+	defer func() {
+		s.mu.Lock()
+		s.idle()
+		s.mu.Unlock()
+	}()
 
 	l, err := mint()
-
-	s.mu.Lock()
-	defer s.mu.Unlock()
-	s.idle()
 	if err != nil {
 		return nil, err
 	}
+	s.mu.Lock()
 	s.held, s.refs = l, 1
+	s.mu.Unlock()
 	return &Ref{s: s, l: l}, nil
 }
 

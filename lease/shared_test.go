@@ -193,3 +193,62 @@ func TestShared(t *testing.T) {
 		<-done
 	})
 }
+
+// TestSharedReleaseFromFence: M2. The last Ref.Release from inside the
+// fence callback completes; Shared is usable afterwards.
+func TestSharedReleaseFromFence(t *testing.T) {
+	ctx := context.Background()
+	const ttl = 200 * time.Millisecond
+	s := storetest.New(t)
+	var sh Shared
+	mint := func() (*Lease, error) { return Acquire(ctx, s, "shared/fence", "owner-a", ttl) }
+	r, err := sh.Join(mint)
+	if err != nil {
+		t.Fatal(err)
+	}
+	done := make(chan struct{})
+	r.Lease().Start(func() { r.Release(ctx); close(done) })
+	if err := Steal(ctx, s, "shared/fence", "owner-b", ttl); err != nil {
+		t.Fatal(err)
+	}
+	select {
+	case <-done:
+	case <-time.After(10 * time.Second):
+		t.Fatal("Ref.Release from the fence callback hung")
+	}
+	if sh.Held() {
+		t.Fatal("lease still held after its last Release")
+	}
+	joined := make(chan error, 1)
+	go func() {
+		_, err := sh.Join(func() (*Lease, error) { return nil, errors.New("mint") })
+		joined <- err
+	}()
+	select {
+	case <-joined:
+	case <-time.After(5 * time.Second):
+		t.Fatal("Join blocked: Shared stuck busy")
+	}
+}
+
+// TestSharedMintPanic: M3. A panicking mint does not leave Shared busy.
+func TestSharedMintPanic(t *testing.T) {
+	var sh Shared
+	func() {
+		defer func() { _ = recover() }()
+		sh.Join(func() (*Lease, error) { panic("mint") }) //nolint:errcheck // panics
+	}()
+	joined := make(chan error, 1)
+	go func() {
+		_, err := sh.Join(func() (*Lease, error) { return nil, errors.New("mint") })
+		joined <- err
+	}()
+	select {
+	case err := <-joined:
+		if err == nil || err.Error() != "mint" {
+			t.Fatalf("second Join: %v", err)
+		}
+	case <-time.After(5 * time.Second):
+		t.Fatal("Join blocked after a panicking mint")
+	}
+}

@@ -4,10 +4,12 @@ import (
 	"context"
 	"crypto/sha256"
 	"errors"
+	"fmt"
 	"math/rand/v2"
 	"slices"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/axiomhq/objstore"
@@ -50,12 +52,17 @@ const (
 	// landed but the caller cannot know it. This is the outcome a write
 	// that reads back its own nonce exists to resolve.
 	Ambiguous
-	// Hang blocks until the call's context is cancelled.
+	// Hang blocks until the call's context is cancelled. A call made with
+	// a context that is never cancelled (context.Background) hangs for
+	// good: nothing, not even NewFaulty's cleanup, releases it.
 	Hang
 	// Pause stops immediately before storage until Fault.Resume, or until
 	// the call's context ends (the call then returns the context's error).
 	// It models a process pause, including an operation already past its
-	// lease check.
+	// lease check. Each Set of a Pause plan arms a fresh pause, so a Resume
+	// issued before that Set never releases it; a Resume after the Set but
+	// before the call arrives does, and the call then passes straight
+	// through.
 	Pause
 )
 
@@ -72,7 +79,8 @@ type Plan struct {
 	// a test can target one part of an object read by byte range without
 	// hitting its header or its neighbours. It applies when MatchFrom is
 	// set, or when From is non-zero (so From: 0 alone matches any offset;
-	// set MatchFrom to target offset 0).
+	// set MatchFrom to target offset 0). Only OpGetRange has an offset:
+	// Set panics on a plan for any other Op that sets From or MatchFrom.
 	From      int64
 	MatchFrom bool
 }
@@ -84,9 +92,12 @@ type Plan struct {
 // is not shaped. Every other call waits Latency plus its size over
 // BytesPerSecond, then fails with ErrFault at ErrorRate (drawn from a
 // generator seeded with Seed, so a sequential test sees the same failures
-// on every run). Writes are shaped before they reach the backend (a shaped
-// failure never lands); reads are shaped after it answers, and a shaped
-// failure returns no data.
+// on every run). Object reads (Get, GetWithETag, GetIfChanged, GetRange)
+// are shaped after the backend answers, sized by the bytes returned, and a
+// shaped failure returns no data. Every other call (writes, deletes, both
+// listings, EnsureBucket, DropBucket) is shaped before it reaches the
+// backend, with size zero except for a write's payload, so a shaped
+// failure never lands.
 type Shape struct {
 	Latency        time.Duration
 	BytesPerSecond int64   // 0 = unlimited
@@ -111,7 +122,13 @@ type Fault struct {
 	plan   Plan
 	seen   int
 	fired  int
-	paused chan struct{}
+	paused chan struct{} // the armed Pause plan's; closed by Resume
+	// held is every pause channel not yet closed, the armed one included:
+	// Resume releases them all.
+	held []chan struct{}
+	// blocked counts calls stopped by Pause or Hang right now, so cleanup
+	// can wait for resumed calls to finish.
+	blocked atomic.Int64
 	// ops counts every backend call by operation, armed or not — the
 	// measurement half of this layer: "how many store requests did this
 	// replay / refresh / compaction cycle cost". readBytes is the payload
@@ -147,7 +164,9 @@ type Fault struct {
 //
 // It watches every key, including ones mutable by design (a lease, a
 // manifest head). Filter Rewrites by the keys your test considers
-// write-once.
+// write-once. The digest covers the bytes the backend stores: on a store
+// with CMEK that is ciphertext, so rewriting a key with the same plaintext
+// under a fresh data key counts as a rewrite.
 func (f *Fault) WatchRewrites() {
 	f.mu.Lock()
 	defer f.mu.Unlock()
@@ -169,16 +188,22 @@ func (f *Fault) Rewrites() []string {
 // wrote records one landed write against the ledger.
 func (f *Fault) wrote(key string, data []byte) {
 	f.mu.Lock()
+	watching := f.digest != nil
+	f.mu.Unlock()
+	var sum [32]byte
+	if watching { // hash outside the mutex: fanned-out writers do not queue on it
+		sum = sha256.Sum256(data)
+	}
+	f.mu.Lock()
 	defer f.mu.Unlock()
 	if f.writeKeys == nil {
 		f.writeKeys = map[string]int{}
 	}
 	f.writeKeys[key]++
 	f.writeBytes += int64(len(data))
-	if f.digest == nil {
+	if f.digest == nil || !watching {
 		return
 	}
-	sum := sha256.Sum256(data)
 	if had, ok := f.digest[key]; ok && had != sum {
 		f.rewritten[key] = true
 	}
@@ -352,13 +377,19 @@ func (f *Fault) read(b []byte) {
 	f.mu.Unlock()
 }
 
-// Set arms p and resets the match counter.
+// Set arms p and resets the match counter. A Pause plan gets a fresh
+// pause, released by the next Resume. Set panics on a plan that sets From
+// or MatchFrom for an Op other than OpGetRange: it could never fire.
 func (f *Fault) Set(p Plan) {
+	if p.Op != OpGetRange && (p.From != 0 || p.MatchFrom) {
+		panic(fmt.Sprintf("storetest: Plan.From/MatchFrom apply to OpGetRange only, not %s", p.Op))
+	}
 	f.mu.Lock()
 	defer f.mu.Unlock()
 	f.plan, f.seen, f.fired = p, 0, 0
-	if p.Mode == Pause && f.paused == nil {
+	if p.Mode == Pause {
 		f.paused = make(chan struct{})
+		f.held = append(f.held, f.paused)
 	}
 }
 
@@ -372,17 +403,29 @@ func (f *Fault) Fired() int {
 	return f.fired
 }
 
-// Resume releases every operation stopped by Pause. Like a process
-// resuming, the operation then runs normally; the lease may have expired
-// meanwhile. Resume with nothing paused is a no-op.
+// Resume releases every operation stopped by Pause, and the armed Pause
+// plan if it has not fired yet. Like a process resuming, the operation then
+// runs normally; the lease may have expired meanwhile. Resume with nothing
+// paused is a no-op.
 func (f *Fault) Resume() {
 	f.mu.Lock()
-	paused := f.paused
-	f.paused = nil
+	held := f.held
+	f.paused, f.held = nil, nil
 	f.mu.Unlock()
-	if paused != nil {
-		close(paused)
+	for _, ch := range held {
+		close(ch)
 	}
+}
+
+// drain waits up to timeout for every call stopped by Pause or Hang to
+// return, and reports whether they all did.
+func (f *Fault) drain(timeout time.Duration) bool {
+	for deadline := time.Now().Add(timeout); f.blocked.Load() > 0; time.Sleep(time.Millisecond) {
+		if time.Now().After(deadline) {
+			return false
+		}
+	}
+	return true
 }
 
 // hit counts the call and reports whether it is the planned one. A Pause
@@ -418,6 +461,8 @@ func (f *Fault) hitAt(ctx context.Context, op Op, off int64, keys ...string) (Mo
 		return p.Mode, true
 	}
 	if paused != nil {
+		f.blocked.Add(1)
+		defer f.blocked.Add(-1)
 		select {
 		case <-paused:
 		case <-ctx.Done():
@@ -437,8 +482,10 @@ func anyContains(keys []string, sub string) bool {
 }
 
 // pre is the injection for the modes that never reach storage.
-func pre(ctx context.Context, m Mode) error {
+func (f *Fault) pre(ctx context.Context, m Mode) error {
 	if m == Hang {
+		f.blocked.Add(1)
+		defer f.blocked.Add(-1)
 		<-ctx.Done()
 		return ctx.Err()
 	}
@@ -449,7 +496,7 @@ func pre(ctx context.Context, m Mode) error {
 func (f *Fault) Put(ctx context.Context, key string, data []byte) error {
 	m, hit := f.hit(ctx, OpPut, key)
 	if hit && m != Ambiguous {
-		return pre(ctx, m)
+		return f.pre(ctx, m)
 	}
 	if err := f.shapeCall(ctx, len(data)); err != nil {
 		return err
@@ -468,7 +515,7 @@ func (f *Fault) Put(ctx context.Context, key string, data []byte) error {
 func (f *Fault) PutIfAbsent(ctx context.Context, key string, data []byte) (bool, error) {
 	m, hit := f.hit(ctx, OpPutIfAbsent, key)
 	if hit && m != Ambiguous {
-		return false, pre(ctx, m)
+		return false, f.pre(ctx, m)
 	}
 	if err := f.shapeCall(ctx, len(data)); err != nil {
 		return false, err
@@ -487,7 +534,7 @@ func (f *Fault) PutIfAbsent(ctx context.Context, key string, data []byte) (bool,
 func (f *Fault) PutIfMatch(ctx context.Context, key string, data []byte, etag string) (bool, error) {
 	m, hit := f.hit(ctx, OpPutIfMatch, key)
 	if hit && m != Ambiguous {
-		return false, pre(ctx, m)
+		return false, f.pre(ctx, m)
 	}
 	if err := f.shapeCall(ctx, len(data)); err != nil {
 		return false, err
@@ -507,7 +554,7 @@ func (f *Fault) Get(ctx context.Context, key string) ([]byte, error) {
 	f.noteRead(key)
 	// A read has no ambiguous outcome: nothing changed either way.
 	if m, hit := f.hit(ctx, OpGet, key); hit {
-		return nil, pre(ctx, m)
+		return nil, f.pre(ctx, m)
 	}
 	b, err := f.b.Get(ctx, key)
 	if err != nil {
@@ -524,7 +571,7 @@ func (f *Fault) Get(ctx context.Context, key string) ([]byte, error) {
 // matches the prefix).
 func (f *Fault) ListPage(ctx context.Context, prefix, after string, limit int) ([]string, string, error) {
 	if m, hit := f.hit(ctx, OpList, prefix); hit {
-		return nil, "", pre(ctx, m)
+		return nil, "", f.pre(ctx, m)
 	}
 	if err := f.shapeCall(ctx, 0); err != nil {
 		return nil, "", err
@@ -536,7 +583,7 @@ func (f *Fault) ListPage(ctx context.Context, prefix, after string, limit int) (
 func (f *Fault) Delete(ctx context.Context, key string) error {
 	m, hit := f.hit(ctx, OpDelete, key)
 	if hit && m != Ambiguous {
-		return pre(ctx, m)
+		return f.pre(ctx, m)
 	}
 	if err := f.shapeCall(ctx, 0); err != nil {
 		return err
@@ -556,7 +603,7 @@ func (f *Fault) Delete(ctx context.Context, key string) error {
 func (f *Fault) DeleteMany(ctx context.Context, keys ...string) error {
 	m, hit := f.hit(ctx, OpDelete, keys...)
 	if hit && m != Ambiguous {
-		return pre(ctx, m)
+		return f.pre(ctx, m)
 	}
 	if err := f.shapeCall(ctx, 0); err != nil {
 		return err
@@ -575,7 +622,7 @@ func (f *Fault) DeleteMany(ctx context.Context, keys ...string) error {
 // OpListPrefixes (Plan.Key matches the prefix).
 func (f *Fault) ListPrefixesPage(ctx context.Context, prefix, after string, limit int) ([]string, string, error) {
 	if m, hit := f.hit(ctx, OpListPrefixes, prefix); hit {
-		return nil, "", pre(ctx, m)
+		return nil, "", f.pre(ctx, m)
 	}
 	if err := f.shapeCall(ctx, 0); err != nil {
 		return nil, "", err
@@ -587,7 +634,7 @@ func (f *Fault) ListPrefixesPage(ctx context.Context, prefix, after string, limi
 func (f *Fault) GetWithETag(ctx context.Context, key string) ([]byte, string, error) {
 	f.noteRead(key)
 	if m, hit := f.hit(ctx, OpGet, key); hit {
-		return nil, "", pre(ctx, m)
+		return nil, "", f.pre(ctx, m)
 	}
 	b, etag, err := f.b.GetWithETag(ctx, key)
 	if err != nil {
@@ -604,7 +651,7 @@ func (f *Fault) GetWithETag(ctx context.Context, key string) ([]byte, string, er
 func (f *Fault) GetIfChanged(ctx context.Context, key, etag string) ([]byte, string, bool, error) {
 	f.noteRead(key)
 	if m, hit := f.hit(ctx, OpGet, key); hit {
-		return nil, "", false, pre(ctx, m)
+		return nil, "", false, f.pre(ctx, m)
 	}
 	b, current, unchanged, err := f.b.GetIfChanged(ctx, key, etag)
 	if err != nil {
@@ -638,7 +685,7 @@ func (f *Fault) DropBucket(ctx context.Context) error {
 func (f *Fault) GetRange(ctx context.Context, key string, offset, length int64) ([]byte, error) {
 	f.noteRead(key)
 	if m, hit := f.hitAt(ctx, OpGetRange, offset, key); hit {
-		return nil, pre(ctx, m)
+		return nil, f.pre(ctx, m)
 	}
 	b, err := f.b.GetRange(ctx, key, offset, length)
 	if err != nil {

@@ -72,8 +72,8 @@ type Store struct {
 	// or configured through one is seen through all. nil (a zero Store)
 	// means no encryption.
 	cmek *atomic.Pointer[cmekState]
-	// plaintext is Config.PlaintextKeys, or DefaultPlaintextKeys.
-	plaintext func(key string, data []byte) bool
+	// accept is Config.AcceptPlaintext, or DefaultAcceptPlaintext.
+	accept func(key string, data []byte) bool
 	// writes bounds non-urgent object writes and deletes in flight; see
 	// Config.MaxInflightWrites. nil (a zero Store) means unbounded.
 	writes *semaphore.Weighted
@@ -86,15 +86,17 @@ func Open(b Backend, cfg Config) *Store {
 	if cfg.RequestsPerSecond > 0 {
 		b = &paced{Backend: b, pace: newPacer(cfg.RequestsPerSecond)}
 	}
-	s := &Store{b: b, cmek: new(atomic.Pointer[cmekState]), plaintext: cfg.PlaintextKeys}
-	if s.plaintext == nil {
-		s.plaintext = DefaultPlaintextKeys
+	s := &Store{b: b, cmek: new(atomic.Pointer[cmekState]), accept: cfg.AcceptPlaintext}
+	if s.accept == nil {
+		s.accept = DefaultAcceptPlaintext
 	}
 	if cfg.MaxInflightWrites >= 0 {
 		s.writes = semaphore.NewWeighted(int64(cmp.Or(cfg.MaxInflightWrites, defaultMaxInflightWrites)))
 	}
 	if cfg.KeyProvider != nil {
-		s.cmek.Store(newCMEKState(cfg.KeyProvider))
+		c := newCMEKState(cfg.KeyProvider)
+		c.interval.Store(int64(cfg.KeyRefreshInterval))
+		s.cmek.Store(c)
 	}
 	return s
 }
@@ -137,7 +139,7 @@ func (s *Store) enterWrite(ctx context.Context) (func(), error) {
 // seal returns data as it is stored: encrypted when key lies in a
 // namespace with a key record.
 func (s *Store) seal(ctx context.Context, op, key string, data []byte) ([]byte, error) {
-	dek, err := s.objectKey(ctx, key)
+	dek, err := s.objectKey(ctx, key, false)
 	if err != nil {
 		return nil, OpErr(op, key, err)
 	}
@@ -180,7 +182,7 @@ func (s *Store) PutIfAbsent(ctx context.Context, key string, data []byte) (bool,
 
 // Get returns the whole object at key; a missing object wraps ErrNotFound.
 func (s *Store) Get(ctx context.Context, key string) ([]byte, error) {
-	dek, err := s.objectKey(ctx, key)
+	dek, err := s.objectKey(ctx, key, true)
 	if err != nil {
 		return nil, OpErr("get", key, err)
 	}
@@ -193,6 +195,8 @@ func (s *Store) Get(ctx context.Context, key string) ([]byte, error) {
 
 // GetRange reads exactly length bytes starting at offset. Short/out-of-bounds
 // ranges fail instead of returning a plausible partial index block.
+// In an encrypted namespace the range is always decrypted:
+// Config.AcceptPlaintext is never consulted.
 func (s *Store) GetRange(ctx context.Context, key string, offset, length int64) ([]byte, error) {
 	if offset < 0 || length <= 0 || offset > math.MaxInt64-length {
 		return nil, OpErr("get-range", key, ErrRange)
@@ -200,7 +204,7 @@ func (s *Store) GetRange(ctx context.Context, key string, offset, length int64) 
 	if err := ctx.Err(); err != nil {
 		return nil, err
 	}
-	dek, err := s.objectKey(ctx, key)
+	dek, err := s.objectKey(ctx, key, false)
 	if err != nil {
 		return nil, OpErr("get-range", key, err)
 	}
@@ -212,7 +216,7 @@ func (s *Store) GetRange(ctx context.Context, key string, offset, length int64) 
 
 // GetWithETag returns the object and its ETag for conditional replacement.
 func (s *Store) GetWithETag(ctx context.Context, key string) ([]byte, string, error) {
-	dek, err := s.objectKey(ctx, key)
+	dek, err := s.objectKey(ctx, key, true)
 	if err != nil {
 		return nil, "", OpErr("get-with-etag", key, err)
 	}
@@ -235,7 +239,7 @@ func (s *Store) GetIfChanged(ctx context.Context, key, etag string) ([]byte, str
 	if err := ctx.Err(); err != nil {
 		return nil, "", false, err
 	}
-	dek, err := s.objectKey(ctx, key)
+	dek, err := s.objectKey(ctx, key, true)
 	if err != nil {
 		return nil, "", false, OpErr("get-if-changed", key, err)
 	}

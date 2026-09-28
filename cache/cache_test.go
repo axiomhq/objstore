@@ -3,6 +3,7 @@ package cache
 import (
 	"fmt"
 	"strings"
+	"sync"
 	"testing"
 )
 
@@ -281,10 +282,50 @@ func TestRechargeIsIdentityChecked(t *testing.T) {
 	if c.Recharge("absent", won, 10, g) {
 		t.Fatal("recharged a missing key")
 	}
-	if c.Recharge("k", won, 2000, g) {
+	room := c.Cap - len("k") - EntryOverhead // the stripe less the entry's own charge
+	if !c.Recharge("k", won, room, g) {
+		t.Fatal("a charge that exactly fits was refused")
+	}
+	if c.Recharge("k", won, room+1, g) {
 		t.Fatal("an oversized charge applied")
 	}
 	if _, ok := c.DecodedSize("k"); ok || c.Charge() != 0 {
 		t.Fatalf("oversized recharge kept the entry (charge %d)", c.Charge())
+	}
+	// A non-comparable value cannot be identity-checked: refused, no panic.
+	c.PutValue("s", []int{1}, 100, g)
+	if c.Recharge("s", []int{1}, 200, g) {
+		t.Fatal("a non-comparable value re-charged")
+	}
+}
+
+// TestGenerationOfRacesInvalidation: GenerationOf is lock-free and bumps
+// are copy-on-write; under -race, readers and writers of several
+// namespaces never race, and every bump is kept.
+func TestGenerationOfRacesInvalidation(t *testing.T) {
+	c := NewByteCache(1 << 20)
+	const bumps = 200
+	var wg sync.WaitGroup
+	for _, name := range []string{"a", "b"} {
+		wg.Go(func() {
+			for range bumps {
+				c.InvalidateNamespace(name)
+			}
+		})
+		wg.Go(func() {
+			last := uint64(0)
+			for range 10 * bumps {
+				g := c.GenerationOf("ns/" + name + "/k")
+				if g < last {
+					t.Errorf("generation of %s went back: %d after %d", name, g, last)
+					return
+				}
+				last = g
+			}
+		})
+	}
+	wg.Wait()
+	if a, b := c.GenerationOf("ns/a/k"), c.GenerationOf("ns/b/k"); a != bumps || b != bumps || c.GenerationOf("other") != 0 {
+		t.Fatalf("generations a=%d b=%d, want %d each", a, b, bumps)
 	}
 }

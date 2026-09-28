@@ -57,13 +57,15 @@ type Backend struct {
 	syncFault func(dir string) error
 }
 
+var _ objstore.Backend = (*Backend)(nil)
+
 // New returns the file backend for bucket, a directory under root.
 func New(root, bucket string) *Backend {
 	return &Backend{root: filepath.Join(filepath.FromSlash(root), bucket)}
 }
 
-// Open returns a Store over New(root, bucket) with cfg's pacing and
-// write bound.
+// Open returns a Store over New(root, bucket) with cfg's pacing, write
+// bound and encryption.
 func Open(root, bucket string, cfg objstore.Config) *objstore.Store {
 	return objstore.Open(New(root, bucket), cfg)
 }
@@ -316,12 +318,12 @@ func (f *Backend) put(ctx context.Context, key string, data []byte) error {
 	if err != nil {
 		return err
 	}
-	defer os.Remove(tmp) // a no-op after Rename; the leak otherwise
 	t := objstore.TimingsOf(ctx)
 	start := time.Now()
 	unlock, err := f.lockKey(ctx, key)
 	t.Since(objstore.CallLock, start)
 	if err != nil {
+		os.Remove(tmp)
 		return err
 	}
 	defer unlock()
@@ -329,6 +331,7 @@ func (f *Backend) put(ctx context.Context, key string, data []byte) error {
 	err = os.Rename(tmp, dst)
 	t.Since(objstore.CallLink, start)
 	if err != nil {
+		os.Remove(tmp)
 		return err
 	}
 	return f.syncPublishedDir(dst, t)
@@ -435,7 +438,8 @@ func (f *Backend) GetIfChanged(ctx context.Context, key, etag string) ([]byte, s
 
 // PutIfMatch replaces the object at key only if its ETag is etag. The new
 // content is written and synced before the key's lock is taken, so the lock
-// covers only the compare, the rename and the directory sync. See
+// covers only the compare, the rename and the directory sync; the cost is
+// that a losing writer still pays its temp file's write and fsync. See
 // PutIfAbsent for (true, err).
 func (f *Backend) PutIfMatch(ctx context.Context, key string, data []byte, etag string) (bool, error) {
 	ok, err := f.putIfMatch(ctx, key, data, etag)

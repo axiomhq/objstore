@@ -12,10 +12,10 @@
 // so discovering a thousand top-level names costs one request, not one
 // per object.
 //
-// ConfigureCMEK adds envelope encryption of every object under
-// ns/<name>/ with a per-name data key wrapped by a customer key (see
-// package kms; the AWS and GCP providers are packages kms/awskms and
-// kms/gcpkms).
+// Config.KeyProvider (or ConfigureCMEK) adds envelope encryption of every
+// object under ns/<name>/ with a per-name data key wrapped by a customer
+// key (see package kms; the AWS and GCP providers are packages kms/awskms
+// and kms/gcpkms).
 //
 // Package wal is a write-ahead log on a Store, package cache a memory and
 // disk cache in front of one, package rangeread a coalescing ranged reader

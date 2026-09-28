@@ -299,12 +299,15 @@ func TestLastWaiterLeavingCancelsLoad(t *testing.T) {
 }
 
 func TestLoaderPanicIsAnError(t *testing.T) {
-	defer slog.SetDefault(slog.Default())
-	slog.SetDefault(slog.New(slog.DiscardHandler)) // the stack goes to the log
+	var logged bytes.Buffer
 	c := New(nil, 1<<20, nil, Keys{})
+	c.Logger = slog.New(slog.NewTextHandler(&logged, nil)) // the stack goes to the log
 	_, err := c.FetchWith(context.Background(), "k", func(context.Context) ([]byte, error) { panic("boom") })
 	if err == nil || !strings.Contains(err.Error(), "panic: boom") || strings.Contains(err.Error(), "goroutine") {
 		t.Fatalf("err = %v, want the panic message without a stack", err)
+	}
+	if !strings.Contains(logged.String(), "loader panic") || !strings.Contains(logged.String(), "goroutine") {
+		t.Fatalf("Cache.Logger did not get the panic and its stack: %q", logged.String())
 	}
 }
 
@@ -353,5 +356,31 @@ func TestOutcomeAndClassStrings(t *testing.T) {
 	c.NoteAs(context.Background(), "k", Outcome(3), true)
 	if got := c.ClassCounts(); got.HitRatio() != 1 {
 		t.Fatalf("out-of-range outcomes counted: %+v", got)
+	}
+}
+
+// TestInvalidatedLoadSkipsTheDiskTier: a load whose namespace is
+// invalidated while it runs publishes nowhere, the disk tier included: its
+// disk key names a retired generation nothing reads again.
+func TestInvalidatedLoadSkipsTheDiskTier(t *testing.T) {
+	disk, err := NewDisk(t.TempDir(), 1<<20)
+	if err != nil {
+		t.Fatal(err)
+	}
+	c := New(nil, 1<<20, disk, Keys{})
+	defer c.Close()
+	key := "ns/x/obj"
+	b, err := c.FetchWith(context.Background(), key, func(context.Context) ([]byte, error) {
+		c.InvalidateNamespace("x")
+		return []byte("stale"), nil
+	})
+	if err != nil || string(b) != "stale" {
+		t.Fatalf("fetch: %q, %v", b, err)
+	}
+	if n := disk.Stats().Entries; n != 0 {
+		t.Fatalf("%d disk entries under a retired generation", n)
+	}
+	if _, ok := c.Memory.Peek(key); ok {
+		t.Fatal("memory kept a retired generation's value")
 	}
 }

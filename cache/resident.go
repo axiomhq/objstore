@@ -3,7 +3,6 @@ package cache
 import (
 	"strings"
 	"sync"
-	"sync/atomic"
 )
 
 // Resident holds decoded log pages under a byte budget without recency
@@ -19,8 +18,8 @@ import (
 // First come, first kept across namespaces; there are no per-namespace
 // shares.
 type Resident struct {
-	Cap        int
-	Generation atomic.Uint64 // invalidation retires in-flight publications
+	Cap  int
+	gens generations // per namespace; invalidation retires in-flight publications
 
 	mu     sync.Mutex
 	size   int
@@ -48,13 +47,19 @@ func (r *Resident) Get(key string) (any, bool) {
 	return e.value, ok
 }
 
+// GenerationOf is key's namespace generation. Read it before loading key
+// and pass it to Put: an InvalidateNamespace of key's namespace in between
+// makes the publication a no-op. Other namespaces' invalidations do not.
+func (r *Resident) GenerationOf(key string) uint64 { return r.gens.of(key) }
+
 // Put stores the page seq of prefix under key unless the budget is full,
-// the page is already truncated, or an invalidation ran since generation was
-// read. It reports whether value is now resident.
+// the page is already truncated, or key's namespace was invalidated since
+// generation (GenerationOf) was read. It reports whether value is now
+// resident.
 func (r *Resident) Put(prefix string, seq uint64, key string, value any, size int, generation uint64) bool {
 	r.mu.Lock()
 	defer r.mu.Unlock()
-	if generation != r.Generation.Load() || seq <= r.floors[prefix] {
+	if generation != r.gens.of(key) || seq <= r.floors[prefix] {
 		return false
 	}
 	if _, ok := r.items[key]; ok {
@@ -87,7 +92,7 @@ func (r *Resident) DropThrough(prefix string, seq uint64) {
 
 // InvalidateNamespace drops the namespace's pages and truncation floors.
 func (r *Resident) InvalidateNamespace(name string) {
-	r.Generation.Add(1)
+	r.gens.bump(name)
 	ns := "ns/" + name + "/"
 	r.mu.Lock()
 	defer r.mu.Unlock()

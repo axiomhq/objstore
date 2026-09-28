@@ -24,13 +24,15 @@ type Backend struct {
 
 var errUnsupported = fmt.Errorf("fs: unsupported on %s: %w", runtime.GOOS, errors.ErrUnsupported)
 
+var _ objstore.Backend = (*Backend)(nil)
+
 // New returns the file backend for bucket, a directory under root.
 func New(root, bucket string) *Backend {
 	return &Backend{root: filepath.Join(filepath.FromSlash(root), bucket)}
 }
 
-// Open returns a Store over New(root, bucket) with cfg's pacing and
-// write bound.
+// Open returns a Store over New(root, bucket) with cfg's pacing, write
+// bound and encryption.
 func Open(root, bucket string, cfg objstore.Config) *objstore.Store {
 	return objstore.Open(New(root, bucket), cfg)
 }

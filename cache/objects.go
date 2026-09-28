@@ -28,8 +28,12 @@ type Cache struct {
 	WAL    *ByteCache
 	// Resident holds decoded log pages outside the memory budget. New
 	// leaves it empty; replace it with NewResident to give it a budget.
-	Resident     *Resident
-	Disk         *Disk
+	Resident *Resident
+	Disk     *Disk
+	// Logger receives a loader panic with its stack (the caller gets the
+	// panic as an error, without it). Nil logs to slog.Default(). Set it
+	// before first use.
+	Logger       *slog.Logger
 	keys         Keys
 	flight       singleflight.Group // coalesces concurrent loads of one key
 	flightMu     sync.Mutex         // guards flights
@@ -174,8 +178,25 @@ func (c *Cache) Put(ctx context.Context, key string, data []byte) error {
 		return err
 	}
 	memory.Put(key, data, generation)
-	c.Disk.Put(DiskKey(key, generation), data)
+	c.putDisk(memory, key, generation, data)
 	return nil
+}
+
+// putDisk fills the disk tier unless key's namespace was invalidated since
+// generation was read: the entry would sit under a retired disk key that
+// nothing reads again. An invalidation racing the check itself can still
+// leave one such entry; it is unreachable and ages out like any other.
+func (c *Cache) putDisk(memory *ByteCache, key string, generation uint64, data []byte) {
+	if memory.GenerationOf(key) == generation {
+		c.Disk.Put(DiskKey(key, generation), data)
+	}
+}
+
+func (c *Cache) logger() *slog.Logger {
+	if c.Logger == nil {
+		return slog.Default()
+	}
+	return c.Logger
 }
 
 // GateWidth bounds concurrent store GETs (Cache.Gate) so a wide query
@@ -271,7 +292,7 @@ func (c *Cache) fetchCached(ctx context.Context, key string, load func(context.C
 		// where nothing can recover it: convert it into every waiter's error.
 		defer func() {
 			if p := recover(); p != nil {
-				slog.Error("cache: loader panic", "key", key, "panic", p, "stack", string(debug.Stack()))
+				c.logger().Error("cache: loader panic", "key", key, "panic", p, "stack", string(debug.Stack()))
 				v, err = nil, fmt.Errorf("cache: fetch %s: panic: %v", key, p)
 			}
 		}()
@@ -301,7 +322,7 @@ func (c *Cache) fetchCached(ctx context.Context, key string, load func(context.C
 				outcome = DiskHit
 			}
 		} else {
-			c.Disk.Put(flightKey, b)
+			c.putDisk(memory, key, generation, b) // flightKey is DiskKey(key, generation)
 		}
 		memory.Put(key, b, generation)
 		return fetched{b, outcome}, nil

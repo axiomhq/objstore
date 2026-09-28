@@ -7,11 +7,11 @@ import "testing"
 func TestResidentBudgetFloorAndInvalidation(t *testing.T) {
 	r := NewResident(100)
 	const a, b = "ns/a/wal/", "ns/b/wal/"
-	gen := r.Generation.Load()
+	gen, genB := r.GenerationOf(a+"1"), r.GenerationOf(b+"5")
 	if !r.Put(a, 1, a+"1", 1, 60, gen) || r.Put(a, 2, a+"2", 2, 60, gen) {
 		t.Fatal("a page past the budget evicted instead of being refused")
 	}
-	if !r.Put(b, 5, b+"5", 5, 40, gen) || r.Charge() != 100 {
+	if !r.Put(b, 5, b+"5", 5, 40, genB) || r.Charge() != 100 {
 		t.Fatalf("charge %d, want 100", r.Charge())
 	}
 	r.DropThrough(a, 1)
@@ -32,8 +32,12 @@ func TestResidentBudgetFloorAndInvalidation(t *testing.T) {
 		t.Fatal("a publication from before the invalidation was admitted")
 	}
 	// A recreated namespace starts over: its floor went with it.
-	if !r.Put(a, 1, a+"1", 1, 10, r.Generation.Load()) {
+	if !r.Put(a, 1, a+"1", 1, 10, r.GenerationOf(a+"1")) {
 		t.Fatal("a recreated namespace's first page was refused")
+	}
+	// Generations are per namespace: a's invalidation retired nothing of b.
+	if r.GenerationOf(b+"6") != genB || !r.Put(b, 6, b+"6", 6, 10, genB) {
+		t.Fatal("another namespace's invalidation retired b's publication")
 	}
 	if _, ok := r.Get(b + "5"); !ok {
 		t.Fatal("another namespace's page was dropped")

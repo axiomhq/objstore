@@ -16,7 +16,7 @@ import (
 // writes under its own key prefix, so they can run in any order (or
 // -run one alone) against one bucket. s should start empty.
 func Conformance(t *testing.T, s *objstore.Store) {
-	ctx := context.Background()
+	ctx := t.Context()
 	t.Run("ConditionalRead", func(t *testing.T) {
 		key := "conditional-read/obj"
 		if err := s.Put(ctx, key, []byte("first")); err != nil {
@@ -109,6 +109,50 @@ func Conformance(t *testing.T, s *objstore.Store) {
 		if _, err := s.Get(ctx, "pgld/1"); !errors.Is(err, objstore.ErrNotFound) {
 			t.Fatal("delete did not remove object")
 		}
+		// Deleting what is not there is not an error: deletes are retried.
+		if err := s.Delete(ctx, "pgld/1"); err != nil {
+			t.Fatalf("Delete of a missing key: %v", err)
+		}
+	})
+	t.Run("EnsureBucketIdempotent", func(t *testing.T) {
+		for range 2 {
+			if err := s.EnsureBucket(ctx); err != nil {
+				t.Fatalf("EnsureBucket on an existing bucket: %v", err)
+			}
+		}
+	})
+	// A write under a cancelled context reports the cancellation and does
+	// not land.
+	t.Run("CancelledWrites", func(t *testing.T) {
+		cancelled, cancel := context.WithCancel(ctx)
+		cancel()
+		writes := map[string]func(key string) error{
+			"Put": func(key string) error { return s.Put(cancelled, key, []byte("x")) },
+			"PutIfAbsent": func(key string) error {
+				_, err := s.PutIfAbsent(cancelled, key, []byte("x"))
+				return err
+			},
+			"PutIfMatch": func(key string) error {
+				if err := s.Put(ctx, key, []byte("v1")); err != nil {
+					return err
+				}
+				_, etag, err := s.GetWithETag(ctx, key)
+				if err != nil {
+					return err
+				}
+				_, err = s.PutIfMatch(cancelled, key, []byte("x"), etag)
+				return err
+			},
+		}
+		for name, write := range writes {
+			key := "cancelled-write/" + name
+			if err := write(key); !errors.Is(err, context.Canceled) {
+				t.Fatalf("%s under a cancelled ctx: %v, want context.Canceled", name, err)
+			}
+			if got, err := s.Get(ctx, key); err == nil && string(got) == "x" {
+				t.Fatalf("%s under a cancelled ctx landed", name)
+			}
+		}
 	})
 	// The delimited listing discovery runs on: one entry per child prefix,
 	// whatever lives under it, and nothing for an object AT the prefix
@@ -128,10 +172,8 @@ func Conformance(t *testing.T, s *objstore.Store) {
 		if len(got) != 2 || got[0] != "lp/one/" || got[1] != "lp/two/" {
 			t.Fatalf("ListPrefixes = %v, want [lp/one/ lp/two/]", got)
 		}
-		for _, k := range []string{"lp/two/meta"} {
-			if err := s.Delete(ctx, k); err != nil {
-				t.Fatal(err)
-			}
+		if err := s.Delete(ctx, "lp/two/meta"); err != nil {
+			t.Fatal(err)
 		}
 		if got, err = s.ListPrefixes(ctx, "lp/"); err != nil {
 			t.Fatal(err)
@@ -165,20 +207,28 @@ func Conformance(t *testing.T, s *objstore.Store) {
 		if got, want := strings.Join(keys, ","), "page/0,page/a/1,page/a/2,page/b/1,page/c/1,page/z"; got != want {
 			t.Fatalf("paged keys = %q, want %q", got, want)
 		}
-		var prefixes []string
-		for after := ""; ; {
-			page, next, err := s.ListPrefixesPage(ctx, "page/", after, 1)
-			if err != nil || len(page) > 1 {
-				t.Fatalf("ListPrefixesPage: page=%v next=%q err=%v", page, next, err)
+		// Limit 1 splits every page; limit 2 and the maximum let one page
+		// of the underlying listing mix objects (page/0, page/z) with
+		// prefixes, and only the prefixes may come back.
+		for _, limit := range []int{1, 2, objstore.MaxListPage} {
+			var prefixes []string
+			for after := ""; ; {
+				page, next, err := s.ListPrefixesPage(ctx, "page/", after, limit)
+				if err != nil || len(page) > limit {
+					t.Fatalf("ListPrefixesPage(limit %d): page=%v next=%q err=%v", limit, page, next, err)
+				}
+				prefixes = append(prefixes, page...)
+				if next == "" {
+					break
+				}
+				if next <= after {
+					t.Fatalf("ListPrefixesPage(limit %d): cursor did not advance: %q after %q", limit, next, after)
+				}
+				after = next
 			}
-			prefixes = append(prefixes, page...)
-			if next == "" {
-				break
+			if got, want := strings.Join(prefixes, ","), "page/a/,page/b/,page/c/"; got != want {
+				t.Fatalf("paged prefixes (limit %d) = %q, want %q", limit, got, want)
 			}
-			after = next
-		}
-		if got, want := strings.Join(prefixes, ","), "page/a/,page/b/,page/c/"; got != want {
-			t.Fatalf("paged prefixes = %q, want %q", got, want)
 		}
 		for _, limit := range []int{0, -1, objstore.MaxListPage + 1} {
 			if _, _, err := s.ListPage(ctx, "page/", "", limit); err == nil {

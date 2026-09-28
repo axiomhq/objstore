@@ -10,6 +10,7 @@ import (
 	"os"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -261,14 +262,14 @@ func TestLease(t *testing.T) {
 	t.Run("AcquireTwice", func(t *testing.T) {
 		s := storetest.New(t)
 		l := New(s, "twice/lease", "owner-a", time.Minute)
-		if _, err := l.Acquire(ctx); err != nil {
+		if err := l.Acquire(ctx); err != nil {
 			t.Fatal(err)
 		}
-		if _, err := l.Acquire(ctx); err == nil {
+		if err := l.Acquire(ctx); err == nil {
 			t.Fatal("second Acquire on one handle succeeded")
 		}
 		l.Release(ctx)
-		if _, err := l.Acquire(ctx); err == nil {
+		if err := l.Acquire(ctx); err == nil {
 			t.Fatal("Acquire after Release succeeded")
 		}
 	})
@@ -291,7 +292,7 @@ func TestLease(t *testing.T) {
 		cancelled, cancel := context.WithCancel(ctx)
 		cancel()
 		l.Release(cancelled)
-		if err := l.Valid(); !errors.Is(err, ErrNotOwner) {
+		if err := l.Valid(); !errors.Is(err, ErrNotOwner) || !strings.Contains(err.Error(), "released") {
 			t.Fatalf("Release with a dead ctx left the lease valid locally: %v", err)
 		}
 		if cur, _, err := Load(ctx, s, "ctx/lease"); err != nil || cur.Expiry.IsZero() {
@@ -303,6 +304,9 @@ func TestLease(t *testing.T) {
 		var l *Lease
 		if err := l.Valid(); !errors.Is(err, ErrNotOwner) || !strings.HasPrefix(err.Error(), "lease: not held") {
 			t.Fatalf("nil lease: %v", err)
+		}
+		if err := New(nil, "k", "o", 0).Valid(); !errors.Is(err, ErrNotOwner) || strings.Contains(err.Error(), "0001") {
+			t.Fatalf("unacquired lease: %v", err)
 		}
 	})
 }
@@ -478,4 +482,93 @@ func (b *lockedBuffer) String() string {
 	b.mu.Lock()
 	defer b.mu.Unlock()
 	return b.buf.String()
+}
+
+// TestReleaseDuringRenewal: H1. A Release while a renewal PUT is in flight
+// is a deliberate stop: no fence callback, no "lease fenced" log, and the
+// handover still lands on the renewal's nonce, so the next holder takes
+// over at once.
+func TestReleaseDuringRenewal(t *testing.T) {
+	ctx := context.Background()
+	const ttl = 2 * time.Second // renew every 500ms, 1s per attempt
+	s, f := storetest.NewFaulty(t)
+	l, err := Acquire(ctx, s, "rel/lease", "owner-a", ttl)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var logs lockedBuffer
+	l.SetLogger(slog.New(slog.NewTextHandler(&logs, nil)))
+	var fenced atomic.Bool
+	l.Start(func() { fenced.Store(true) })
+	f.Set(storetest.Plan{Op: storetest.OpPutIfMatch, N: 1, Mode: storetest.Pause, Key: "rel/lease"})
+	waitFor(t, func() bool { return f.Fired() == 1 })
+	released := make(chan struct{})
+	go func() { l.Release(ctx); close(released) }()
+	waitFor(t, l.stopped)
+	f.Resume()
+	select {
+	case <-released:
+	case <-time.After(10 * time.Second):
+		t.Fatal("Release hung")
+	}
+	time.Sleep(10 * time.Millisecond) // a callback goroutine would have run by now
+	if fenced.Load() || strings.Contains(logs.String(), "lease fenced") {
+		t.Fatalf("Release fenced the lease: callback=%v logs:\n%s", fenced.Load(), logs.String())
+	}
+	if err := l.Valid(); !errors.Is(err, ErrNotOwner) || !strings.Contains(err.Error(), "released") {
+		t.Fatalf("released lease: %v", err)
+	}
+	if cur, _, err := Load(ctx, s, "rel/lease"); err != nil || !cur.Expiry.IsZero() {
+		t.Fatalf("handover skipped after a renewal landed: %+v %v\n%s", cur, err, logs.String())
+	}
+	b, err := Acquire(ctx, s, "rel/lease", "owner-b", ttl)
+	if err != nil {
+		t.Fatalf("next holder could not take over at once: %v", err)
+	}
+	b.Release(ctx)
+}
+
+// TestReleaseDuringFirstAcquire: M1. A Release racing the first
+// acquisition makes Acquire fail, not succeed on a retired handle, and
+// still hands the landed write back.
+func TestReleaseDuringFirstAcquire(t *testing.T) {
+	ctx := context.Background()
+	s, f := storetest.NewFaulty(t)
+	l := New(s, "rel/first", "owner-a", time.Minute)
+	f.Set(storetest.Plan{Op: storetest.OpPutIfAbsent, N: 1, Mode: storetest.Pause, Key: "rel/first"})
+	acquired := make(chan error, 1)
+	go func() { acquired <- l.Acquire(ctx) }()
+	waitFor(t, func() bool { return f.Fired() == 1 })
+	released := make(chan struct{})
+	go func() { l.Release(ctx); close(released) }()
+	waitFor(t, l.stopped)
+	f.Resume()
+	if err := <-acquired; !errors.Is(err, ErrNotOwner) {
+		t.Fatalf("Acquire racing Release: %v, want ErrNotOwner", err)
+	}
+	<-released
+	if err := l.Valid(); !errors.Is(err, ErrNotOwner) {
+		t.Fatalf("released lease still valid: %v", err)
+	}
+	if cur, _, err := Load(ctx, s, "rel/first"); err != nil || !cur.Expiry.IsZero() {
+		t.Fatalf("handover skipped: %+v %v", cur, err)
+	}
+}
+
+func TestTakeAfterRetire(t *testing.T) {
+	l := New(storetest.New(t), "retired/lease", "owner-a", time.Minute)
+	l.Retire()
+	if err := l.Take(context.Background()); !errors.Is(err, ErrNotOwner) {
+		t.Fatalf("Take on a retired lease: %v", err)
+	}
+}
+
+// waitFor polls cond for up to 10s.
+func waitFor(t *testing.T, cond func() bool) {
+	t.Helper()
+	for deadline := time.Now().Add(10 * time.Second); !cond(); time.Sleep(time.Millisecond) {
+		if time.Now().After(deadline) {
+			t.Fatal("condition never held")
+		}
+	}
 }

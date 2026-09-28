@@ -6,6 +6,7 @@ import (
 	"errors"
 	"fmt"
 	"testing"
+	"time"
 
 	"github.com/axiomhq/objstore/cache"
 	"github.com/axiomhq/objstore/storetest"
@@ -149,7 +150,12 @@ func TestConcurrentColdParentsShareOneGet(t *testing.T) {
 	}
 	r := newReader(t, s, objects, Config{})
 	joined := make(chan struct{}, queries)
-	r.joined = func() { joined <- struct{}{} }
+	r.joined = func() {
+		select {
+		case joined <- struct{}{}:
+		default:
+		}
+	}
 	fault.ResetOps()
 	fault.Set(storetest.Plan{Op: storetest.OpGetRange, Key: object, N: 1, Mode: storetest.Pause})
 	errs := make(chan error, queries)
@@ -200,14 +206,29 @@ func TestSharedParentOutlivesItsLeader(t *testing.T) {
 	}
 	r := newReader(t, s, objects, Config{})
 	joined := make(chan struct{}, 4)
-	r.joined = func() { joined <- struct{}{} }
+	r.joined = func() {
+		select {
+		case joined <- struct{}{}:
+		default:
+		}
+	}
 	fault.Set(storetest.Plan{Op: storetest.OpGetRange, Key: object, N: 1, Mode: storetest.Hang})
 	leaderCtx, cancel := context.WithCancel(t.Context())
 	leader, follower := make(chan error, 1), make(chan error, 1)
 	go func() { _, err := r.FetchRanges(leaderCtx, loads); leader <- err }()
 	<-joined
+	// The flight is registered before its GET starts: wait for the hung GET
+	// itself, or a cancel landing first would let the one-shot Hang fire on
+	// the follower's retry instead.
+	for deadline := time.Now().Add(10 * time.Second); fault.Fired() == 0; time.Sleep(time.Millisecond) {
+		if time.Now().After(deadline) {
+			t.Fatal("the leader's GET never started")
+		}
+	}
 	go func() {
-		ctx, err := r.FetchRanges(t.Context(), loads)
+		fctx, fcancel := context.WithTimeout(t.Context(), 10*time.Second)
+		defer fcancel()
+		ctx, err := r.FetchRanges(fctx, loads)
 		if got, ok := cache.Scoped(ctx, loads[1].Key); err == nil && (!ok || !bytes.Equal(got, whole[12:18])) {
 			err = fmt.Errorf("child = %q", got)
 		}
@@ -230,7 +251,12 @@ func TestSharedParentOutlivesItsLeader(t *testing.T) {
 func TestSharedParentFollowerRetriesTheLeadersError(t *testing.T) {
 	var r Reader
 	joined := make(chan struct{}, 4)
-	r.joined = func() { joined <- struct{}{} }
+	r.joined = func() {
+		select {
+		case joined <- struct{}{}:
+		default:
+		}
+	}
 	x := Extent{Object: "o", Offset: 0, Length: 4}
 	started, release := make(chan struct{}), make(chan struct{})
 	own := errors.New("the leader's own budget")
@@ -350,6 +376,11 @@ func TestTransientLoadsAreDecoded(t *testing.T) {
 	if got, _ := cache.Scoped(ctx, load.Key); err != nil || string(got) != "AB" || calls != 1 {
 		t.Fatalf("direct child: %q %v, decoded %d times", got, err, calls)
 	}
+	// A second stage is served from the cache: no second decode.
+	ctx, err = r.FetchRanges(t.Context(), []Load{load})
+	if got, _ := cache.Scoped(ctx, load.Key); err != nil || string(got) != "AB" || calls != 1 {
+		t.Fatalf("cached child: %q %v, decoded %d times", got, err, calls)
+	}
 }
 
 // TestZeroConfigReader: R2. New with a zero Config gets the defaults, so
@@ -367,8 +398,8 @@ func TestZeroConfigReader(t *testing.T) {
 		t.Fatal(err)
 	}
 	want, _ := (Config{}).Normalized()
-	if r.Config != want {
-		t.Fatalf("Config = %+v, want %+v", r.Config, want)
+	if r.Config() != want {
+		t.Fatalf("Config = %+v, want %+v", r.Config(), want)
 	}
 	load := Load{Extent: Extent{Object: object, Offset: 3, Length: 4}, Key: object + "#zero"}
 	ctx, err := r.FetchRanges(t.Context(), []Load{load})
@@ -427,11 +458,50 @@ func TestInvalidLoadIsErrInvalidExtent(t *testing.T) {
 		{Extent: Extent{Object: "o#x", Offset: 0, Length: 1}, Key: "k"},
 		{Extent: Extent{Object: "", Offset: 0, Length: 1}, Key: "k"},
 		{Extent: Extent{Object: "o", Offset: 0, Length: 1}, Key: "k", DecodedBytes: -1},
+		{Extent: Extent{Object: "o", Offset: 0, Length: 1}},
 	} {
 		_, err := r.FetchRanges(t.Context(), []Load{load})
 		if !errors.Is(err, ErrInvalidExtent) || errors.Is(err, ErrCorrupt) {
 			t.Fatalf("%+v: %v, want ErrInvalidExtent", load, err)
 		}
+	}
+	// One Key naming two extents would serve one child's bytes for both.
+	reused := []Load{
+		{Extent: Extent{Object: "o", Offset: 0, Length: 1}, Key: "k"},
+		{Extent: Extent{Object: "o", Offset: 4, Length: 1}, Key: "k"},
+	}
+	if _, err := r.FetchRanges(t.Context(), reused); !errors.Is(err, ErrInvalidExtent) {
+		t.Fatalf("Key reused with a different extent: %v, want ErrInvalidExtent", err)
+	}
+}
+
+// TestDedupSameKeySameExtent: a Key repeated with its own extent is one
+// child, read once.
+func TestDedupSameKeySameExtent(t *testing.T) {
+	s, fault := storetest.NewFault(storetest.New(t))
+	objects := cache.New(s, 1<<20, nil, cache.Keys{})
+	t.Cleanup(objects.Close)
+	const object = "ns/dedup/object"
+	if err := s.Put(t.Context(), object, []byte("0123456789")); err != nil {
+		t.Fatal(err)
+	}
+	r := newReader(t, s, objects, Config{})
+	load := Load{Extent: Extent{Object: object, Offset: 2, Length: 3}, Key: object + "#d"}
+	fault.ResetOps()
+	ctx, err := r.FetchRanges(t.Context(), []Load{load, load})
+	if got, ok := cache.Scoped(ctx, load.Key); err != nil || !ok || string(got) != "234" {
+		t.Fatalf("dedup: %q %v %v", got, ok, err)
+	}
+	if n := fault.Ops()[storetest.OpGetRange]; n != 1 {
+		t.Fatalf("duplicate load made %d range GETs, want 1", n)
+	}
+}
+
+func TestZeroReaderIsAnError(t *testing.T) {
+	var r Reader
+	load := Load{Extent: Extent{Object: "o", Offset: 0, Length: 1}, Key: "k"}
+	if _, err := r.FetchRanges(t.Context(), []Load{load}); err == nil {
+		t.Fatal("zero Reader ran FetchRanges")
 	}
 }
 

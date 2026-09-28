@@ -9,12 +9,16 @@ import (
 )
 
 // ErrCorrupt marks a read whose bytes cannot be what was asked for: the
-// store returned a range shorter than requested.
+// store returned a range shorter or longer than requested. A conforming
+// backend never does (a range past EOF is objstore.ErrRange, see
+// storetest.Conformance), so ErrCorrupt fires only on a non-conforming
+// store or a truncated transfer.
 var ErrCorrupt = errors.New("rangeread: corrupt")
 
 // ErrInvalidExtent marks caller input that cannot name a byte range: an
 // empty object name, one containing '#', a negative offset, a non-positive
-// length, an end past MaxInt64, or a negative DecodedBytes.
+// length, an end past MaxInt64, a negative DecodedBytes, an empty Load.Key,
+// or one Load.Key given two different extents in one FetchRanges.
 var ErrInvalidExtent = errors.New("rangeread: invalid extent")
 
 // Config bounds physical range coalescing. Zero fields use the defaults

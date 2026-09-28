@@ -406,6 +406,7 @@ func TestNewDiskRemovesStaleDirectories(t *testing.T) {
 		t.Fatal(err)
 	}
 	crashed.Put("ns/a/1", []byte("1"))
+	crashed.lock.Close() // the crash: the lock goes with the process, the directory stays
 	keep := filepath.Join(root, "unrelated")
 	if err := os.Mkdir(keep, 0700); err != nil {
 		t.Fatal(err)
@@ -428,6 +429,85 @@ func TestNewDiskRemovesStaleDirectories(t *testing.T) {
 	entries, _ := os.ReadDir(root)
 	if len(entries) != 1 || entries[0].Name() != "unrelated" {
 		t.Fatalf("root after Wipe and Close: %v", entries)
+	}
+}
+
+// TestTwoDisksShareARoot: a root may host several live Disks. Neither
+// NewDisk sweeps the other's directory, and closing one leaves the other
+// serving; Wipe after Close is a no-op.
+func TestTwoDisksShareARoot(t *testing.T) {
+	if !sweepable {
+		t.Skip("no flock: nothing is swept")
+	}
+	root := t.TempDir()
+	a, err := NewDisk(root, 1<<20)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer a.Close()
+	a.Put("ns/a/1", []byte("from a"))
+	b, err := NewDisk(root, 1<<20)
+	if err != nil {
+		t.Fatal(err)
+	}
+	b.Put("ns/b/1", []byte("from b"))
+	third, err := NewDisk(root, 1<<20) // sweeps again, with both live
+	if err != nil {
+		t.Fatal(err)
+	}
+	third.Close()
+	for _, tc := range []struct {
+		d        *Disk
+		key, val string
+	}{{a, "ns/a/1", "from a"}, {b, "ns/b/1", "from b"}} {
+		if got, ok := tc.d.Get(tc.key); !ok || string(got) != tc.val {
+			t.Fatalf("%s: %q, %v: a live Disk's directory was swept", tc.key, got, ok)
+		}
+	}
+	b.Close()
+	if err := b.Wipe(); err != nil {
+		t.Fatalf("Wipe after Close: %v", err)
+	}
+	b.Close() // idempotent
+	if _, err := os.Stat(b.home); !os.IsNotExist(err) {
+		t.Fatalf("closed Disk's directory: %v", err)
+	}
+	if got, ok := a.Get("ns/a/1"); !ok || string(got) != "from a" {
+		t.Fatalf("closing b cost a its entry: %q, %v", got, ok)
+	}
+	entries, _ := os.ReadDir(root)
+	if len(entries) != 1 || filepath.Join(root, entries[0].Name()) != a.home {
+		t.Fatalf("root holds %v, want only a's directory", entries)
+	}
+}
+
+// TestSweepRacesNewDisk: Disks created while others sweep the same root
+// all survive with their entries.
+func TestSweepRacesNewDisk(t *testing.T) {
+	root := t.TempDir()
+	const n = 8
+	disks := make([]*Disk, n)
+	errs := make([]error, n)
+	var wg sync.WaitGroup
+	for i := range n {
+		wg.Go(func() {
+			if disks[i], errs[i] = NewDisk(root, 1<<20); errs[i] == nil {
+				disks[i].Put("k", []byte{byte(i)})
+			}
+		})
+	}
+	wg.Wait()
+	for i, d := range disks {
+		if errs[i] != nil {
+			t.Fatal(errs[i])
+		}
+		if got, ok := d.Get("k"); !ok || got[0] != byte(i) {
+			t.Fatalf("disk %d lost its entry: %v, %v", i, got, ok)
+		}
+		d.Close()
+	}
+	if entries, _ := os.ReadDir(root); len(entries) != 0 {
+		t.Fatalf("root after closing every Disk: %v", entries)
 	}
 }
 

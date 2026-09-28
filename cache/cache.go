@@ -3,7 +3,9 @@ package cache
 import (
 	"fmt"
 	"hash/maphash"
+	"maps"
 	"math/bits"
+	"reflect"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -93,9 +95,14 @@ var _ sizedDecoded = concreteDecoded{}
 
 // generations counts invalidations per namespace. A key's generation is
 // its namespace's; keys outside ns/<name>/ are always at generation 0.
+//
+// Reads are on the hot path (GenerationOf runs once per cached key a request
+// touches) and bumps are rare, so the map is copy-on-write: of is one atomic
+// load and a map lookup, and bump replaces the map under a mutex that only
+// serializes writers.
 type generations struct {
-	mu   sync.RWMutex
-	gens map[string]uint64
+	mu   sync.Mutex // serializes bump
+	gens atomic.Pointer[map[string]uint64]
 }
 
 // of is key's current generation.
@@ -104,19 +111,22 @@ func (g *generations) of(key string) uint64 {
 	if name == "" {
 		return 0
 	}
-	g.mu.RLock()
-	defer g.mu.RUnlock()
-	return g.gens[name]
+	if m := g.gens.Load(); m != nil {
+		return (*m)[name]
+	}
+	return 0
 }
 
 // bump retires every generation of name read so far.
 func (g *generations) bump(name string) {
 	g.mu.Lock()
 	defer g.mu.Unlock()
-	if g.gens == nil {
-		g.gens = make(map[string]uint64)
+	next := make(map[string]uint64)
+	if m := g.gens.Load(); m != nil {
+		maps.Copy(next, *m)
 	}
-	g.gens[name]++
+	next[name]++
+	g.gens.Store(&next)
 }
 
 // logicalNamespace is the <name> of a logical key under ns/<name>/, or "".
@@ -376,25 +386,26 @@ func (c *ByteCache) PutDecoded(key string, v any, size int, generation uint64) {
 }
 
 // Recharge sets the charge of key's decode to size when that decode is v
-// itself (v is a pointer: identity, not equality), and reports whether it
-// did. A holder of a value that lost a publication race, was evicted or
-// predates the generation is refused, so it cannot re-charge another
-// value's entry. A charge that no longer fits the stripe drops the entry.
+// itself, and reports whether it did. v must be of a comparable type, in
+// practice a pointer (identity, not equality); any other v is refused. A
+// holder of a value that lost a publication race, was evicted or predates
+// the generation is refused, so it cannot re-charge another value's entry.
+// A charge that no longer fits the stripe drops the entry.
 func (c *ByteCache) Recharge(key string, v any, size int, generation uint64) bool {
-	if size <= 0 || v == nil {
+	if size <= 0 || v == nil || !reflect.TypeOf(v).Comparable() {
 		return false
 	}
 	s := c.stripe(key)
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	if generation != c.GenerationOf(key) {
+	if generation != c.gens.of(key) {
 		return false
 	}
 	e, ok := s.items[key]
 	if !ok || e.decoded == nil || e.decoded.decodedValue() != v {
 		return false
 	}
-	if size > s.cap-len(e.val) {
+	if size > s.cap-e.base() {
 		s.remove(e)
 		return false
 	}

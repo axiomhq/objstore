@@ -2,6 +2,7 @@ package wal
 
 import (
 	"context"
+	"encoding/binary"
 	"errors"
 	"fmt"
 	"math/rand"
@@ -9,9 +10,11 @@ import (
 	"runtime"
 	"slices"
 	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 
+	"github.com/axiomhq/objstore"
 	"github.com/axiomhq/objstore/storetest"
 )
 
@@ -259,5 +262,96 @@ func BenchmarkWalk(b *testing.B) {
 				}
 			}
 		})
+	}
+}
+
+// syntheticPages serves pages of size bytes for seq <= last and not-found
+// past it, counting GETs; decodeSynthetic reads the sequence back.
+type syntheticPages struct {
+	last, size    uint64
+	gets, missing atomic.Int64
+	missDelay     time.Duration
+}
+
+func (p *syntheticPages) get(ctx context.Context, key string) ([]byte, error) {
+	seq, err := SeqFromKey(key)
+	if err != nil {
+		return nil, err
+	}
+	if seq > p.last {
+		p.missing.Add(1)
+		time.Sleep(p.missDelay)
+		return nil, objstore.ErrNotFound
+	}
+	p.gets.Add(1)
+	b := make([]byte, p.size)
+	binary.BigEndian.PutUint64(b, seq)
+	return b, nil
+}
+
+func decodeSynthetic(b []byte) (Header, int, error) {
+	return Header{Seq: binary.BigEndian.Uint64(b)}, len(b), nil
+}
+
+// TestWalkParallelBoundsRetainedBytes: with the visitor stalled on the
+// first page, a walk holds the pages whose permits fill the pool and at
+// most window = workers more fetched pages waiting for one; that is, what
+// it retains is at most the pool plus window × maxPageBytes.
+func TestWalkParallelBoundsRetainedBytes(t *testing.T) {
+	const workers = 8
+	const size = 4 << 20                                   // wire bytes; a permit is 4x
+	const permitted = int64(maxInFlightBytes / (4 * size)) // pages the pool holds at once
+	pages := &syntheticPages{last: 100, size: size}
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	stalled, resume := make(chan struct{}), make(chan struct{})
+	done := make(chan error, 1)
+	go func() {
+		first := true
+		done <- WalkParallelWithGet(ctx, pages.get, testPrefix, 0, 0, workers, decodeSynthetic, nil, func(Entry[int]) error {
+			if first {
+				first = false
+				close(stalled)
+				<-resume
+			}
+			return nil
+		})
+	}()
+	<-stalled
+	// Let the walk run as far ahead as it can.
+	for last := int64(-1); ; {
+		time.Sleep(50 * time.Millisecond)
+		n := pages.gets.Load()
+		if n == last {
+			break
+		}
+		last = n
+	}
+	if got, bound := pages.gets.Load(), permitted+workers; got > bound {
+		t.Fatalf("%d pages fetched with the visitor stalled on the first; want at most %d (pool %d + window %d)", got, bound, permitted, workers)
+	}
+	close(resume)
+	cancel()
+	if err := <-done; !errors.Is(err, context.Canceled) {
+		t.Fatal(err)
+	}
+}
+
+// TestWalkParallelTailCost: an unbounded walk spends at most window (=
+// workers) not-found GETs past the end of the log, even when those GETs
+// are slow enough for every worker to start one.
+func TestWalkParallelTailCost(t *testing.T) {
+	const workers = 8
+	pages := &syntheticPages{last: 3, size: 16, missDelay: 20 * time.Millisecond}
+	visits := 0
+	err := WalkParallelWithGet(context.Background(), pages.get, testPrefix, 0, 0, workers, decodeSynthetic, nil, func(Entry[int]) error {
+		visits++
+		return nil
+	})
+	if err != nil || visits != 3 {
+		t.Fatalf("visits %d, err %v", visits, err)
+	}
+	if n := pages.missing.Load(); n < 1 || n > workers {
+		t.Fatalf("%d not-found GETs past the end, want 1..%d", n, workers)
 	}
 }

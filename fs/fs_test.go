@@ -138,9 +138,6 @@ func TestFSSyncDirsDecision(t *testing.T) {
 	}
 }
 
-// TestFSGetRangeEdges pins the range contract at EOF: a read ending exactly
-// at the last byte succeeds, one byte past it is objstore.ErrRange before any read,
-// and a zero-length read at EOF is empty and error-free.
 // TestFSWritesBackInChunks: objects around and past writeBackChunk, which
 // writeTemp writes back a chunk at a time, publish byte for byte through
 // Put, PutIfAbsent and PutIfMatch, urgent or not, and leave no temp file
@@ -196,6 +193,9 @@ func TestFSWritesBackInChunks(t *testing.T) {
 	}
 }
 
+// TestFSGetRangeEdges pins the range contract at EOF: a read ending exactly
+// at the last byte succeeds, one byte past it is objstore.ErrRange before any read,
+// and a zero-length read at EOF is empty and error-free.
 func TestFSGetRangeEdges(t *testing.T) {
 	f := New(t.TempDir(), "b")
 	ctx := context.Background()

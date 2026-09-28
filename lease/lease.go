@@ -64,11 +64,15 @@ type Lease struct {
 	owner string
 	ttl   time.Duration
 
-	mu       sync.Mutex
-	log      *slog.Logger // renewal failures and fences; nil is silent
-	started  bool         // a renewal goroutine was started; it closes done
-	nonce    string       // last attributed acquisition/renewal; owner alone is not continuity
-	deadline time.Time    // LOCAL clock: this process stops serving here
+	mu  sync.Mutex
+	log *slog.Logger // renewal failures, fences and handovers; nil is silent
+	// started: Acquire has begun, so either Acquire itself (its Take failed,
+	// or the lease was retired under it) or the renewal goroutine it starts
+	// closes done. retire closes done only when started is false.
+	started  bool
+	released bool      // Release was called: Valid refuses from here on
+	nonce    string    // last attributed acquisition/renewal; owner alone is not continuity
+	deadline time.Time // LOCAL clock: this process stops serving here
 	// pending is every write attempt whose answer was lost, by nonce, with
 	// the time it started: a record later found in our name with one of
 	// these nonces is that write landing late, and it is ours.
@@ -96,12 +100,17 @@ type Lease struct {
 // later, via Start. Every failure path between the two owes the lease a
 // Release. A ttl <= 0 means DefaultTTL.
 func Acquire(ctx context.Context, s Store, key, owner string, ttl time.Duration) (*Lease, error) {
-	return New(s, key, owner, ttl).Acquire(ctx)
+	l := New(s, key, owner, ttl)
+	if err := l.Acquire(ctx); err != nil {
+		return nil, err
+	}
+	return l, nil
 }
 
 // New returns an unacquired lease on key. Take drives it by hand (no
 // renewal goroutine); Acquire takes it and starts renewing. A ttl <= 0
-// means DefaultTTL.
+// means DefaultTTL. A handle carries one acquisition: to retry a failed
+// Acquire, call New(...).Acquire again.
 func New(s Store, key, owner string, ttl time.Duration) *Lease {
 	if ttl <= 0 {
 		ttl = DefaultTTL
@@ -111,26 +120,31 @@ func New(s Store, key, owner string, ttl time.Duration) *Lease {
 
 // Acquire takes l and starts its renewal goroutine. It returns an error,
 // and does not touch the store, on a lease that was already acquired or
-// has been retired or released: a handle carries one acquisition.
-func (l *Lease) Acquire(ctx context.Context) (*Lease, error) {
+// has been retired or released: a handle carries one acquisition. A lease
+// retired or released while Acquire runs is ErrNotOwner, never a success.
+func (l *Lease) Acquire(ctx context.Context) error {
 	l.mu.Lock()
 	if l.started || l.stopped() {
 		l.mu.Unlock()
-		return nil, fmt.Errorf("lease %s: Acquire called twice, or after Retire; use a fresh New", l.key)
+		return fmt.Errorf("lease %s: Acquire called twice, or after Retire; use a fresh New", l.key)
 	}
 	l.started = true
 	l.mu.Unlock()
-	if err := l.Take(ctx); err != nil {
-		l.mu.Lock()
+	err := l.Take(ctx)
+	l.mu.Lock()
+	defer l.mu.Unlock()
+	if err == nil && l.stopped() {
+		err = fmt.Errorf("%w: %s was released or retired during Acquire", ErrNotOwner, l.key)
+	}
+	if err != nil {
 		l.started = false
 		if l.stopped() { // retired meanwhile, expecting a renewer to close done
 			l.finish()
 		}
-		l.mu.Unlock()
-		return nil, err
+		return err
 	}
 	go l.renew()
-	return l, nil
+	return nil
 }
 
 // SetLogger directs renewal failures and fences to log; nil (the default)
@@ -160,8 +174,11 @@ func (l *Lease) stopped() bool {
 // finish closes done, once, whichever path ends the lease.
 func (l *Lease) finish() { l.doneOnce.Do(func() { close(l.done) }) }
 
-// Start installs the fence callback, running it immediately if the lease
-// was already lost in the meantime. Call it once, after Acquire.
+// Start installs the fence callback, running it immediately (on the
+// caller's goroutine) if the lease was already lost in the meantime. Call
+// it once, after Acquire. A later fence runs the callback on a goroutine of
+// its own, so the callback may call anything on the lease, Release and
+// Retire included. A Release or Retire never runs it.
 func (l *Lease) Start(fence func()) {
 	l.mu.Lock()
 	l.fence = fence
@@ -189,6 +206,9 @@ func (l *Lease) CheckHeadOnRenewal(check func(context.Context) error) {
 // (proven somebody else's), anything else (unresolved: retry, never
 // assume).
 func (l *Lease) Take(ctx context.Context) error {
+	if l.stopped() {
+		return fmt.Errorf("%w: %s was released or retired in this process", ErrNotOwner, l.key)
+	}
 	l.mu.Lock()
 	nonce, deadline, fenced := l.nonce, l.deadline, l.fenced
 	l.mu.Unlock()
@@ -320,6 +340,10 @@ func (l *Lease) pendingStart(nonce string) (time.Time, bool) {
 	return start, ok
 }
 
+// hold records a landed write. A write that landed while the lease was
+// being released or retired still records its nonce, so Release's
+// handover CAS finds it, but it does not extend the local deadline and
+// reports ErrNotOwner: the process has already let go.
 func (l *Lease) hold(start time.Time, nonce string) error {
 	l.mu.Lock()
 	defer l.mu.Unlock()
@@ -328,8 +352,11 @@ func (l *Lease) hold(start time.Time, nonce string) error {
 		return fmt.Errorf("%w: %s acquisition completed after its validity interval", ErrNotOwner, l.key)
 	}
 	l.nonce = nonce
-	l.deadline = start.Add(l.ttl)
 	l.pending = nil // every earlier attempt is superseded by this one
+	if l.released || l.stopped() {
+		return fmt.Errorf("%w: %s was released or retired while this write was in flight", ErrNotOwner, l.key)
+	}
+	l.deadline = start.Add(l.ttl)
 	return nil
 }
 
@@ -344,8 +371,14 @@ func (l *Lease) Valid() error {
 	}
 	l.mu.Lock()
 	defer l.mu.Unlock()
+	if l.released {
+		return fmt.Errorf("%w: %s was released in this process; a fresh acquisition is needed", ErrNotOwner, l.key)
+	}
 	if l.fenced {
 		return fmt.Errorf("%w: %s was fenced in this process; a fresh acquisition is needed", ErrNotOwner, l.key)
+	}
+	if l.deadline.IsZero() {
+		return fmt.Errorf("%w: %s was never acquired by this handle", ErrNotOwner, l.key)
 	}
 	now := time.Now()
 	if !Before(now, now.Round(0), l.deadline) {
@@ -387,7 +420,9 @@ func (l *Lease) renew() {
 		// resume serving state missing those writes. Only a fresh
 		// acquisition, followed by the caller's catch-up, may pick it back up.
 		if err := l.Valid(); err != nil {
-			l.fenceFor(err)
+			if !l.stopped() {
+				l.fenceFor(err)
+			}
 			return
 		}
 		// Bounded: a hung store makes a renewal unresolved, never a pinned
@@ -402,18 +437,20 @@ func (l *Lease) renew() {
 			t0 := time.Now()
 			err = l.Take(ctx)
 			cancel()
-			if err == nil {
-				break
+			if err == nil || errors.Is(err, ErrNotOwner) {
+				break // a refusal is logged once, as the fence below
 			}
 			if log := l.logger(); log != nil {
 				log.Warn("lease renewal failed", "key", l.key, "attempt", attempt+1, "took", time.Since(t0).Round(time.Millisecond), "err", err)
 			}
-			if errors.Is(err, ErrNotOwner) {
-				break
-			}
 		}
 		if err == nil {
 			continue
+		}
+		// Released or retired while the renewal ran: a deliberate stop,
+		// not a lost lease. Never fence it.
+		if l.stopped() {
+			return
 		}
 		if errors.Is(err, ErrNotOwner) {
 			l.fenceFor(err)
@@ -427,10 +464,13 @@ func (l *Lease) renew() {
 }
 
 // Fence retires the lease in this process for good: Valid refuses until a
-// fresh acquisition. The fence callback runs once, on the first Fence.
+// fresh acquisition. The fence callback runs once, on the first Fence, on
+// a goroutine of its own.
 func (l *Lease) Fence() { l.fenceFor(errors.New("fenced by caller")) }
 
-// fenceFor is Fence with the reason logged at Warn.
+// fenceFor is Fence with the reason logged at Warn. The callback runs on
+// its own goroutine: it may Release, which waits for the renewer, which
+// may be the caller here.
 func (l *Lease) fenceFor(reason error) {
 	l.mu.Lock()
 	already, fn, log := l.fenced, l.fence, l.log
@@ -443,27 +483,28 @@ func (l *Lease) fenceFor(reason error) {
 		log.Warn("lease fenced", "key", l.key, "owner", l.owner, "reason", reason)
 	}
 	if fn != nil {
-		fn()
+		go fn()
 	}
 }
 
 // Retire stops renewing without touching the object. The lease then simply
 // expires for whoever wants it next. It waits for a running renewal
-// goroutine to exit (at most about one TTL), so never call it from the
-// fence callback. A nil lease is a no-op.
+// goroutine to exit (at most about one TTL). A nil lease is a no-op.
 func (l *Lease) Retire() {
 	if l == nil {
 		return
 	}
-	l.retire()
+	l.retire(false)
 	<-l.done
 }
 
 // retire stops renewal and, when no renewer was ever started, ends the
-// lease itself. It does not wait.
-func (l *Lease) retire() {
+// lease itself. released also marks it released, so Valid refuses at once.
+// It does not wait.
+func (l *Lease) retire(released bool) {
 	l.mu.Lock()
 	l.interrupted = true
+	l.released = l.released || released
 	l.stopOnce.Do(func() { close(l.stop) })
 	if !l.started {
 		l.finish()
@@ -509,41 +550,63 @@ func (l *Lease) FloorProven() {
 // just means the lease expires on its own. If ctx ends while the renewal
 // goroutine is still finishing an attempt, Release stops the lease locally
 // and skips the handover. The ETag CAS is what makes it safe to call on a
-// lease we may have already lost. A nil lease is a no-op.
+// lease we may have already lost. A skipped or failed handover is logged
+// (SetLogger). Release never runs the fence callback. A nil lease is a
+// no-op.
 func (l *Lease) Release(ctx context.Context) {
 	if l == nil {
 		return
 	}
-	l.retire()
 	// Local first, and unconditionally: having promised the lease to
 	// whoever takes it next, this process must stop acting on it now, not
-	// when the deadline it last renewed happens to run out. A renewal still
-	// in flight cannot undo this: hold refuses a lapsed deadline.
-	l.mu.Lock()
-	l.deadline = time.Time{}
-	l.mu.Unlock()
+	// when the deadline it last renewed happens to run out. Valid refuses
+	// a released lease; a renewal still in flight records its nonce (so the
+	// handover below finds it) but cannot revive the lease.
+	l.retire(true)
+	log := l.logger()
 	select {
 	case <-l.done:
 	case <-ctx.Done():
+		if log != nil {
+			log.Warn("lease handover skipped: renewal still finishing", "key", l.key, "owner", l.owner, "err", ctx.Err())
+		}
 		return
 	}
 	l.mu.Lock()
 	nonce := l.nonce
 	l.mu.Unlock()
+	if nonce == "" {
+		return // never held: nothing to hand over
+	}
 	// Urgent like Take: the handover must not queue behind bulk writes, or
 	// the next holder waits the TTL instead of taking over now.
 	ctx, cancel := context.WithTimeout(objstore.Urgent(ctx), l.ttl)
 	defer cancel()
 	cur, etag, err := Load(ctx, l.store, l.key)
-	if err != nil || etag == "" || cur.Owner != l.owner || cur.Nonce != nonce {
+	if err != nil {
+		if log != nil {
+			log.Warn("lease handover failed", "key", l.key, "owner", l.owner, "err", err)
+		}
+		return
+	}
+	if etag == "" || cur.Owner != l.owner || cur.Nonce != nonce {
+		if log != nil {
+			log.Info("lease handover skipped: no longer ours", "key", l.key, "owner", l.owner, "holder", cur.Owner)
+		}
 		return
 	}
 	cur.Expiry = time.Time{}
 	data, err := json.Marshal(cur)
-	if err != nil {
-		return
+	if err == nil {
+		var ok bool
+		ok, err = l.store.PutIfMatch(ctx, l.key, data, etag)
+		if err == nil && !ok {
+			err = errors.New("lease changed before the handover CAS")
+		}
 	}
-	l.store.PutIfMatch(ctx, l.key, data, etag) //nolint:errcheck // best effort by contract
+	if err != nil && log != nil {
+		log.Warn("lease handover failed", "key", l.key, "owner", l.owner, "err", err)
+	}
 }
 
 // Load reads the lease object and its ETag. A missing lease is (zero, "",

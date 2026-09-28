@@ -28,13 +28,21 @@ func BenchmarkSplitBatch(b *testing.B) {
 		}
 		records[i] = r
 	}
-	batch := &batch[Bytes]{records: records, nonce: "benchmark"}
-	b.SetBytes(rows * size)
-	b.ReportAllocs()
-	for b.Loop() {
-		if _, err := splitBatch(1, batch); err != nil {
-			b.Fatal(err)
-		}
+	for _, bc := range []struct {
+		name      string
+		pageLimit int // zero: one page
+		pages     int
+	}{{"single-page", 0, 1}, {"multi-page", 64 << 10, 9}} {
+		b.Run(bc.name, func(b *testing.B) {
+			batch := &batch[Bytes]{records: records, nonce: "benchmark", pageLimit: bc.pageLimit}
+			b.SetBytes(rows * size)
+			b.ReportAllocs()
+			for b.Loop() {
+				if pages, _, err := splitBatch(1, batch); err != nil || len(pages) != bc.pages {
+					b.Fatal(len(pages), err)
+				}
+			}
+		})
 	}
 }
 

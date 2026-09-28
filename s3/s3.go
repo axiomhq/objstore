@@ -77,8 +77,8 @@ func endpointAllowed(endpoint string, allowed []string) bool {
 	return slices.Contains(allowed, u.String())
 }
 
-// Open returns a Store over New(ctx, cfg) with ocfg's pacing and write
-// bound.
+// Open returns a Store over New(ctx, cfg) with ocfg's pacing, write bound
+// and encryption.
 func Open(ctx context.Context, cfg Config, ocfg objstore.Config) (*objstore.Store, error) {
 	b, err := New(ctx, cfg)
 	if err != nil {

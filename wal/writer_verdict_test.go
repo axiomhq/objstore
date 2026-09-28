@@ -1,8 +1,10 @@
 package wal
 
 import (
+	"bytes"
 	"context"
 	"errors"
+	"fmt"
 	"slices"
 	"strings"
 	"sync"
@@ -199,7 +201,7 @@ func TestLostRaceLatches(t *testing.T) {
 		if ops := f.Ops(); len(ops) != 0 {
 			t.Fatalf("a latched writer touched the store: %v", ops)
 		}
-		if st := w.Stats(); !st.Lost || st.LostRace != 1 || st.Pending != 0 {
+		if st := w.Stats(); !st.Lost || !errors.Is(st.Terminal, ErrLostRace) || st.LostRace != 1 || st.Pending != 0 {
 			t.Fatalf("stats: %+v", st)
 		}
 	})
@@ -298,8 +300,11 @@ func TestPartialBatchAdvancesPastLandedPages(t *testing.T) {
 		}
 		assertMarkerThen(t, s, "theirs")
 	})
+	// A covered floor is terminal: the writer cannot know the next sequence,
+	// and a later batch could land under the watermark (acknowledged, never
+	// replayed) or contend with its own landed page.
 	t.Run("floor", func(t *testing.T) {
-		s := storetest.New(t)
+		s, f := storetest.NewFaulty(t)
 		w := NewWriter[Bytes](s, testPrefix, 1, nil, WithCommitInterval(MinCommitInterval))
 		defer w.Close()
 		var mu sync.Mutex
@@ -315,10 +320,20 @@ func TestPartialBatchAdvancesPastLandedPages(t *testing.T) {
 		if err := w.Append(ctx, records); !errors.Is(err, ErrUnresolved) {
 			t.Fatalf("append: %v, want ErrUnresolved", err)
 		}
-		if err := w.Append(ctx, rows("next")); err != nil {
-			t.Fatalf("the next batch contended with the writer's own page: %v", err)
+		f.ResetOps()
+		if err := w.Append(ctx, rows("next")); !errors.Is(err, ErrUnresolved) || !strings.Contains(err.Error(), "watermark") {
+			t.Fatalf("append after a covered floor: %v, want the latched ErrUnresolved", err)
 		}
-		assertMarkerThen(t, s, "next")
+		if ops := f.Ops(); len(ops) != 0 {
+			t.Fatalf("a terminal writer touched the store: %v", ops)
+		}
+		if st := w.Stats(); st.Lost || !errors.Is(st.Terminal, ErrUnresolved) {
+			t.Fatalf("stats: %+v", st)
+		}
+		entries, err := replay(ctx, s, testPrefix, 0)
+		if err != nil || len(entries) != 1 || entries[0].Seq != 1 || !entries[0].Incomplete {
+			t.Fatalf("replay: %+v, %v; want the landed page as an incomplete batch", entries, err)
+		}
 	})
 }
 
@@ -361,5 +376,173 @@ func TestWriteErrorIsAnError(t *testing.T) {
 	var err error = WriteError{At: time.Unix(0, 0).UTC(), Op: "put", Key: "log/1", Err: errBoom}
 	if !errors.Is(err, errBoom) || !strings.Contains(err.Error(), "put log/1") {
 		t.Fatalf("%v", err)
+	}
+}
+
+// TestStatsDuringDroppedRecordCommit: dropping a bad record's call from a
+// batch updates the batch's records and bytes under the writer's lock, so
+// Stats (and Enqueue's admission) polled throughout never race with the
+// commit (run under -race), and the dropped records stop counting.
+func TestStatsDuringDroppedRecordCommit(t *testing.T) {
+	s, f := storetest.NewFaulty(t)
+	w := NewWriter[testRecord](s, testPrefix, 1, nil, WithCommitInterval(MinCommitInterval))
+	defer w.Close()
+	first, release := wedge(t, w, f)
+	ctx := context.Background()
+	good, err := w.Enqueue(ctx, []testRecord{{b: "good"}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	bad, err := w.Enqueue(ctx, []testRecord{{b: "x"}, {b: "y", fail: true}, {b: "z"}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	stop := make(chan struct{})
+	var wg sync.WaitGroup
+	wg.Go(func() {
+		for {
+			select {
+			case <-stop:
+				return
+			default:
+			}
+			if st := w.Stats(); st.Pending > 5 || st.UnackedBytes < 0 {
+				t.Errorf("stats: %+v", st)
+				return
+			}
+			// Enqueue reads the in-flight batch too; an empty one is a no-op.
+			if _, err := w.Enqueue(ctx, nil); err != nil {
+				t.Error(err)
+				return
+			}
+		}
+	})
+	release()
+	errFirst, errGood, errBad := <-first, <-good, <-bad
+	close(stop)
+	wg.Wait()
+	if errFirst != nil || errGood != nil || !errors.Is(errBad, ErrInvalidRecord) {
+		t.Fatalf("verdicts: first %v, good %v, bad %v", errFirst, errGood, errBad)
+	}
+	if st := w.Stats(); st.Pending != 0 || st.UnackedBytes != 0 {
+		t.Fatalf("stats after the commit: %+v", st)
+	}
+}
+
+// TestEnqueueRefusesBatchPastUnackedBound: an append that alone exceeds a
+// bound can never be admitted, so it is ErrRecordTooLarge, not the
+// retryable ErrOverloaded, and it is not counted as shed load.
+func TestEnqueueRefusesBatchPastUnackedBound(t *testing.T) {
+	w := NewWriter[testRecord](storetest.New(t), testPrefix, 1, nil)
+	defer w.Close()
+	huge := []testRecord{{size: 50 << 20}, {size: 50 << 20}, {size: 50 << 20}} // each fits a page; together past the byte bound
+	if _, err := w.Enqueue(context.Background(), huge); !errors.Is(err, ErrRecordTooLarge) || errors.Is(err, ErrOverloaded) ||
+		!strings.Contains(err.Error(), "batch exceeds the unacked bound") {
+		t.Fatalf("past the byte bound: %v, want ErrRecordTooLarge", err)
+	}
+	w.SetMaxUnacked(2)
+	if _, err := w.Enqueue(context.Background(), []testRecord{{b: "1"}, {b: "2"}, {b: "3"}}); !errors.Is(err, ErrRecordTooLarge) {
+		t.Fatalf("past the record bound: %v, want ErrRecordTooLarge", err)
+	}
+	if st := w.Stats(); st.Rejected != 0 || st.Pending != 0 {
+		t.Fatalf("stats: %+v", st)
+	}
+}
+
+// splitCalls builds a batch of calls, each a group of records, and splits
+// it; want is the records of the calls that encode.
+func splitCalls(t *testing.T, pageLimit int, groups ...[]testRecord) (pages [][]byte, kept []testRecord, b *batch[testRecord]) {
+	t.Helper()
+	b = &batch[testRecord]{nonce: "nonce", at: time.UnixMilli(1234).UTC(), pageLimit: pageLimit}
+	for _, g := range groups {
+		b.records = append(b.records, g...)
+		b.calls = append(b.calls, call{n: len(g)})
+	}
+	pages, kept, err := splitBatch(7, b)
+	if err != nil {
+		t.Fatal(err)
+	}
+	return pages, kept, b
+}
+
+// checkPages decodes pages, checks each is exactly what Encode writes for
+// its header and records, and that together they carry want in order.
+func checkPages(t *testing.T, pages [][]byte, want []testRecord) {
+	t.Helper()
+	var got []string
+	for i, page := range pages {
+		h, recs, err := Decode(page)
+		if err != nil {
+			t.Fatalf("page %d: %v", i, err)
+		}
+		if h.Seq != 7+uint64(i) || h.BatchIndex != uint64(i) || (len(pages) > 1 && h.BatchPages != uint64(len(pages))) {
+			t.Fatalf("page %d header: %+v", i, h)
+		}
+		if canonical, _ := Encode(h, pageRecords(recs)); !bytes.Equal(canonical, page) {
+			t.Fatalf("page %d differs from Encode", i)
+		}
+		for _, r := range recs {
+			got = append(got, string(r))
+		}
+	}
+	var wantIDs []string
+	for _, r := range want {
+		wantIDs = append(wantIDs, r.b)
+	}
+	if !slices.Equal(got, wantIDs) {
+		t.Fatalf("pages carry %d records, want %d", len(got), len(wantIDs))
+	}
+}
+
+func named(prefix string, n, size int) []testRecord {
+	out := make([]testRecord, n)
+	for i := range out {
+		id := fmt.Sprintf("%s-%d-", prefix, i)
+		out[i] = testRecord{b: id + strings.Repeat("x", max(size-len(id), 0))}
+	}
+	return out
+}
+
+// TestSplitBatchDropShrinksCountVarint: 200 records need a two-byte count;
+// dropping a call leaves 100, a one-byte count. The page is still exactly
+// what Encode writes.
+func TestSplitBatchDropShrinksCountVarint(t *testing.T) {
+	good := named("good", 100, 8)
+	bad := append(named("bad", 99, 8), testRecord{b: "boom", fail: true})
+	pages, kept, b := splitCalls(t, 0, good, bad)
+	if len(pages) != 1 || len(kept) != 100 || len(b.records) != 200 {
+		t.Fatalf("%d pages, %d kept, batch now %d records (want 1, 100, and the batch untouched)", len(pages), len(kept), len(b.records))
+	}
+	if !errors.Is(b.calls[1].err, ErrInvalidRecord) || b.calls[0].err != nil {
+		t.Fatalf("call verdicts: %v, %v", b.calls[0].err, b.calls[1].err)
+	}
+	checkPages(t, pages, good)
+}
+
+// TestSplitBatchDropInsideMultiPageBatch: a dropped call in the middle of
+// a batch that spans several pages leaves canonical pages carrying the
+// other calls' records in order.
+func TestSplitBatchDropInsideMultiPageBatch(t *testing.T) {
+	a, c := named("a", 6, 1000), named("c", 6, 1000)
+	bad := append(named("b", 3, 1000), testRecord{b: "boom", size: 7}) // Size disagrees with AppendTo
+	pages, kept, _ := splitCalls(t, 4096, a, bad, c)
+	if len(pages) < 3 || len(kept) != 12 {
+		t.Fatalf("%d pages, %d kept; want several pages and 12 records", len(pages), len(kept))
+	}
+	checkPages(t, pages, append(slices.Clone(a), c...))
+}
+
+// TestSplitBatchRefusesRecordLargerThanAnyPage: a record past every
+// page's budget fails the batch before any page exists, wherever it sits.
+func TestSplitBatchRefusesRecordLargerThanAnyPage(t *testing.T) {
+	for name, at := range map[string]int{"first": 0, "middle": 2, "last": 4} {
+		t.Run(name, func(t *testing.T) {
+			records := named("r", 5, 100)
+			records[at] = testRecord{b: strings.Repeat("h", 2000)}
+			b := &batch[testRecord]{records: records, nonce: "nonce", pageLimit: 1024}
+			if pages, _, err := splitBatch(7, b); !errors.Is(err, ErrRecordTooLarge) || pages != nil {
+				t.Fatalf("%d pages, %v; want ErrRecordTooLarge and no pages", len(pages), err)
+			}
+		})
 	}
 }

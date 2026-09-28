@@ -1,7 +1,6 @@
 package gcs
 
 import (
-	"bytes"
 	"context"
 	"errors"
 	"fmt"
@@ -60,8 +59,8 @@ func New(ctx context.Context, cfg Config) (*Backend, error) {
 	return &Backend{bucket: client.Bucket(cfg.Bucket), name: cfg.Bucket, project: cfg.ProjectID}, nil
 }
 
-// Open returns a Store over New(ctx, cfg) with ocfg's pacing and write
-// bound.
+// Open returns a Store over New(ctx, cfg) with ocfg's pacing, write bound
+// and encryption.
 func Open(ctx context.Context, cfg Config, ocfg objstore.Config) (*objstore.Store, error) {
 	b, err := New(ctx, cfg)
 	if err != nil {
@@ -147,22 +146,40 @@ func (g *Backend) PutIfMatch(ctx context.Context, key string, data []byte, etag 
 }
 
 // readAll drains r and proves the object arrived whole: a truncated body
-// must be a named error, never a silent prefix.
+// must be a named error, never a silent prefix. Like s3's readBody it reads
+// into one exact-size buffer, so no slack stays pinned on the result.
 func readAll(op, key string, r *storage.Reader) ([]byte, error) {
 	defer r.Close()
 	size := r.Attrs.Size
-	var buf bytes.Buffer
-	if size > 0 && size <= 64<<20 {
-		// ReadFrom needs MinRead slack for its final EOF read.
-		buf.Grow(int(size) + bytes.MinRead)
+	if size < 0 || size > 64<<20 {
+		// Cap speculative allocation: a bogus size must not cause an
+		// enormous make.
+		data, err := io.ReadAll(r)
+		if err != nil {
+			return nil, objstore.OpErr(op, key, err)
+		}
+		if int64(len(data)) != size {
+			return nil, objstore.OpErr(op, key, fmt.Errorf("short read: got %d bytes, object size is %d", len(data), size))
+		}
+		return data, nil
 	}
-	if _, err := buf.ReadFrom(r); err != nil {
+	data := make([]byte, size)
+	n, err := io.ReadFull(r, data)
+	if errors.Is(err, io.ErrUnexpectedEOF) || errors.Is(err, io.EOF) {
+		return nil, objstore.OpErr(op, key, fmt.Errorf("short read: got %d bytes, object size is %d", n, size))
+	}
+	if err != nil {
 		return nil, objstore.OpErr(op, key, err)
 	}
-	if int64(buf.Len()) != size {
-		return nil, objstore.OpErr(op, key, fmt.Errorf("short read: got %d bytes, object size is %d", buf.Len(), size))
+	// Read on to EOF: the client validates its checksum there, and a body
+	// longer than the size is as wrong as a short one.
+	var extra [1]byte
+	if _, err := io.ReadFull(r, extra[:]); err == nil {
+		return nil, objstore.OpErr(op, key, fmt.Errorf("long read: body exceeds object size %d", size))
+	} else if !errors.Is(err, io.EOF) {
+		return nil, objstore.OpErr(op, key, err)
 	}
-	return buf.Bytes(), nil
+	return data, nil
 }
 
 func (g *Backend) get(ctx context.Context, op, key string) ([]byte, string, error) {
@@ -279,10 +296,18 @@ func (g *Backend) ListPage(ctx context.Context, prefix, after string, limit int)
 		if attrs.Name <= after {
 			continue
 		}
-		if len(keys) == limit {
-			return keys, keys[len(keys)-1], nil
-		}
 		keys = append(keys, attrs.Name)
+		if len(keys) == limit {
+			// Buffered items all sort after after, and a page token means
+			// the server has more: either proves another page without
+			// fetching one more item, which at limit == MaxListPage
+			// (the server's page cap) would cost a second request.
+			pi := it.PageInfo()
+			if pi.Remaining() > 0 || pi.Token != "" {
+				return keys, keys[len(keys)-1], nil
+			}
+			return keys, "", nil
+		}
 	}
 }
 

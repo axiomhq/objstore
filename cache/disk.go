@@ -9,6 +9,7 @@ import (
 	"fmt"
 	"hash/crc32"
 	"io"
+	"io/fs"
 	"log/slog"
 	"maps"
 	"os"
@@ -32,7 +33,8 @@ import (
 type Disk struct {
 	// Logger receives failures the cache survives but an operator should
 	// see (a temporary file it could not remove). Nil discards them. Set it
-	// before first use.
+	// before first use. NewDisk's sweep of stale directories runs before
+	// it can be set and logs to slog.Default().
 	Logger *slog.Logger
 
 	// Pin transactions include reservation and warming. Serializing them keeps
@@ -40,7 +42,9 @@ type Disk struct {
 	// ponytail: one pin transaction per worker; shard this lock if pin churn matters.
 	pinMu                             sync.Mutex
 	mu                                sync.Mutex
-	dir                               string
+	home                              string   // the locked directory: lockName, dataDir and Wipe's trash
+	lock                              *os.File // holds home's flock until Close; nil once closed
+	dir                               string   // home/dataDir: the cached files
 	cap, size                         int64
 	reserved                          int64 // charges of Puts writing their temporary file
 	ll                                list.List
@@ -89,18 +93,25 @@ type DiskStats struct {
 	InactiveExpiries                  uint64
 }
 
-// dirPrefix names every directory a Disk creates under its root: its cache
-// directory and the trash a Wipe or Close renames it to.
-const dirPrefix = "objstore-cache-"
+// dirPrefix names every directory a Disk creates under its root. Inside
+// it are lockName, dataDir with the cached files, and the trash a Wipe
+// renames dataDir to before removing it.
+const (
+	dirPrefix = "objstore-cache-"
+	lockName  = "lock"
+	dataDir   = "d"
+)
 
 // NewDisk creates a disk tier of capacity bytes in a new directory under
 // root (the system temporary directory when root is ""). pinCapacity, if
 // given, bounds pin reservations (default: capacity). A capacity of zero
 // or less returns a nil *Disk, which caches nothing.
 //
-// A non-empty root belongs to one process: NewDisk removes the directories
-// an earlier Disk left under it (a crash skips Close), since nothing on
-// them is ever recovered.
+// A root may host several Disks, in this process or others: each holds an
+// exclusive lock on its directory for its lifetime, and NewDisk removes the
+// stale directories under root (a crash skips Close) whose lock is free.
+// One it cannot remove is logged and left. With root == "" nothing is
+// swept; neither is anything on platforms without flock.
 func NewDisk(root string, capacity int64, pinCapacity ...int64) (*Disk, error) {
 	if capacity <= 0 {
 		return nil, nil
@@ -116,21 +127,82 @@ func NewDisk(root string, capacity int64, pinCapacity ...int64) (*Disk, error) {
 		if err := os.MkdirAll(root, 0700); err != nil {
 			return nil, err
 		}
-		stale, err := filepath.Glob(filepath.Join(root, dirPrefix+"*"))
-		if err != nil {
+		if err := sweepStale(root); err != nil {
 			return nil, err
 		}
-		for _, dir := range stale {
-			if err := os.RemoveAll(dir); err != nil {
-				return nil, fmt.Errorf("cache: remove stale %s: %w", dir, err)
-			}
-		}
 	}
-	dir, err := os.MkdirTemp(root, dirPrefix)
+	home, lock, err := lockedHome(root)
 	if err != nil {
 		return nil, err
 	}
-	return &Disk{dir: dir, cap: capacity, pinCap: pc, maxPinned: MaxPinnedNamespaces, items: make(map[string]*list.Element), pins: make(map[string]map[string]int64), pinBytes: make(map[string]int64), pinAt: make(map[string]time.Time), pinPrevAt: make(map[string]time.Time), pinned: make(map[string]int), lastAccess: make(map[string]time.Time)}, nil
+	dir := filepath.Join(home, dataDir)
+	if err := os.Mkdir(dir, 0700); err != nil {
+		os.RemoveAll(home)
+		lock.Close()
+		return nil, err
+	}
+	return &Disk{home: home, lock: lock, dir: dir, cap: capacity, pinCap: pc, maxPinned: MaxPinnedNamespaces, items: make(map[string]*list.Element), pins: make(map[string]map[string]int64), pinBytes: make(map[string]int64), pinAt: make(map[string]time.Time), pinPrevAt: make(map[string]time.Time), pinned: make(map[string]int), lastAccess: make(map[string]time.Time)}, nil
+}
+
+// sweepStale removes the Disk directories under root whose lock is free.
+// A live Disk holds its lock, so its directory is skipped.
+func sweepStale(root string) error {
+	if !sweepable {
+		return nil
+	}
+	stale, err := filepath.Glob(filepath.Join(root, dirPrefix+"*"))
+	if err != nil {
+		return err
+	}
+	for _, dir := range stale {
+		lock, ok, err := lockFile(filepath.Join(dir, lockName))
+		if err != nil {
+			if !errors.Is(err, fs.ErrNotExist) { // gone meanwhile: nothing to sweep
+				slog.Warn("cache: skip stale disk directory: cannot lock it", "dir", dir, "err", err)
+			}
+			continue
+		}
+		if !ok {
+			continue // a live Disk holds it
+		}
+		if err := os.RemoveAll(dir); err != nil {
+			slog.Warn("cache: skip stale disk directory: cannot remove it", "dir", dir, "err", err)
+		}
+		lock.Close()
+	}
+	return nil
+}
+
+// lockedHome creates a directory under root and takes its lock. A
+// concurrent sweep can take the lock of a directory just created, before
+// its Disk does, and remove it: the creator then finds the lock taken or
+// its lock file gone and starts over with a new directory.
+func lockedHome(root string) (string, *os.File, error) {
+	var err error
+	for range 8 {
+		var home string
+		if home, err = os.MkdirTemp(root, dirPrefix); err != nil {
+			return "", nil, err
+		}
+		path := filepath.Join(home, lockName)
+		lock, ok, lerr := lockFile(path)
+		if lerr != nil {
+			err = lerr
+			os.RemoveAll(home) // gone already if a sweep removed it
+			continue
+		}
+		if !ok {
+			continue // a sweep holds it and removes it; not ours any more
+		}
+		held, herr := lock.Stat()
+		named, nerr := os.Stat(path)
+		if herr == nil && nerr == nil && os.SameFile(held, named) {
+			return home, lock, nil
+		}
+		lock.Close() // a sweep removed the directory between create and lock
+		err = errors.Join(herr, nerr)
+	}
+	return "", nil, fmt.Errorf("cache: lock a new disk directory under %q: %w", root, errors.Join(err, errors.New("lost every attempt to a concurrent sweep")))
 }
 
 // diskBlock is the unit a cached file is checksummed and read in. An
@@ -323,15 +395,16 @@ func (c *Disk) logger() *slog.Logger {
 	return c.Logger
 }
 
-// detachDir renames the cache directory aside, so the caller can remove it
-// after releasing c.mu, and forgets every entry. recreate makes a fresh,
-// empty directory in its place. It returns the path to remove, "" if none.
+// detachDir renames the data directory aside, inside the locked home so no
+// sweep can touch it, so the caller can remove it after releasing c.mu,
+// and forgets every entry. recreate makes a fresh, empty data directory in
+// its place. It returns the path to remove, "" if none.
 func (c *Disk) detachDir(recreate bool) (string, error) {
-	trash, err := os.MkdirTemp(filepath.Dir(c.dir), filepath.Base(c.dir)+".trash-")
+	trash, err := os.MkdirTemp(c.home, "trash-")
 	if err != nil {
 		return "", err
 	}
-	if err := os.Rename(c.dir, filepath.Join(trash, "d")); err != nil && !os.IsNotExist(err) {
+	if err := os.Rename(c.dir, filepath.Join(trash, dataDir)); err != nil && !os.IsNotExist(err) {
 		os.Remove(trash)
 		return "", err
 	}
@@ -612,6 +685,10 @@ func (c *Disk) Wipe() error {
 		return nil
 	}
 	c.mu.Lock()
+	if c.closed {
+		c.mu.Unlock()
+		return nil // Close removed the directory; there is nothing to wipe
+	}
 	trash, err := c.detachDir(true)
 	c.mu.Unlock()
 	if trash != "" {
@@ -676,14 +753,20 @@ func (c *Disk) Stats() DiskStats {
 	return DiskStats{CapacityBytes: c.cap, UsedBytes: c.size, PinCapacityBytes: c.pinCap, PinnedBytes: c.pinnedBytes, PinnedNamespaces: len(c.pins), Entries: len(c.items), Hits: c.hits, Misses: c.misses, Evictions: c.evictions, Failures: c.failures, InactiveExpiries: c.inactiveExpiries}
 }
 
-// Close stops caching and removes the directory. Reservations are kept, so
-// PinStatus still answers; every later Put is refused.
+// Close stops caching, removes the directory and releases its lock.
+// Reservations are kept, so PinStatus still answers; every later Put is
+// refused. A second Close does nothing.
 func (c *Disk) Close() {
 	if c == nil {
 		return
 	}
 	c.mu.Lock()
-	c.closed = true
+	lock := c.lock
+	c.lock, c.closed = nil, true
+	if lock == nil {
+		c.mu.Unlock()
+		return
+	}
 	trash, err := c.detachDir(false)
 	if err != nil {
 		c.failures++
@@ -693,9 +776,14 @@ func (c *Disk) Close() {
 	if err == nil && trash != "" {
 		err = os.RemoveAll(trash)
 	}
-	if err != nil {
-		logger.Error("cache: remove disk tier directory", "dir", c.dir, "err", err)
+	if err == nil {
+		// Remove the home, lock file included, while still holding the lock.
+		err = os.RemoveAll(c.home)
 	}
+	if err != nil {
+		logger.Error("cache: remove disk tier directory", "dir", c.home, "err", err)
+	}
+	lock.Close()
 }
 
 // DiskKey is the on-disk identity of a logical cache key at one generation

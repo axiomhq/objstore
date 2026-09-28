@@ -13,13 +13,14 @@ import (
 // Reader reads immutable objects by byte range on top of the object cache:
 // it plans and coalesces the ranged GETs of one read stage (FetchRanges)
 // and counts the physical range work. The cache remembers what it reads and
-// does not know it exists. Build one per process, with New.
+// does not know it exists. Build one per process, with New; the zero Reader
+// is not usable.
 type Reader struct {
 	Store   *objstore.Store
 	Objects *cache.Cache
-	Config  Config              // normalized by New
-	Memory  *semaphore.Weighted // Config.MaxInFlightBytes across the process
 	IO      Counters
+	config  Config              // normalized by New
+	memory  *semaphore.Weighted // config.MaxInFlightBytes across the process
 	// parents shares one GET among concurrent identical coalesced parent
 	// ranges (FetchRanges), without caching the parent.
 	parents singleflight.Group
@@ -33,8 +34,11 @@ func New(s *objstore.Store, objects *cache.Cache, cfg Config) (*Reader, error) {
 	if err != nil {
 		return nil, err
 	}
-	return &Reader{Store: s, Objects: objects, Config: cfg, Memory: semaphore.NewWeighted(cfg.MaxInFlightBytes)}, nil
+	return &Reader{Store: s, Objects: objects, config: cfg, memory: semaphore.NewWeighted(cfg.MaxInFlightBytes)}, nil
 }
+
+// Config is the normalized configuration the Reader was built with.
+func (r *Reader) Config() Config { return r.config }
 
 // Fetch returns an immutable object via the cache. Cached bytes must never
 // be mutated: every decoder copies out. Concurrent misses for the same key
