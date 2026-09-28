@@ -1,3 +1,6 @@
+// Package s3 is the S3 backend for objstore. Cloudflare R2, MinIO, Ceph and
+// Hetzner use it too because they speak the S3 API. The AWS KMS key
+// provider is github.com/axiomhq/objstore/aws/kms.
 package s3
 
 import (

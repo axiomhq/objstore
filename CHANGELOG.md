@@ -12,7 +12,7 @@
 
 **objstore**
 
-- `objstore.New(ctx, endpoint, bucket)` and `NewConfigured(ctx, cfg)` are gone. Use `s3.Open`, `gcs.Open`, `fs.Open`, or `objstore.Open(backend, cfg)`.
+- `objstore.New(ctx, endpoint, bucket)` and `NewConfigured(ctx, cfg)` are gone. Use `s3.Open` (`objstore/aws/s3`), `gcs.Open` (`objstore/gcp/gcs`), `fs.Open`, or `objstore.Open(backend, cfg)`.
 - `Config.Endpoint`, `Bucket`, `AllowedEndpoints`, `SSE`, `KMSKeyID` and `RequestTimeout` moved to `s3.Config`.
 - `Store.SSE()` → `(*s3.Backend).SSE()`. `objstore.ErrEndpointDenied` → `s3.ErrEndpointDenied`.
 - `objstore.Backend` is an exported interface (was an alias of an unexported one). It may grow.
@@ -33,8 +33,8 @@
 **kms**
 
 - `kms` imports only the standard library.
-- `kms.AWSKMS`, `kms.AWSClient` → `awskms.Provider`, `awskms.Client` (package `kms/awskms`).
-- `kms.GCPKMS`, `kms.GCPClient` → `gcpkms.Provider`, `gcpkms.Client` (package `kms/gcpkms`).
+- `kms.AWSKMS`, `kms.AWSClient` → `awskms.Provider`, `awskms.Client` (package `kms` at `objstore/aws/kms`; import it as `awskms` next to `objstore/kms`).
+- `kms.GCPKMS`, `kms.GCPClient` → `gcpkms.Provider`, `gcpkms.Client` (package `kms` at `objstore/gcp/kms`; import it as `gcpkms` next to `objstore/kms`).
 - `kms.Router{Local, AWS, GCP, Default}` → `kms.Router{Routes, Default, DefaultScheme}`. The longest scheme prefix in `Routes` wins. An unmatched name goes to `Default` as `DefaultScheme+name`; the scheme is no longer guessed from `Default`'s type.
 - `ErrKeyUnavailable` text is `kms: customer-managed encryption key unavailable`.
 - A DEK that is not `kms.DEKSize` bytes is a caller error (`kms.CheckDEK`), not `ErrKeyUnavailable`.
@@ -127,7 +127,7 @@
 
 ### Added
 
-- Packages `fs`, `s3`, `gcs` (Google Cloud Storage), `kms/awskms`, `kms/gcpkms`, `storetest/bucket`.
+- Packages `fs`, `aws/s3`, `gcp/gcs` (Google Cloud Storage), `aws/kms`, `gcp/kms`, `storetest/bucket`. Provider packages live under `aws/` and `gcp/`; R2, MinIO, Ceph and Hetzner use `aws/s3`.
 - objstore: `Open`, `OpErr`, `IsUrgent`, `TimingsOf`, `Timings.Since`, `Call.String`, `ErrConflict`, `ErrInvalidKey`, `ErrInvalidEnvelope`, `ErrKeyRecordExists`, `ErrLegacyEmptyObject`.
 - objstore: `Config.KeyProvider`, `Config.KeyRefreshInterval`, `Config.AcceptPlaintext`, `DefaultAcceptPlaintext`.
 - kms: `DEKSize`, `CheckDEK`, `LeaseCadencer`; `awskms.Scheme` (`aws:`), `gcpkms.Scheme` (`gcp:`).

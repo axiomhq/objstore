@@ -13,7 +13,7 @@ import (
 	"time"
 
 	"github.com/axiomhq/objstore"
-	"github.com/axiomhq/objstore/gcs"
+	"github.com/axiomhq/objstore/gcp/gcs"
 	"github.com/axiomhq/objstore/storetest"
 	"github.com/fsouza/fake-gcs-server/fakestorage"
 	"google.golang.org/api/option"

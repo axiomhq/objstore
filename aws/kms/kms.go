@@ -1,6 +1,8 @@
-// Package awskms is a kms.KeyProvider backed by AWS KMS. Key names have
-// the form aws:arn:aws:kms:<region>:<account>:key/<id>.
-package awskms
+// Package kms is a kms.KeyProvider (github.com/axiomhq/objstore/kms) backed
+// by AWS KMS. Key names have the form
+// aws:arn:aws:kms:<region>:<account>:key/<id>. The S3 backend is
+// github.com/axiomhq/objstore/aws/s3.
+package kms
 
 import (
 	"context"
@@ -39,11 +41,11 @@ func (p Provider) LeaseCadenced(string) bool { return true }
 
 func (p Provider) arn(keyName string) (string, error) {
 	if p.Client == nil {
-		return "", fmt.Errorf("%w: awskms: nil client", kms.ErrKeyUnavailable)
+		return "", fmt.Errorf("%w: aws kms: nil client", kms.ErrKeyUnavailable)
 	}
 	arn, ok := strings.CutPrefix(keyName, Scheme)
 	if !ok || !strings.HasPrefix(arn, "arn:") {
-		return "", fmt.Errorf("%w: awskms: invalid key name %q", kms.ErrKeyUnavailable, keyName)
+		return "", fmt.Errorf("%w: aws kms: invalid key name %q", kms.ErrKeyUnavailable, keyName)
 	}
 	return arn, nil
 }
@@ -62,7 +64,7 @@ func (p Provider) Wrap(ctx context.Context, keyName string, dek []byte) ([]byte,
 		return nil, "", fmt.Errorf("%w: %w", kms.ErrKeyUnavailable, err)
 	}
 	if out == nil || len(out.CiphertextBlob) == 0 {
-		return nil, "", fmt.Errorf("%w: awskms: empty ciphertext", kms.ErrKeyUnavailable)
+		return nil, "", fmt.Errorf("%w: aws kms: empty ciphertext", kms.ErrKeyUnavailable)
 	}
 	return out.CiphertextBlob, aws.ToString(out.KeyId), nil
 }
@@ -78,7 +80,7 @@ func (p Provider) Unwrap(ctx context.Context, keyName string, wrapped []byte) ([
 		return nil, fmt.Errorf("%w: %w", kms.ErrKeyUnavailable, err)
 	}
 	if out == nil || len(out.Plaintext) != kms.DEKSize {
-		return nil, fmt.Errorf("%w: awskms: decrypted key is not %d bytes", kms.ErrKeyUnavailable, kms.DEKSize)
+		return nil, fmt.Errorf("%w: aws kms: decrypted key is not %d bytes", kms.ErrKeyUnavailable, kms.DEKSize)
 	}
 	return out.Plaintext, nil
 }

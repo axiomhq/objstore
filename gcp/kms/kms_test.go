@@ -1,4 +1,4 @@
-package gcpkms
+package kms
 
 import (
 	"bytes"

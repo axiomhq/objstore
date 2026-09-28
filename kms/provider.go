@@ -4,8 +4,8 @@
 // ErrKeyUnavailable, LocalFile (32-byte keys in a directory) and Router,
 // which picks a provider by the key name's scheme. The cloud providers live
 // in their own packages so a binary links only the SDK it uses: package
-// github.com/axiomhq/objstore/kms/awskms (aws:arn:...) and
-// github.com/axiomhq/objstore/kms/gcpkms (gcp:projects/...).
+// github.com/axiomhq/objstore/aws/kms (aws:arn:...) and
+// github.com/axiomhq/objstore/gcp/kms (gcp:projects/...).
 package kms
 
 import (
@@ -25,9 +25,9 @@ const DEKSize = 32
 // the customer key was rotated. Per provider:
 //
 //   - LocalFile: the first 8 bytes of the SHA-256 of the key file, in hex.
-//   - awskms.Provider: the key ARN reported by AWS KMS. AWS does not expose
+//   - aws/kms Provider: the key ARN reported by AWS KMS. AWS does not expose
 //     the backing material version, so rotation is not visible in it.
-//   - gcpkms.Provider: the full CryptoKeyVersion resource name that
+//   - gcp/kms Provider: the full CryptoKeyVersion resource name that
 //     encrypted the key.
 //
 // Unwrap must reject a revoked or unavailable key, including on a warm

@@ -13,8 +13,8 @@ import (
 	"time"
 
 	"github.com/axiomhq/objstore"
+	"github.com/axiomhq/objstore/aws/s3"
 	"github.com/axiomhq/objstore/fs"
-	"github.com/axiomhq/objstore/s3"
 	"github.com/axiomhq/objstore/storetest"
 )
 

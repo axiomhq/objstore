@@ -1,7 +1,8 @@
-// Package gcpkms is a kms.KeyProvider backed by Google Cloud KMS. Key
-// names have the form
-// gcp:projects/<p>/locations/<l>/keyRings/<r>/cryptoKeys/<k>.
-package gcpkms
+// Package kms is a kms.KeyProvider (github.com/axiomhq/objstore/kms) backed
+// by Google Cloud KMS. Key names have the form
+// gcp:projects/<p>/locations/<l>/keyRings/<r>/cryptoKeys/<k>. The Google
+// Cloud Storage backend is github.com/axiomhq/objstore/gcp/gcs.
+package kms
 
 import (
 	"context"
@@ -40,11 +41,11 @@ func checksum(data []byte) *wrapperspb.Int64Value {
 
 func (p Provider) name(keyName string) (string, error) {
 	if p.Client == nil {
-		return "", fmt.Errorf("%w: gcpkms: nil client", kms.ErrKeyUnavailable)
+		return "", fmt.Errorf("%w: gcp kms: nil client", kms.ErrKeyUnavailable)
 	}
 	name, ok := strings.CutPrefix(keyName, Scheme)
 	if !ok || !strings.HasPrefix(name, "projects/") {
-		return "", fmt.Errorf("%w: gcpkms: invalid key name %q", kms.ErrKeyUnavailable, keyName)
+		return "", fmt.Errorf("%w: gcp kms: invalid key name %q", kms.ErrKeyUnavailable, keyName)
 	}
 	return name, nil
 }
@@ -63,7 +64,7 @@ func (p Provider) Wrap(ctx context.Context, keyName string, dek []byte) ([]byte,
 		return nil, "", fmt.Errorf("%w: %w", kms.ErrKeyUnavailable, err)
 	}
 	if out == nil || len(out.Ciphertext) == 0 || out.Name == "" || !out.VerifiedPlaintextCrc32C || out.CiphertextCrc32C == nil || out.CiphertextCrc32C.Value != checksum(out.Ciphertext).Value {
-		return nil, "", fmt.Errorf("%w: gcpkms: encrypt response failed integrity check", kms.ErrKeyUnavailable)
+		return nil, "", fmt.Errorf("%w: gcp kms: encrypt response failed integrity check", kms.ErrKeyUnavailable)
 	}
 	return out.Ciphertext, out.Name, nil
 }
@@ -79,7 +80,7 @@ func (p Provider) Unwrap(ctx context.Context, keyName string, wrapped []byte) ([
 		return nil, fmt.Errorf("%w: %w", kms.ErrKeyUnavailable, err)
 	}
 	if out == nil || len(out.Plaintext) != kms.DEKSize || out.PlaintextCrc32C == nil || out.PlaintextCrc32C.Value != checksum(out.Plaintext).Value {
-		return nil, fmt.Errorf("%w: gcpkms: decrypt response failed integrity check", kms.ErrKeyUnavailable)
+		return nil, fmt.Errorf("%w: gcp kms: decrypt response failed integrity check", kms.ErrKeyUnavailable)
 	}
 	return out.Plaintext, nil
 }

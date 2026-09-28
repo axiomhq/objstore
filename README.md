@@ -5,16 +5,17 @@ go get github.com/axiomhq/objstore
 ```
 
 Object storage with compare-and-swap, for Go. One `Store` over an S3 bucket
-(`objstore/s3`: AWS, MinIO, Ceph, Hetzner, and Cloudflare R2 at
+(`objstore/aws/s3`), Google Cloud Storage (`objstore/gcp/gcs`), or a durable
+local directory (`objstore/fs`). Packages are laid out by provider: `aws/`
+holds `s3` and `kms`, `gcp/` holds `gcs` and `kms`. Cloudflare R2 (at
 `https://<account-id>.r2.cloudflarestorage.com` with `AWS_REGION=auto`),
-Google Cloud Storage (`objstore/gcs`), or a durable local directory
-(`objstore/fs`), with:
+MinIO, Ceph and Hetzner use `aws/s3` because they speak the S3 API. With:
 
 - conditional PUT and GET, and the ETag with the body
 - paginated list, delimited list, batch delete
 - one package per provider, so a binary links only the SDKs it uses
 - a file store (`objstore/fs`) that fsyncs every object and writes large ones back in chunks, so a small urgent write never waits behind a big one
-- envelope encryption per name (`objstore/kms`, stdlib only), with AWS KMS and GCP KMS providers in `objstore/kms/awskms` and `objstore/kms/gcpkms`
+- envelope encryption per name (`objstore/kms`, stdlib only), with AWS KMS and GCP KMS providers in `objstore/aws/kms` and `objstore/gcp/kms`
 - a conformance suite, fault injection and metering for tests (`objstore/storetest`)
 - a write-ahead log: one entry per second, conditional PUT, nonce read-back (`objstore/wal`)
 - a memory and disk object cache with singleflight and per-request stats (`objstore/cache`)
@@ -22,6 +23,8 @@ Google Cloud Storage (`objstore/gcs`), or a durable local directory
 - a lease for leader election or a single writer: acquire, renew, fence (`objstore/lease`)
 
 ## Use
+
+Imports: `github.com/axiomhq/objstore/aws/s3`, `github.com/axiomhq/objstore/gcp/gcs`, `github.com/axiomhq/objstore/fs`.
 
 1. Open a store: `s, err := s3.Open(ctx, s3.Config{Endpoint: "https://s3.us-east-1.amazonaws.com", Bucket: "my-bucket"}, objstore.Config{})`.
    GCS: `s, err := gcs.Open(ctx, gcs.Config{Bucket: "my-bucket"}, objstore.Config{})`. Local: `s := fs.Open("/var/lib/data", "bucket", objstore.Config{})` (Unix only).
@@ -41,13 +44,14 @@ instead of in chunks.
 
 | v0.4 | v0.5 |
 | --- | --- |
+| S3 in package `objstore` | package `s3` at `objstore/aws/s3`; GCS (new) is `objstore/gcp/gcs` |
 | `objstore.New(ctx, endpoint, bucket)` | `s3.Open(ctx, s3.Config{Endpoint: endpoint, Bucket: bucket}, objstore.Config{})`; for `file://root`, `fs.Open(root, bucket, objstore.Config{})` |
 | `Config.Endpoint`, `Bucket`, `SSE`, `KMSKeyID`, `AllowedEndpoints`, `RequestTimeout` | `s3.Config` |
 | `Store.SSE()`, `objstore.ErrEndpointDenied` | `(*s3.Backend).SSE()` (from `s3.New`), `s3.ErrEndpointDenied` |
 | `s.ConfigureCMEK(p)` | still works; or `objstore.Config{KeyProvider: p}` |
 | built-in plaintext exemptions | `Config.AcceptPlaintext` (nil = `objstore.DefaultAcceptPlaintext`) |
 | `Timings.LogAttrs()` | `Timings.Attrs()` |
-| `kms.AWSKMS{Client: c}`, `kms.GCPKMS{Client: c}` | `awskms.Provider{Client: c}`, `gcpkms.Provider{Client: c}` |
+| `kms.AWSKMS{Client: c}`, `kms.GCPKMS{Client: c}` | `awskms.Provider{Client: c}`, `gcpkms.Provider{Client: c}`, with `awskms "github.com/axiomhq/objstore/aws/kms"` and `gcpkms "github.com/axiomhq/objstore/gcp/kms"` (both are package `kms`) |
 | `kms.Router{Local: l, AWS: a, GCP: g, Default: d}` | `kms.Router{Routes: map[string]kms.KeyProvider{"local:": l, awskms.Scheme: a, gcpkms.Scheme: g}, Default: d, DefaultScheme: "local:"}` (the scheme of `d`) |
 | `l.Release()`, `ref.Release()` | `l.Release(ctx)`, `ref.Release(ctx)` |
 | `l.Log = logger` | `l.SetLogger(logger)` |
@@ -166,6 +170,7 @@ Every write carries a fresh nonce, so the read-back tells "my write landed" from
        gcpkms.Scheme: gcpkms.Provider{Client: gcpClient},
    }}
    ```
+   `awskms` and `gcpkms` are import aliases for `github.com/axiomhq/objstore/aws/kms` and `github.com/axiomhq/objstore/gcp/kms`; both are package `kms`, like the interface package.
    The longest matching scheme wins; a name matching none goes to `Default` as `DefaultScheme+name`. Import only the provider packages you use.
 2. Turn it on: `objstore.Config{KeyProvider: p}` at open (or `s.ConfigureCMEK(p)` before first use). Every object under `ns/<name>/` of a name with a key record is now encrypted with that name's data key.
 3. Before the first write for a name, wrap a fresh `kms.DEKSize`-byte key and install it: `wrapped, ver, err := p.Wrap(ctx, keyName, dek)`, then `s.InstallNamespaceKey(ctx, name, objstore.Envelope{Mode: objstore.EncryptionCustomerManaged, KeyName: keyName, KeyVersion: ver, DEKWrapped: wrapped})`.
@@ -215,8 +220,8 @@ for windows, darwin, illumos, solaris and aix/ppc64.
 Real providers, each skipped when its variable is unset:
 
 - `OBJSTORE_TEST_S3`: S3 endpoint, e.g. MinIO at `http://localhost:9000` (each of `AWS_ACCESS_KEY_ID`, `AWS_SECRET_ACCESS_KEY`, `AWS_REGION` left unset defaults to MinIO's `minioadmin`, `minioadmin`, `us-east-1`).
-- `OBJSTORE_TEST_R2_ENDPOINT`: `https://<account-id>.r2.cloudflarestorage.com`, with an R2 API token in `AWS_ACCESS_KEY_ID` / `AWS_SECRET_ACCESS_KEY` and `AWS_REGION=auto`. Runs `TestR2` in `./s3`.
-- `OBJSTORE_TEST_GCS_PROJECT`: a GCP project where Application Default Credentials can create buckets. Runs `TestConformanceReal` in `./gcs` against a fresh `objstore-test-<nanos>` bucket, dropped afterwards. `TestConformance` runs on an in-process fake-gcs-server with no variable.
+- `OBJSTORE_TEST_R2_ENDPOINT`: `https://<account-id>.r2.cloudflarestorage.com`, with an R2 API token in `AWS_ACCESS_KEY_ID` / `AWS_SECRET_ACCESS_KEY` and `AWS_REGION=auto`. Runs `TestR2` in `./aws/s3`.
+- `OBJSTORE_TEST_GCS_PROJECT`: a GCP project where Application Default Credentials can create buckets. Runs `TestConformanceReal` in `./gcp/gcs` against a fresh `objstore-test-<nanos>` bucket, dropped afterwards. `TestConformance` runs on an in-process fake-gcs-server with no variable.
 
 ## License
 

@@ -1,4 +1,4 @@
-package awskms
+package kms
 
 import (
 	"bytes"
