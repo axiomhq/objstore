@@ -10,6 +10,7 @@ import (
 	"strings"
 	"sync"
 	"sync/atomic"
+	"testing"
 	"time"
 
 	"github.com/axiomhq/objstore"
@@ -54,7 +55,7 @@ const (
 	Ambiguous
 	// Hang blocks until the call's context is cancelled. A call made with
 	// a context that is never cancelled (context.Background) hangs for
-	// good: nothing, not even NewFaulty's cleanup, releases it.
+	// good: nothing, not even Faulty's cleanup, releases it.
 	Hang
 	// Pause stops immediately before storage until Fault.Resume, or until
 	// the call's context ends (the call then returns the context's error).
@@ -415,6 +416,25 @@ func (f *Fault) Resume() {
 	for _, ch := range held {
 		close(ch)
 	}
+}
+
+// Faulty returns s wrapped in a fault injector, for crash-point tests.
+// Disarmed until the caller sets a Plan. Cleanup resumes any call still
+// held by a Pause plan and waits (up to 5s) for every paused or hung call
+// to return, so a failed test neither leaks a blocked goroutine nor lets
+// one write into a removed TempDir. A Hang call ends only with its
+// context: use t.Context() (cancelled before cleanup), never
+// context.Background().
+func Faulty(t testing.TB, s *objstore.Store) (*objstore.Store, *Fault) {
+	t.Helper()
+	s, f := NewFault(s)
+	t.Cleanup(func() {
+		f.Resume()
+		if !f.drain(5 * time.Second) {
+			t.Logf("storetest: %d paused or hung calls still blocked at cleanup", f.blocked.Load())
+		}
+	})
+	return s, f
 }
 
 // drain waits up to timeout for every call stopped by Pause or Hang to

@@ -7,12 +7,12 @@ import (
 	"strings"
 	"testing"
 
-	"github.com/axiomhq/objstore/storetest"
+	"github.com/axiomhq/objstore/storetest/bucket"
 )
 
 func TestWalkVisitsEntriesInOrderAndStopsAtThrough(t *testing.T) {
 	ctx := context.Background()
-	s := storetest.New(t)
+	s := bucket.New(t)
 	// Two single-page entries, one two-page batch, one more: seqs 1, 2, 3+4, 5.
 	pages := []struct {
 		h  Header
@@ -74,7 +74,7 @@ func TestWalkVisitsEntriesInOrderAndStopsAtThrough(t *testing.T) {
 // more than one page regardless of suffix length.
 func TestWalkStreamsOnePageAtATime(t *testing.T) {
 	ctx := context.Background()
-	s := storetest.New(t)
+	s := bucket.New(t)
 	const pages = 64
 	for i := 0; i < pages; i++ {
 		if ok, err := put(ctx, s, testPrefix, Header{Seq: uint64(i + 1)}, Bytes{byte('a' + i%26)}); err != nil || !ok {

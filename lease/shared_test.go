@@ -9,6 +9,7 @@ import (
 	"time"
 
 	"github.com/axiomhq/objstore/storetest"
+	"github.com/axiomhq/objstore/storetest/bucket"
 )
 
 func TestShared(t *testing.T) {
@@ -16,7 +17,7 @@ func TestShared(t *testing.T) {
 	const ttl = time.Minute
 
 	t.Run("RefCount", func(t *testing.T) {
-		s := storetest.New(t)
+		s := bucket.New(t)
 		var sh Shared
 		minted := 0
 		mint := func() (*Lease, error) {
@@ -66,7 +67,7 @@ func TestShared(t *testing.T) {
 	})
 
 	t.Run("ConcurrentJoinMintsOnce", func(t *testing.T) {
-		s := storetest.New(t)
+		s := bucket.New(t)
 		var sh Shared
 		var minted atomic.Int32
 		mint := func() (*Lease, error) {
@@ -100,7 +101,7 @@ func TestShared(t *testing.T) {
 	// answers at once; a concurrent Join waits for the mint and, when it
 	// fails, mints its own.
 	t.Run("HungMintDoesNotBlockShared", func(t *testing.T) {
-		s, f := storetest.NewFaulty(t)
+		s, f := bucket.NewFaulty(t)
 		f.Set(storetest.Plan{Op: storetest.OpPutIfAbsent, N: 1, Mode: storetest.Hang, Key: "shared/hang"})
 		var sh Shared
 		var minted atomic.Int32
@@ -164,7 +165,7 @@ func TestShared(t *testing.T) {
 	// The last Ref.Release hands back outside the mutex: Held answers
 	// while the handover is stuck on the store.
 	t.Run("ReleaseOutsideLock", func(t *testing.T) {
-		s, f := storetest.NewFaulty(t)
+		s, f := bucket.NewFaulty(t)
 		var sh Shared
 		r, err := sh.Join(func() (*Lease, error) { return Acquire(ctx, s, "shared/rel", "owner-a", ttl) })
 		if err != nil {
@@ -199,7 +200,7 @@ func TestShared(t *testing.T) {
 func TestSharedReleaseFromFence(t *testing.T) {
 	ctx := context.Background()
 	const ttl = 200 * time.Millisecond
-	s := storetest.New(t)
+	s := bucket.New(t)
 	var sh Shared
 	mint := func() (*Lease, error) { return Acquire(ctx, s, "shared/fence", "owner-a", ttl) }
 	r, err := sh.Join(mint)

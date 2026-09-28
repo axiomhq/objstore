@@ -1,4 +1,6 @@
-package storetest
+// Package bucket opens a fresh test bucket on the file backend or, with
+// OBJSTORE_TEST_S3, on S3.
+package bucket
 
 import (
 	"context"
@@ -13,6 +15,7 @@ import (
 	"github.com/axiomhq/objstore"
 	"github.com/axiomhq/objstore/fs"
 	"github.com/axiomhq/objstore/s3"
+	"github.com/axiomhq/objstore/storetest"
 )
 
 // New returns a Store on a fresh bucket. OBJSTORE_TEST_S3 names an S3
@@ -79,20 +82,8 @@ func NewS3(t testing.TB, endpoint string) *objstore.Store {
 }
 
 // NewFaulty returns New(t)'s Store wrapped in a fault injector, for
-// crash-point tests. Disarmed until the caller sets a Plan. Cleanup
-// resumes any call still held by a Pause plan and waits (up to 5s) for
-// every paused or hung call to return, so a failed test neither leaks a
-// blocked goroutine nor lets one write into a removed TempDir. A Hang call
-// ends only with its context: use t.Context() (cancelled before cleanup),
-// never context.Background().
-func NewFaulty(t testing.TB) (*objstore.Store, *Fault) {
+// crash-point tests; see storetest.Faulty.
+func NewFaulty(t testing.TB) (*objstore.Store, *storetest.Fault) {
 	t.Helper()
-	s, f := NewFault(New(t))
-	t.Cleanup(func() {
-		f.Resume()
-		if !f.drain(5 * time.Second) {
-			t.Logf("storetest: %d paused or hung calls still blocked at cleanup", f.blocked.Load())
-		}
-	})
-	return s, f
+	return storetest.Faulty(t, New(t))
 }

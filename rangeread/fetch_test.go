@@ -10,10 +10,11 @@ import (
 
 	"github.com/axiomhq/objstore/cache"
 	"github.com/axiomhq/objstore/storetest"
+	"github.com/axiomhq/objstore/storetest/bucket"
 )
 
 func TestSingleChildPlanIsNotCachedTwice(t *testing.T) {
-	s, fault := storetest.NewFault(storetest.New(t))
+	s, fault := storetest.NewFault(bucket.New(t))
 	disk, err := cache.NewDisk(t.TempDir(), 1<<20)
 	if err != nil {
 		t.Fatal(err)
@@ -54,7 +55,7 @@ func TestSingleChildPlanIsNotCachedTwice(t *testing.T) {
 // TestCoalescedParentIsNotCached: two children read in one coalesced range
 // are cached; the parent range, gap included, is not, in either tier.
 func TestCoalescedParentIsNotCached(t *testing.T) {
-	s, fault := storetest.NewFault(storetest.New(t))
+	s, fault := storetest.NewFault(bucket.New(t))
 	disk, err := cache.NewDisk(t.TempDir(), 1<<20)
 	if err != nil {
 		t.Fatal(err)
@@ -98,7 +99,7 @@ func TestCoalescedParentIsNotCached(t *testing.T) {
 // range the disk tier already holds inside a whole object are cached in
 // memory, not copied to disk a second time.
 func TestCoalescedChildrenOfACachedObjectStayOffDisk(t *testing.T) {
-	s, fault := storetest.NewFault(storetest.New(t))
+	s, fault := storetest.NewFault(bucket.New(t))
 	disk, err := cache.NewDisk(t.TempDir(), 1<<20)
 	if err != nil {
 		t.Fatal(err)
@@ -136,7 +137,7 @@ func TestCoalescedChildrenOfACachedObjectStayOffDisk(t *testing.T) {
 // parent is still not cached.
 func TestConcurrentColdParentsShareOneGet(t *testing.T) {
 	const queries = 8
-	s, fault := storetest.NewFault(storetest.New(t))
+	s, fault := storetest.NewFault(bucket.New(t))
 	objects := cache.New(s, 1<<20, nil, cache.Keys{})
 	t.Cleanup(objects.Close)
 	const object = "ns/shared/object"
@@ -192,7 +193,7 @@ func TestConcurrentColdParentsShareOneGet(t *testing.T) {
 // TestSharedParentOutlivesItsLeader: a query that joined another query's
 // parent GET does not inherit that query's cancellation.
 func TestSharedParentOutlivesItsLeader(t *testing.T) {
-	s, fault := storetest.NewFault(storetest.New(t))
+	s, fault := storetest.NewFault(bucket.New(t))
 	objects := cache.New(s, 1<<20, nil, cache.Keys{})
 	t.Cleanup(objects.Close)
 	const object = "ns/leader/object"
@@ -295,7 +296,7 @@ func TestSharedParentFollowerRetriesTheLeadersError(t *testing.T) {
 // returned scope and nowhere else, alone in its plan or coalesced with a
 // neighbour, and costs the memory tier no charge.
 func TestTransientLoadsAreServedOnlyFromTheScope(t *testing.T) {
-	s, fault := storetest.NewFault(storetest.New(t))
+	s, fault := storetest.NewFault(bucket.New(t))
 	disk, err := cache.NewDisk(t.TempDir(), 1<<20)
 	if err != nil {
 		t.Fatal(err)
@@ -342,7 +343,7 @@ func TestTransientLoadsAreServedOnlyFromTheScope(t *testing.T) {
 // TestTransientLoadsAreDecoded: R1. A transient child is decoded like any
 // other, alone in its plan or coalesced with a neighbour.
 func TestTransientLoadsAreDecoded(t *testing.T) {
-	s := storetest.New(t)
+	s := bucket.New(t)
 	objects := cache.New(s, 1<<20, nil, cache.Keys{})
 	t.Cleanup(objects.Close)
 	const object = "ns/decode/table.sst"
@@ -386,7 +387,7 @@ func TestTransientLoadsAreDecoded(t *testing.T) {
 // TestZeroConfigReader: R2. New with a zero Config gets the defaults, so
 // FetchRanges does real work instead of skipping every stage.
 func TestZeroConfigReader(t *testing.T) {
-	s := storetest.New(t)
+	s := bucket.New(t)
 	objects := cache.New(s, 1<<20, nil, cache.Keys{})
 	t.Cleanup(objects.Close)
 	const object = "ns/zero/object"
@@ -414,7 +415,7 @@ func TestZeroConfigReader(t *testing.T) {
 // TestGetRangeErrorFailsTheStage: a store error surfaces from FetchRanges
 // and caches nothing; the next stage reads again.
 func TestGetRangeErrorFailsTheStage(t *testing.T) {
-	s, fault := storetest.NewFault(storetest.New(t))
+	s, fault := storetest.NewFault(bucket.New(t))
 	objects := cache.New(s, 1<<20, nil, cache.Keys{})
 	t.Cleanup(objects.Close)
 	const object = "ns/fail/object"
@@ -448,7 +449,7 @@ func TestGetRangeErrorFailsTheStage(t *testing.T) {
 }
 
 func TestInvalidLoadIsErrInvalidExtent(t *testing.T) {
-	s := storetest.New(t)
+	s := bucket.New(t)
 	objects := cache.New(s, 1<<20, nil, cache.Keys{})
 	t.Cleanup(objects.Close)
 	r := newReader(t, s, objects, Config{})
@@ -478,7 +479,7 @@ func TestInvalidLoadIsErrInvalidExtent(t *testing.T) {
 // TestDedupSameKeySameExtent: a Key repeated with its own extent is one
 // child, read once.
 func TestDedupSameKeySameExtent(t *testing.T) {
-	s, fault := storetest.NewFault(storetest.New(t))
+	s, fault := storetest.NewFault(bucket.New(t))
 	objects := cache.New(s, 1<<20, nil, cache.Keys{})
 	t.Cleanup(objects.Close)
 	const object = "ns/dedup/object"

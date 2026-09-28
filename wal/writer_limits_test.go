@@ -9,10 +9,11 @@ import (
 	"time"
 
 	"github.com/axiomhq/objstore/storetest"
+	"github.com/axiomhq/objstore/storetest/bucket"
 )
 
 func TestWriterCommitsAtOnceWhenIdle(t *testing.T) {
-	s, f := storetest.NewFaulty(t)
+	s, f := bucket.NewFaulty(t)
 	f.SetShape(storetest.Shape{Latency: 20 * time.Millisecond})
 	const interval = time.Second
 	w := NewWriter[Bytes](s, testPrefix, 1, nil, WithCommitInterval(interval))
@@ -29,7 +30,7 @@ func TestWriterCommitsAtOnceWhenIdle(t *testing.T) {
 }
 
 func TestWriterRateLimitsEntries(t *testing.T) {
-	s, f := storetest.NewFaulty(t)
+	s, f := bucket.NewFaulty(t)
 	w := NewWriter[Bytes](s, testPrefix, 1, nil, WithCommitInterval(250*time.Millisecond))
 	defer w.Close()
 	ctx := context.Background()
@@ -88,7 +89,7 @@ func TestWriterRateLimitsEntries(t *testing.T) {
 }
 
 func TestWriterCloseKeepsEntryRate(t *testing.T) {
-	s := storetest.New(t)
+	s := bucket.New(t)
 	const interval = 100 * time.Millisecond
 	w := NewWriter[Bytes](s, testPrefix, 1, nil, WithCommitInterval(interval))
 	// The interval runs from the first PUT's start, so start the clock
@@ -114,7 +115,7 @@ func TestWriterCloseKeepsEntryRate(t *testing.T) {
 func TestEntryBoundedByBytes(t *testing.T) {
 	ctx := context.Background()
 	t.Run("one_megabyte_records", func(t *testing.T) {
-		s := storetest.New(t)
+		s := bucket.New(t)
 		w := NewWriter[Bytes](s, testPrefix, 1, nil, WithCommitInterval(MinCommitInterval))
 		defer w.Close()
 		records := make([]Bytes, 100)
@@ -142,7 +143,7 @@ func TestEntryBoundedByBytes(t *testing.T) {
 		}
 	})
 	t.Run("twenty_thousand_small_records", func(t *testing.T) {
-		s := storetest.New(t)
+		s := bucket.New(t)
 		w := NewWriter[Bytes](s, testPrefix, 1, nil)
 		defer w.Close()
 		records := make([]Bytes, 20_000)
@@ -163,7 +164,7 @@ func TestEntryBoundedByBytes(t *testing.T) {
 }
 
 func TestWriterUnackedBoundRefuses(t *testing.T) {
-	s, f := storetest.NewFaulty(t)
+	s, f := bucket.NewFaulty(t)
 	w := NewWriter[Bytes](s, testPrefix, 1, nil, WithCommitInterval(50*time.Millisecond))
 	w.mu.Lock()
 	w.unackedByteLimit = 1 << 20 // exercise the byte path without a 128 MiB fixture

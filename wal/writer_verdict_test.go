@@ -13,6 +13,7 @@ import (
 
 	"github.com/axiomhq/objstore"
 	"github.com/axiomhq/objstore/storetest"
+	"github.com/axiomhq/objstore/storetest/bucket"
 )
 
 var errBoom = errors.New("boom")
@@ -72,7 +73,7 @@ func TestBadRecordFailsOnlyItsCall(t *testing.T) {
 		"size-mismatch": {b: "bad", size: 7},
 	} {
 		t.Run(name, func(t *testing.T) {
-			s, f := storetest.NewFaulty(t)
+			s, f := bucket.NewFaulty(t)
 			var mu sync.Mutex
 			var applied []string
 			w := NewWriter(s, testPrefix, 1, func(_ uint64, _ time.Time, records []testRecord) {
@@ -114,7 +115,7 @@ func TestBadRecordFailsOnlyItsCall(t *testing.T) {
 // TestBadRecordAloneClaimsNothing: a batch whose every call failed to
 // encode claims no sequence; the next batch takes it.
 func TestBadRecordAloneClaimsNothing(t *testing.T) {
-	s := storetest.New(t)
+	s := bucket.New(t)
 	w := NewWriter[testRecord](s, testPrefix, 1, nil, WithCommitInterval(MinCommitInterval))
 	defer w.Close()
 	ctx := context.Background()
@@ -133,7 +134,7 @@ func TestBadRecordAloneClaimsNothing(t *testing.T) {
 // with a negative size, is refused synchronously: nothing is queued and
 // the store is not touched.
 func TestEnqueueRefusesOversizedRecord(t *testing.T) {
-	s, f := storetest.NewFaulty(t)
+	s, f := bucket.NewFaulty(t)
 	w := NewWriter[testRecord](s, testPrefix, 1, nil)
 	defer w.Close()
 	f.ResetOps()
@@ -162,7 +163,7 @@ func TestEnqueueRefusesOversizedRecord(t *testing.T) {
 // TestMaxUnackedCountsIncomingRecords: the record bound counts the records
 // being enqueued, not only those already held.
 func TestMaxUnackedCountsIncomingRecords(t *testing.T) {
-	s, f := storetest.NewFaulty(t)
+	s, f := bucket.NewFaulty(t)
 	w := NewWriter[testRecord](s, testPrefix, 1, nil, WithCommitInterval(MinCommitInterval))
 	w.SetMaxUnacked(3)
 	defer w.Close()
@@ -181,7 +182,7 @@ func TestMaxUnackedCountsIncomingRecords(t *testing.T) {
 func TestLostRaceLatches(t *testing.T) {
 	ctx := context.Background()
 	seedForeign := func(t *testing.T) (*Writer[Bytes], *storetest.Fault) {
-		s, f := storetest.NewFaulty(t)
+		s, f := bucket.NewFaulty(t)
 		if ok, err := put(ctx, s, testPrefix, Header{Seq: 1, Nonce: "other-writer"}, Bytes("theirs")); !ok || err != nil {
 			t.Fatal(ok, err)
 		}
@@ -236,7 +237,7 @@ func TestLostRaceLatches(t *testing.T) {
 // forever).
 func TestMultiPageBatchWithinOneAttempt(t *testing.T) {
 	const interval = 500 * time.Millisecond
-	s, f := storetest.NewFaulty(t)
+	s, f := bucket.NewFaulty(t)
 	w := NewWriter[Bytes](s, testPrefix, 1, nil, WithCommitInterval(interval))
 	w.SetAttemptTimeout(interval)
 	defer w.Close()
@@ -258,7 +259,7 @@ func TestMultiPageBatchWithinOneAttempt(t *testing.T) {
 // new entry, so it does not hold the next batch back another interval.
 func TestAdoptionDoesNotRearmPacing(t *testing.T) {
 	const interval = 500 * time.Millisecond
-	s, f := storetest.NewFaulty(t)
+	s, f := bucket.NewFaulty(t)
 	w := NewWriter[Bytes](s, testPrefix, 1, nil, WithCommitInterval(interval))
 	defer w.Close()
 	f.Set(storetest.Plan{Op: storetest.OpPutIfAbsent, N: 1, Mode: storetest.Ambiguous})
@@ -286,7 +287,7 @@ func TestPartialBatchAdvancesPastLandedPages(t *testing.T) {
 	ctx := context.Background()
 	records := []Bytes{filled('a', 17<<20), filled('b', 17<<20)} // two pages
 	t.Run("lost-race", func(t *testing.T) {
-		s := storetest.New(t)
+		s := bucket.New(t)
 		if ok, err := put(ctx, s, testPrefix, Header{Seq: 2, Nonce: "other-writer"}, Bytes("theirs")); !ok || err != nil {
 			t.Fatal(ok, err)
 		}
@@ -304,7 +305,7 @@ func TestPartialBatchAdvancesPastLandedPages(t *testing.T) {
 	// and a later batch could land under the watermark (acknowledged, never
 	// replayed) or contend with its own landed page.
 	t.Run("floor", func(t *testing.T) {
-		s, f := storetest.NewFaulty(t)
+		s, f := bucket.NewFaulty(t)
 		w := NewWriter[Bytes](s, testPrefix, 1, nil, WithCommitInterval(MinCommitInterval))
 		defer w.Close()
 		var mu sync.Mutex
@@ -357,7 +358,7 @@ func assertMarkerThen(t *testing.T, s *objstore.Store, id string) {
 // or 1 (Writer); after an abandoned batch either one ends it with a marker.
 func TestSinglePageAfterAbandonedBatch(t *testing.T) {
 	for _, pages := range []uint64{0, 1} {
-		s := storetest.New(t)
+		s := bucket.New(t)
 		ctx := context.Background()
 		if ok, err := put(ctx, s, testPrefix, Header{Seq: 1, Nonce: "abandoned", BatchPages: 3}, Bytes("x")); !ok || err != nil {
 			t.Fatal(ok, err)
@@ -384,7 +385,7 @@ func TestWriteErrorIsAnError(t *testing.T) {
 // Stats (and Enqueue's admission) polled throughout never race with the
 // commit (run under -race), and the dropped records stop counting.
 func TestStatsDuringDroppedRecordCommit(t *testing.T) {
-	s, f := storetest.NewFaulty(t)
+	s, f := bucket.NewFaulty(t)
 	w := NewWriter[testRecord](s, testPrefix, 1, nil, WithCommitInterval(MinCommitInterval))
 	defer w.Close()
 	first, release := wedge(t, w, f)
@@ -433,7 +434,7 @@ func TestStatsDuringDroppedRecordCommit(t *testing.T) {
 // bound can never be admitted, so it is ErrRecordTooLarge, not the
 // retryable ErrOverloaded, and it is not counted as shed load.
 func TestEnqueueRefusesBatchPastUnackedBound(t *testing.T) {
-	w := NewWriter[testRecord](storetest.New(t), testPrefix, 1, nil)
+	w := NewWriter[testRecord](bucket.New(t), testPrefix, 1, nil)
 	defer w.Close()
 	huge := []testRecord{{size: 50 << 20}, {size: 50 << 20}, {size: 50 << 20}} // each fits a page; together past the byte bound
 	if _, err := w.Enqueue(context.Background(), huge); !errors.Is(err, ErrRecordTooLarge) || errors.Is(err, ErrOverloaded) ||

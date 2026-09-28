@@ -10,10 +10,11 @@ import (
 	"github.com/axiomhq/objstore"
 	"github.com/axiomhq/objstore/fs"
 	"github.com/axiomhq/objstore/storetest"
+	"github.com/axiomhq/objstore/storetest/bucket"
 )
 
 func TestFaultModes(t *testing.T) {
-	s, f := storetest.NewFaulty(t)
+	s, f := bucket.NewFaulty(t)
 	ctx := context.Background()
 
 	t.Run("NthCallOnly", func(t *testing.T) {
@@ -104,7 +105,7 @@ func TestFaultModes(t *testing.T) {
 // ranged reads and ETag reads all count what they returned, and ResetOps
 // zeroes it with the call counts.
 func TestFaultReadBytes(t *testing.T) {
-	s, f := storetest.NewFaulty(t)
+	s, f := bucket.NewFaulty(t)
 	ctx := context.Background()
 	if err := s.Put(ctx, "rb", make([]byte, 100)); err != nil {
 		t.Fatal(err)
@@ -132,7 +133,7 @@ func TestFaultReadBytes(t *testing.T) {
 }
 
 func TestFaultWriteBytes(t *testing.T) {
-	s, f := storetest.NewFaulty(t)
+	s, f := bucket.NewFaulty(t)
 	ctx := context.Background()
 	if err := s.Put(ctx, "write", make([]byte, 7)); err != nil {
 		t.Fatal(err)
@@ -153,7 +154,7 @@ func TestFaultWriteBytes(t *testing.T) {
 }
 
 func TestFaultShapeIsDeterministicAndBounded(t *testing.T) {
-	s, f := storetest.NewFaulty(t)
+	s, f := bucket.NewFaulty(t)
 	ctx := context.Background()
 	if err := s.Put(ctx, "shape", make([]byte, 1000)); err != nil {
 		t.Fatal(err)
@@ -225,7 +226,7 @@ func TestFaultSetShapeRacesCalls(t *testing.T) {
 }
 
 func TestConditionalReadFaultAndMetering(t *testing.T) {
-	s, f := storetest.NewFaulty(t)
+	s, f := bucket.NewFaulty(t)
 	ctx := context.Background()
 	if err := s.Put(ctx, "conditional", []byte("data")); err != nil {
 		t.Fatal(err)
@@ -258,7 +259,7 @@ func TestConditionalReadFaultAndMetering(t *testing.T) {
 }
 
 func TestWriteKeysCountsLandedConditionalPages(t *testing.T) {
-	s, f := storetest.NewFaulty(t)
+	s, f := bucket.NewFaulty(t)
 	ctx := context.Background()
 	const key = "ns/root/wal/00000000000000000001"
 	f.Set(storetest.Plan{Op: storetest.OpPutIfAbsent, Key: "/wal/", N: 1, Mode: storetest.Ambiguous})
@@ -295,7 +296,7 @@ func TestWriteKeysCountsLandedConditionalPages(t *testing.T) {
 // TestShapedReadReturnsNothing: a read the shaper fails hands back no data
 // and meters no bytes, like a read the backend failed.
 func TestShapedReadReturnsNothing(t *testing.T) {
-	s, f := storetest.NewFaulty(t)
+	s, f := bucket.NewFaulty(t)
 	ctx := context.Background()
 	if err := s.Put(ctx, "shaped", []byte("payload")); err != nil {
 		t.Fatal(err)
@@ -320,7 +321,7 @@ func TestFaultPauseResume(t *testing.T) {
 	ctx := context.Background()
 
 	t.Run("Resume", func(t *testing.T) {
-		s, f := storetest.NewFaulty(t)
+		s, f := bucket.NewFaulty(t)
 		f.Set(storetest.Plan{Op: storetest.OpPut, N: 1, Mode: storetest.Pause, Key: "paused"})
 		done := make(chan error, 1)
 		go func() { done <- s.Put(ctx, "paused", []byte("x")) }()
@@ -346,7 +347,7 @@ func TestFaultPauseResume(t *testing.T) {
 	})
 
 	t.Run("ContextEnds", func(t *testing.T) {
-		s, f := storetest.NewFaulty(t)
+		s, f := bucket.NewFaulty(t)
 		f.Set(storetest.Plan{Op: storetest.OpPut, N: 1, Mode: storetest.Pause})
 		pctx, cancel := context.WithTimeout(ctx, 20*time.Millisecond)
 		defer cancel()
@@ -360,7 +361,7 @@ func TestFaultPauseResume(t *testing.T) {
 }
 
 func TestFaultMatchFrom(t *testing.T) {
-	s, f := storetest.NewFaulty(t)
+	s, f := bucket.NewFaulty(t)
 	ctx := context.Background()
 	if err := s.Put(ctx, "ranged", []byte("0123456789")); err != nil {
 		t.Fatal(err)
@@ -387,7 +388,7 @@ func TestFaultMatchFrom(t *testing.T) {
 }
 
 func TestFaultWatchRewrites(t *testing.T) {
-	s, f := storetest.NewFaulty(t)
+	s, f := bucket.NewFaulty(t)
 	ctx := context.Background()
 	if err := s.Put(ctx, "before", []byte("a")); err != nil {
 		t.Fatal(err)
@@ -415,7 +416,7 @@ func TestFaultWatchRewrites(t *testing.T) {
 }
 
 func TestFaultReadKeys(t *testing.T) {
-	s, f := storetest.NewFaulty(t)
+	s, f := bucket.NewFaulty(t)
 	ctx := context.Background()
 	for _, k := range []string{"rk/a", "rk/b"} {
 		if err := s.Put(ctx, k, []byte("data")); err != nil {
@@ -442,7 +443,7 @@ func TestFaultReadKeys(t *testing.T) {
 }
 
 func TestFaultListPrefixes(t *testing.T) {
-	s, f := storetest.NewFaulty(t)
+	s, f := bucket.NewFaulty(t)
 	ctx := context.Background()
 	if err := s.Put(ctx, "lp/one/x", []byte("x")); err != nil {
 		t.Fatal(err)
@@ -480,7 +481,7 @@ func TestFaultZeroValue(t *testing.T) {
 // under earlier plans too.
 func TestFaultPauseRearm(t *testing.T) {
 	ctx := t.Context()
-	s, f := storetest.NewFaulty(t)
+	s, f := bucket.NewFaulty(t)
 	f.Resume() // before the plan: must not pre-release it
 	f.Set(storetest.Plan{Op: storetest.OpPut, N: 1, Mode: storetest.Pause, Key: "first"})
 	first := make(chan error, 1)

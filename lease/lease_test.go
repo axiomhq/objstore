@@ -15,6 +15,7 @@ import (
 	"time"
 
 	"github.com/axiomhq/objstore/storetest"
+	"github.com/axiomhq/objstore/storetest/bucket"
 )
 
 func TestLease(t *testing.T) {
@@ -28,7 +29,7 @@ func TestLease(t *testing.T) {
 	}
 
 	t.Run("AcquireRenewExpireTakeover", func(t *testing.T) {
-		s := storetest.New(t)
+		s := bucket.New(t)
 		// First acquire: PutIfAbsent, nothing there yet.
 		a, err := Acquire(ctx, s, "a/lease", "owner-a", ttl)
 		if err != nil {
@@ -74,7 +75,7 @@ func TestLease(t *testing.T) {
 	// read-back is what turns that into a held lease instead of a spurious
 	// ErrNotOwner.
 	t.Run("AmbiguousTakeover", func(t *testing.T) {
-		s, f := storetest.NewFaulty(t)
+		s, f := bucket.NewFaulty(t)
 		b, err := Acquire(ctx, s, "amb/lease", "owner-b", ttl)
 		if err != nil {
 			t.Fatal(err)
@@ -94,7 +95,7 @@ func TestLease(t *testing.T) {
 	})
 
 	t.Run("AmbiguousFirstAcquire", func(t *testing.T) {
-		s, f := storetest.NewFaulty(t)
+		s, f := bucket.NewFaulty(t)
 		f.Set(storetest.Plan{Op: storetest.OpPutIfAbsent, N: 1, Mode: storetest.Ambiguous, Key: "fresh/lease"})
 		fr, err := Acquire(ctx, s, "fresh/lease", "owner-a", ttl)
 		if f.Fired() != 1 {
@@ -110,7 +111,7 @@ func TestLease(t *testing.T) {
 	// The fence, from the renewal side: a lease stolen while its owner is
 	// renewing must fence that owner on its next renewal.
 	t.Run("StolenFences", func(t *testing.T) {
-		s := storetest.New(t)
+		s := bucket.New(t)
 		var logs lockedBuffer
 		fenced := make(chan struct{})
 		d, err := Acquire(ctx, s, "b/lease", "owner-d", ttl)
@@ -142,7 +143,7 @@ func TestLease(t *testing.T) {
 	})
 
 	t.Run("RenewalAttributesALateLandingWrite", func(t *testing.T) {
-		s := storetest.New(t)
+		s := bucket.New(t)
 		ttl := 2 * time.Second
 		l := New(s, "a/lease", "owner-a", ttl)
 		if err := l.Take(ctx); err != nil {
@@ -176,7 +177,7 @@ func TestLease(t *testing.T) {
 	// read-back were lost. A retried Take must adopt our own record, not
 	// wait 1.5 TTL for it as if somebody else held it.
 	t.Run("RetriedTakeAfterUnresolvedAcquire", func(t *testing.T) {
-		ls := &lossy{Store: storetest.New(t)}
+		ls := &lossy{Store: bucket.New(t)}
 		ls.loseNextPut()
 		l := New(ls, "retry/lease", "owner-a", time.Minute)
 		if err := l.Take(ctx); err == nil || errors.Is(err, ErrNotOwner) {
@@ -195,7 +196,7 @@ func TestLease(t *testing.T) {
 	})
 
 	t.Run("TakeoverHonorsClockSkewMargin", func(t *testing.T) {
-		s := storetest.New(t)
+		s := bucket.New(t)
 		const ttl = time.Minute
 		a, err := Acquire(ctx, s, "skew/lease", "owner", ttl)
 		if err != nil {
@@ -230,7 +231,7 @@ func TestLease(t *testing.T) {
 	// L1: a lease driven by Take has no renewer; Retire and Release must
 	// still end it instead of waiting forever on done.
 	t.Run("NewTakeRelease", func(t *testing.T) {
-		s := storetest.New(t)
+		s := bucket.New(t)
 		l := New(s, "take/lease", "owner-a", time.Minute)
 		if err := l.Take(ctx); err != nil {
 			t.Fatal(err)
@@ -260,7 +261,7 @@ func TestLease(t *testing.T) {
 	})
 
 	t.Run("AcquireTwice", func(t *testing.T) {
-		s := storetest.New(t)
+		s := bucket.New(t)
 		l := New(s, "twice/lease", "owner-a", time.Minute)
 		if err := l.Acquire(ctx); err != nil {
 			t.Fatal(err)
@@ -284,7 +285,7 @@ func TestLease(t *testing.T) {
 	})
 
 	t.Run("ReleaseHonorsContext", func(t *testing.T) {
-		s := storetest.New(t)
+		s := bucket.New(t)
 		l, err := Acquire(ctx, s, "ctx/lease", "owner-a", time.Minute)
 		if err != nil {
 			t.Fatal(err)
@@ -318,7 +319,7 @@ func TestCheckHeadOnRenewal(t *testing.T) {
 	const ttl = 200 * time.Millisecond
 
 	t.Run("NotCalledOnInitialTake", func(t *testing.T) {
-		s := storetest.New(t)
+		s := bucket.New(t)
 		l := New(s, "probe/initial", "owner", time.Minute)
 		calls := 0
 		l.CheckHeadOnRenewal(func(context.Context) error { calls++; return nil })
@@ -337,7 +338,7 @@ func TestCheckHeadOnRenewal(t *testing.T) {
 	})
 
 	t.Run("NotOwnerFences", func(t *testing.T) {
-		s := storetest.New(t)
+		s := bucket.New(t)
 		l, err := Acquire(ctx, s, "probe/fence", "owner", ttl)
 		if err != nil {
 			t.Fatal(err)
@@ -354,7 +355,7 @@ func TestCheckHeadOnRenewal(t *testing.T) {
 	})
 
 	t.Run("OtherErrorDoesNotFence", func(t *testing.T) {
-		s := storetest.New(t)
+		s := bucket.New(t)
 		l, err := Acquire(ctx, s, "probe/soft", "owner", ttl)
 		if err != nil {
 			t.Fatal(err)
@@ -391,7 +392,7 @@ func TestCheckHeadOnRenewal(t *testing.T) {
 // assertion.
 func TestSetLoggerRace(t *testing.T) {
 	ctx := context.Background()
-	s, f := storetest.NewFaulty(t)
+	s, f := bucket.NewFaulty(t)
 	const ttl = 100 * time.Millisecond
 	l, err := Acquire(ctx, s, "log/lease", "owner", ttl)
 	if err != nil {
@@ -491,7 +492,7 @@ func (b *lockedBuffer) String() string {
 func TestReleaseDuringRenewal(t *testing.T) {
 	ctx := context.Background()
 	const ttl = 2 * time.Second // renew every 500ms, 1s per attempt
-	s, f := storetest.NewFaulty(t)
+	s, f := bucket.NewFaulty(t)
 	l, err := Acquire(ctx, s, "rel/lease", "owner-a", ttl)
 	if err != nil {
 		t.Fatal(err)
@@ -533,7 +534,7 @@ func TestReleaseDuringRenewal(t *testing.T) {
 // still hands the landed write back.
 func TestReleaseDuringFirstAcquire(t *testing.T) {
 	ctx := context.Background()
-	s, f := storetest.NewFaulty(t)
+	s, f := bucket.NewFaulty(t)
 	l := New(s, "rel/first", "owner-a", time.Minute)
 	f.Set(storetest.Plan{Op: storetest.OpPutIfAbsent, N: 1, Mode: storetest.Pause, Key: "rel/first"})
 	acquired := make(chan error, 1)
@@ -556,7 +557,7 @@ func TestReleaseDuringFirstAcquire(t *testing.T) {
 }
 
 func TestTakeAfterRetire(t *testing.T) {
-	l := New(storetest.New(t), "retired/lease", "owner-a", time.Minute)
+	l := New(bucket.New(t), "retired/lease", "owner-a", time.Minute)
 	l.Retire()
 	if err := l.Take(context.Background()); !errors.Is(err, ErrNotOwner) {
 		t.Fatalf("Take on a retired lease: %v", err)

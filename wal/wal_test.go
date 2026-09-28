@@ -15,6 +15,7 @@ import (
 
 	"github.com/axiomhq/objstore"
 	"github.com/axiomhq/objstore/storetest"
+	"github.com/axiomhq/objstore/storetest/bucket"
 )
 
 const testPrefix = "log/"
@@ -88,7 +89,7 @@ func TestKeyOrdering(t *testing.T) {
 }
 
 func TestAppendReplay(t *testing.T) {
-	s := storetest.New(t)
+	s := bucket.New(t)
 	ctx := context.Background()
 	for seq := uint64(1); seq <= 3; seq++ {
 		ok, err := put(ctx, s, testPrefix, Header{Seq: seq}, Bytes{byte('a' + seq - 1)})
@@ -126,7 +127,7 @@ func TestAppendReplay(t *testing.T) {
 // walk GETs after+1, +2, ... and stops at the first miss. No listing, and
 // the only request beyond the pages it had to read anyway is that miss.
 func TestReplayWalksToNotFound(t *testing.T) {
-	s, f := storetest.NewFaulty(t)
+	s, f := bucket.NewFaulty(t)
 	ctx := context.Background()
 	for seq := uint64(1); seq <= 3; seq++ {
 		if ok, err := put(ctx, s, testPrefix, Header{Seq: seq}, Bytes("d")); err != nil || !ok {
@@ -194,7 +195,7 @@ func FuzzSeqFromKey(f *testing.F) {
 
 func TestWalkWithGetUsesSuppliedFetcher(t *testing.T) {
 	ctx := context.Background()
-	s := storetest.New(t)
+	s := bucket.New(t)
 	if ok, err := put(ctx, s, testPrefix, Header{Seq: 1}, Bytes("a")); err != nil || !ok {
 		t.Fatalf("append: ok=%v err=%v", ok, err)
 	}
@@ -213,7 +214,7 @@ func TestWalkWithGetUsesSuppliedFetcher(t *testing.T) {
 
 func TestReplayPublishesBatchOnlyAtLastPage(t *testing.T) {
 	ctx := context.Background()
-	s := storetest.New(t)
+	s := bucket.New(t)
 	records := rows("a", "b")
 	for i, r := range records {
 		h := Header{Seq: uint64(i + 1), Nonce: "batch", BatchPages: 2, BatchIndex: uint64(i)}
@@ -246,7 +247,7 @@ func TestReplayPublishesBatchOnlyAtLastPage(t *testing.T) {
 
 func TestReplayRejectsSequenceMismatchInsideBatch(t *testing.T) {
 	ctx := context.Background()
-	s := storetest.New(t)
+	s := bucket.New(t)
 	for seq := uint64(1); seq <= 2; seq++ {
 		h := Header{Seq: seq, Nonce: "batch", BatchPages: 2, BatchIndex: seq - 1}
 		if seq == 1 {

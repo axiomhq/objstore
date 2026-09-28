@@ -129,8 +129,8 @@ Every write carries a fresh nonce, so the read-back tells "my write landed" from
 
 ## Tests with faults
 
-1. `s := storetest.New(t)` gives a fresh bucket per test, dropped at cleanup.
-2. `s, f := storetest.NewFaulty(t)` wraps it in a `*storetest.Fault`.
+1. `s := bucket.New(t)` (`objstore/storetest/bucket`) gives a fresh bucket per test, dropped at cleanup.
+2. `s, f := bucket.NewFaulty(t)` wraps it in a `*storetest.Fault`; `storetest.Faulty(t, s)` wraps a Store you opened yourself.
 3. Arm one crash point: `f.Set(storetest.Plan{Op: storetest.OpPut, N: 2, Key: "manifest", Mode: storetest.Ambiguous})`.
    `Fail` errors before the write, `Ambiguous` writes and then errors, `Hang` blocks until cancel, `Pause` blocks until `f.Resume()`.
 4. Read what happened: `f.Fired()`, `f.Ops()`, `f.ReadKeys()`, `f.WriteKeys()`, `f.ReadBytes()`, `f.WriteBytes()`.
@@ -150,6 +150,8 @@ Without `OBJSTORE_TEST_S3` every suite runs on a file bucket in a temp
 directory; the S3 client's error and paging mapping runs against a fake
 server either way. `storetest.Conformance(t, s)` is the suite every backend
 passes; run it on your own `objstore.Backend` via `objstore.Open`.
+`storetest` imports no provider, so that links neither the AWS nor the GCS
+SDK; the per-test buckets live in `storetest/bucket`.
 
 Real providers, each skipped when its variable is unset:
 

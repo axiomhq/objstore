@@ -18,6 +18,7 @@ import (
 	"github.com/axiomhq/objstore"
 	"github.com/axiomhq/objstore/fs"
 	"github.com/axiomhq/objstore/storetest"
+	"github.com/axiomhq/objstore/storetest/bucket"
 )
 
 type cacheScenarioResult struct {
@@ -185,7 +186,7 @@ func TestPutFillsTheDiskTier(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	c := New(storetest.New(t), 1<<10, disk, Keys{})
+	c := New(bucket.New(t), 1<<10, disk, Keys{})
 	defer c.Close()
 	key := "ns/x/table/1"
 	data := bytes.Repeat([]byte("table"), 1000)

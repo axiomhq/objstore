@@ -9,6 +9,7 @@ import (
 	"github.com/axiomhq/objstore"
 	"github.com/axiomhq/objstore/cache"
 	"github.com/axiomhq/objstore/storetest"
+	"github.com/axiomhq/objstore/storetest/bucket"
 )
 
 func newReader(t *testing.T, s *objstore.Store, objects *cache.Cache, cfg Config) *Reader {
@@ -21,7 +22,7 @@ func newReader(t *testing.T, s *objstore.Store, objects *cache.Cache, cfg Config
 }
 
 func TestReaderFetch(t *testing.T) {
-	s, fault := storetest.NewFault(storetest.New(t))
+	s, fault := storetest.NewFault(bucket.New(t))
 	objects := cache.New(s, 1<<20, nil, cache.Keys{})
 	t.Cleanup(objects.Close)
 	r := newReader(t, s, objects, Config{})
@@ -44,7 +45,7 @@ func TestReaderFetch(t *testing.T) {
 }
 
 func TestReaderPrefetch(t *testing.T) {
-	s, fault := storetest.NewFault(storetest.New(t))
+	s, fault := storetest.NewFault(bucket.New(t))
 	objects := cache.New(s, 1<<20, nil, cache.Keys{})
 	t.Cleanup(objects.Close)
 	r := newReader(t, s, objects, Config{})

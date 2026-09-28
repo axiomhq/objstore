@@ -6,12 +6,13 @@ import (
 
 	"github.com/axiomhq/objstore"
 	"github.com/axiomhq/objstore/storetest"
+	"github.com/axiomhq/objstore/storetest/bucket"
 )
 
 // TestFaultyPassthrough: a disarmed Fault is the backend it wraps — it runs
 // the same conformance suite every backend runs.
 func TestFaultyPassthrough(t *testing.T) {
-	s, _ := storetest.NewFaulty(t)
+	s, _ := bucket.NewFaulty(t)
 	storetest.Conformance(t, s)
 }
 

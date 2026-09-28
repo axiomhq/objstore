@@ -17,10 +17,11 @@ import (
 	"github.com/axiomhq/objstore"
 	"github.com/axiomhq/objstore/fs"
 	"github.com/axiomhq/objstore/storetest"
+	"github.com/axiomhq/objstore/storetest/bucket"
 )
 
 func TestWriterCoalescesAndCommits(t *testing.T) {
-	s := storetest.New(t)
+	s := bucket.New(t)
 	ctx := context.Background()
 	var mu sync.Mutex
 	var committed []string
@@ -107,7 +108,7 @@ func assertContiguous(t *testing.T, s *objstore.Store, prefix string, want int) 
 // leaves the log SHORT — never holey. Every way a batch can end badly is
 // exercised, and after each one the pages in the bucket are still 1..n.
 func TestCrashedWriterLeavesNoHole(t *testing.T) {
-	s, f := storetest.NewFaulty(t)
+	s, f := bucket.NewFaulty(t)
 	ctx := context.Background()
 	fast := WithCommitInterval(10 * time.Millisecond) // the cadence is not under test
 	w := NewWriter[Bytes](s, testPrefix, 1, nil, fast)
@@ -164,7 +165,7 @@ func TestCrashedWriterLeavesNoHole(t *testing.T) {
 }
 
 func TestWriterSplitBrain(t *testing.T) {
-	s := storetest.New(t)
+	s := bucket.New(t)
 	ctx := context.Background()
 	a := NewWriter[Bytes](s, testPrefix, 1, nil)
 	defer a.Close()
@@ -189,7 +190,7 @@ func TestWriterAmbiguousPutOwnNonce(t *testing.T) {
 	// Simulates a PUT that succeeded server-side while the response was
 	// lost: the entry exists at nextSeq bearing THIS BATCH's nonce. commit
 	// must treat it as committed — not split brain — and continue at seq+1.
-	s := storetest.New(t)
+	s := bucket.New(t)
 	ctx := context.Background()
 	prior := rows("already-durable")
 	ok, err := put(ctx, s, testPrefix, Header{Seq: 1, Nonce: "batch-nonce-x"}, prior...)
@@ -221,7 +222,7 @@ func TestWriterAmbiguousPutOwnNonce(t *testing.T) {
 // finished: it cannot tell which sequence is next, so every later Append
 // gets the same error without touching the store.
 func TestWriterCorruptReadbackIsUnknown(t *testing.T) {
-	s, f := storetest.NewFaulty(t)
+	s, f := bucket.NewFaulty(t)
 	ctx := context.Background()
 	if err := s.Put(ctx, Key(testPrefix, 1), []byte("corrupt page")); err != nil {
 		t.Fatal(err)
@@ -249,7 +250,7 @@ func filled(c byte, n int) Bytes { return Bytes(bytes.Repeat([]byte{c}, n)) }
 func TestWriterSplitsAtomicBatchAndResolvesAmbiguousPages(t *testing.T) {
 	for _, nth := range []int{1, 2} {
 		t.Run(fmt.Sprint(nth), func(t *testing.T) {
-			s, f := storetest.NewFaulty(t)
+			s, f := bucket.NewFaulty(t)
 			f.Set(storetest.Plan{Op: storetest.OpPutIfAbsent, N: nth, Mode: storetest.Ambiguous, Key: testPrefix})
 			w := NewWriter[Bytes](s, testPrefix, 1, nil, WithCommitInterval(10*time.Millisecond))
 			defer w.Close()
@@ -371,7 +372,7 @@ func TestWriterRejectsOversizedRecordBeforePublish(t *testing.T) {
 }
 
 func TestRestartAfterCrashBetweenPagesAbandonsPartialBatch(t *testing.T) {
-	s := storetest.New(t)
+	s := bucket.New(t)
 	ctx := context.Background()
 	partial := Header{Seq: 1, Nonce: "crashed", BatchPages: 2, BatchIndex: 0}
 	if ok, err := put(ctx, s, testPrefix, partial, Bytes("partial")); err != nil || !ok {
@@ -392,7 +393,7 @@ func TestWriterUnresolvedOnClose(t *testing.T) {
 	// Storage that never answers: a batch's outcome is unknowable. The
 	// writer must neither lie nor hang — Close reports ErrUnresolved. The
 	// first PUT hangs until its attempt deadline; every call after it fails.
-	s, f := storetest.NewFaulty(t)
+	s, f := bucket.NewFaulty(t)
 	f.Set(storetest.Plan{Op: storetest.OpPutIfAbsent, N: 1, Mode: storetest.Hang})
 	f.SetShape(storetest.Shape{ErrorRate: 1, Seed: 1})
 	w := NewWriter[Bytes](s, testPrefix, 1, nil, WithCommitInterval(20*time.Millisecond))
@@ -423,7 +424,7 @@ func TestWriterUnresolvedOnClose(t *testing.T) {
 // block forever. Past the bound Append refuses immediately, and the queue
 // never grows past the bound it was given.
 func TestWriterRejectsPastUnackedBound(t *testing.T) {
-	s, f := storetest.NewFaulty(t)
+	s, f := bucket.NewFaulty(t)
 	const bound = 8
 	w := NewWriter[Bytes](s, testPrefix, 1, nil, WithCommitInterval(50*time.Millisecond))
 	w.SetMaxUnacked(bound)
@@ -525,7 +526,7 @@ func (h *lineHandler) snapshot() []string {
 // newest failed attempt, the log says it once per window rather than once
 // per tick, and the first commit that lands clears the record.
 func TestWriterReportsBackendCause(t *testing.T) {
-	s, f := storetest.NewFaulty(t)
+	s, f := bucket.NewFaulty(t)
 	h := &lineHandler{}
 	w := NewWriter[Bytes](s, testPrefix, 1, nil, WithCommitInterval(10*time.Millisecond))
 	w.SetLogger(slog.New(h))
@@ -586,7 +587,7 @@ func TestWriterReportsBackendCause(t *testing.T) {
 }
 
 func TestWriterClosed(t *testing.T) {
-	s := storetest.New(t)
+	s := bucket.New(t)
 	w := NewWriter[Bytes](s, testPrefix, 1, nil)
 	w.Close()
 	if err := w.Append(context.Background(), rows("x")); !errors.Is(err, ErrWriterClosed) {
@@ -597,7 +598,7 @@ func TestWriterClosed(t *testing.T) {
 func TestWriterEmptyAppend(t *testing.T) {
 	// Regression: an empty append must return promptly, not strand a waiter
 	// in a batch flush() skips.
-	s := storetest.New(t)
+	s := bucket.New(t)
 	w := NewWriter[Bytes](s, testPrefix, 1, nil)
 	defer w.Close()
 	done := make(chan error, 1)
@@ -617,7 +618,7 @@ func TestWriterEmptyAppend(t *testing.T) {
 }
 
 func TestWriterKeepsBatchPendingUntilApplied(t *testing.T) {
-	s := storetest.New(t)
+	s := bucket.New(t)
 	entered, resume := make(chan struct{}), make(chan struct{})
 	w := NewWriter(s, testPrefix, 1, func(uint64, time.Time, []Bytes) {
 		close(entered)
@@ -647,7 +648,7 @@ func TestWriterKeepsBatchPendingUntilApplied(t *testing.T) {
 func TestWriterCloseDrains(t *testing.T) {
 	// Regression: Close must not return until the final flush committed — a
 	// caller may delete the prefix right after Close.
-	s := storetest.New(t)
+	s := bucket.New(t)
 	w := NewWriter[Bytes](s, testPrefix, 1, nil)
 	errCh, err := w.Enqueue(context.Background(), rows("last")) // accepted once Enqueue returns
 	if err != nil {
@@ -669,7 +670,7 @@ func TestWriterCloseDrains(t *testing.T) {
 // append is held until a full interval has passed since that commit.
 func TestCommitIntervalCoalescesIntoOnePage(t *testing.T) {
 	const interval = 300 * time.Millisecond
-	s, f := storetest.NewFaulty(t)
+	s, f := bucket.NewFaulty(t)
 	f.SetShape(storetest.Shape{Latency: 20 * time.Millisecond})
 	ctx := context.Background()
 	var mu sync.Mutex
@@ -759,7 +760,7 @@ func TestWithCommitIntervalClampsValuesOutOfRange(t *testing.T) {
 			t.Fatalf("WithCommitInterval(%s) set %s, want %s", d, o.commitInterval, want)
 		}
 	}
-	w := NewWriter[Bytes](storetest.New(t), testPrefix, 1, nil, WithCommitInterval(200*time.Millisecond))
+	w := NewWriter[Bytes](bucket.New(t), testPrefix, 1, nil, WithCommitInterval(200*time.Millisecond))
 	defer w.Close()
 	// Pacing precedes the attempt's deadline, so the deadline is not
 	// raised to the commit interval.
@@ -781,7 +782,7 @@ func TestWithCommitIntervalClampsValuesOutOfRange(t *testing.T) {
 // watermark already covers.
 func TestDurableEntryIsOneConditionalPut(t *testing.T) {
 	ctx := context.Background()
-	s, f := storetest.NewFaulty(t)
+	s, f := bucket.NewFaulty(t)
 	w := NewWriter[Bytes](s, testPrefix, 1, nil, WithCommitInterval(MinCommitInterval))
 	defer w.Close()
 	f.ResetOps()

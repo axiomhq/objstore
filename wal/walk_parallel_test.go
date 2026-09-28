@@ -15,7 +15,7 @@ import (
 	"time"
 
 	"github.com/axiomhq/objstore"
-	"github.com/axiomhq/objstore/storetest"
+	"github.com/axiomhq/objstore/storetest/bucket"
 )
 
 // summary is a page as a test decoder sees it: its records (nil for a
@@ -39,7 +39,7 @@ func scanSummary(data []byte) (Header, summary, error) {
 
 func TestWalkParallelMatchesWalk(t *testing.T) {
 	ctx := context.Background()
-	s := storetest.New(t)
+	s := bucket.New(t)
 	rng := rand.New(rand.NewSource(23))
 	type page struct {
 		h  Header
@@ -112,7 +112,7 @@ func TestWalkParallelMatchesWalk(t *testing.T) {
 
 func TestWalkParallelVisitError(t *testing.T) {
 	ctx := context.Background()
-	s := storetest.New(t)
+	s := bucket.New(t)
 	for seq := uint64(1); seq <= 20; seq++ {
 		if ok, err := put(ctx, s, testPrefix, Header{Seq: seq}, Bytes(fmt.Sprint(seq))); !ok || err != nil {
 			t.Fatal(err)
@@ -141,7 +141,7 @@ func errorText(err error) string {
 
 func TestWalkParallelStopsAtFirstError(t *testing.T) {
 	ctx := context.Background()
-	s := storetest.New(t)
+	s := bucket.New(t)
 	for seq := uint64(1); seq <= 12; seq++ {
 		if ok, err := put(ctx, s, testPrefix, Header{Seq: seq}, Bytes(fmt.Sprint(seq))); !ok || err != nil {
 			t.Fatal(err)
@@ -168,7 +168,7 @@ func TestWalkParallelStopsAtFirstError(t *testing.T) {
 
 func TestWalkParallelCancellation(t *testing.T) {
 	ctx := context.Background()
-	s := storetest.New(t)
+	s := bucket.New(t)
 	for seq := uint64(1); seq <= 64; seq++ {
 		if ok, err := put(ctx, s, testPrefix, Header{Seq: seq}, Bytes(fmt.Sprint(seq))); !ok || err != nil {
 			t.Fatal(err)
@@ -193,7 +193,7 @@ func TestWalkParallelCancellation(t *testing.T) {
 // fetched serially would never let the first one finish.
 func TestWalkParallelWithGetFetchesConcurrently(t *testing.T) {
 	ctx := context.Background()
-	s := storetest.New(t)
+	s := bucket.New(t)
 	const pages, workers = 8, 4
 	for seq := uint64(1); seq <= pages; seq++ {
 		if ok, err := put(ctx, s, testPrefix, Header{Seq: seq}, Bytes(fmt.Sprint(seq))); !ok || err != nil {
@@ -234,7 +234,7 @@ func TestWalkParallelWithGetFetchesConcurrently(t *testing.T) {
 
 func BenchmarkWalk(b *testing.B) {
 	ctx := context.Background()
-	s := storetest.New(b)
+	s := bucket.New(b)
 	const pages = 64
 	for seq := uint64(1); seq <= pages; seq++ {
 		records := make([]Bytes, 256)
