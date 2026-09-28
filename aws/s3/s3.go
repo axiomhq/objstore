@@ -1,6 +1,6 @@
 // Package s3 is the S3 backend for objstore. Cloudflare R2, MinIO, Ceph and
-// Hetzner use it too because they speak the S3 API. The AWS KMS key
-// provider is github.com/axiomhq/objstore/aws/kms.
+// Hetzner use it too because they speak the S3 API. A write whose context
+// carries objstore.WithKMSKey is stored with SSE-KMS under that key.
 package s3
 
 import (
@@ -80,8 +80,7 @@ func endpointAllowed(endpoint string, allowed []string) bool {
 	return slices.Contains(allowed, u.String())
 }
 
-// Open returns a Store over New(ctx, cfg) with ocfg's pacing, write bound
-// and encryption.
+// Open returns a Store over New(ctx, cfg) with ocfg's pacing and write bound.
 func Open(ctx context.Context, cfg Config, ocfg objstore.Config) (*objstore.Store, error) {
 	b, err := New(ctx, cfg)
 	if err != nil {
@@ -135,7 +134,7 @@ func New(ctx context.Context, cfg Config) (*Backend, error) {
 // decides what it means for its users; the store does not interpret it.
 func (s *Backend) SSE() (mode, kmsKeyID string) { return s.sse, s.kmsKeyID }
 
-func (s *Backend) putInput(key string, data []byte) *awss3.PutObjectInput {
+func (s *Backend) putInput(ctx context.Context, key string, data []byte) *awss3.PutObjectInput {
 	in := &awss3.PutObjectInput{Bucket: &s.bucket, Key: &key, Body: bytes.NewReader(data)}
 	if s.sse != "" {
 		in.ServerSideEncryption = types.ServerSideEncryption(s.sse)
@@ -143,7 +142,28 @@ func (s *Backend) putInput(key string, data []byte) *awss3.PutObjectInput {
 	if s.kmsKeyID != "" {
 		in.SSEKMSKeyId = &s.kmsKeyID
 	}
+	if id := objstore.KMSKey(ctx); id != "" {
+		in.ServerSideEncryption = types.ServerSideEncryptionAwsKms
+		in.SSEKMSKeyId = &id
+	}
 	return in
+}
+
+// SupportsKMS: S3 applies a per-object KMS key (objstore.Store.KMS).
+func (s *Backend) SupportsKMS() bool { return true }
+
+// opErr is objstore.OpErr, adding objstore.ErrAccessDenied for a 403 or an
+// SSE-KMS failure S3 reports under a KMS.* code (a disabled,
+// pending-deletion or unreachable key).
+func opErr(op, key string, err error) error {
+	if err == nil {
+		return nil
+	}
+	var re *awshttp.ResponseError
+	if errors.As(err, &re) && re.HTTPStatusCode() == http.StatusForbidden || strings.HasPrefix(apiErrorCode(err), "KMS.") {
+		err = fmt.Errorf("%w: %w", objstore.ErrAccessDenied, err)
+	}
+	return objstore.OpErr(op, key, err)
 }
 
 // readBody drains an object body and proves it arrived whole. A GET can end
@@ -190,8 +210,8 @@ func readBody(op, key string, body io.ReadCloser, contentLength *int64) ([]byte,
 
 // Put writes key unconditionally.
 func (s *Backend) Put(ctx context.Context, key string, data []byte) error {
-	_, err := s.client.PutObject(ctx, s.putInput(key, data))
-	return objstore.OpErr("put", key, err)
+	_, err := s.client.PutObject(ctx, s.putInput(ctx, key, data))
+	return opErr("put", key, err)
 }
 
 // PutIfAbsent writes key only if it does not already exist (If-None-Match: *).
@@ -202,7 +222,7 @@ func (s *Backend) Put(ctx context.Context, key string, data []byte) error {
 // objstore.ErrConflict and the caller's retry loop handles it, never as
 // "another writer won".
 func (s *Backend) PutIfAbsent(ctx context.Context, key string, data []byte) (bool, error) {
-	in := s.putInput(key, data)
+	in := s.putInput(ctx, key, data)
 	in.IfNoneMatch = aws.String("*")
 	_, err := s.client.PutObject(ctx, in)
 	if err != nil {
@@ -210,9 +230,9 @@ func (s *Backend) PutIfAbsent(ctx context.Context, key string, data []byte) (boo
 		case "PreconditionFailed":
 			return false, nil
 		case "ConditionalRequestConflict":
-			return false, objstore.OpErr("put-if-absent", key, fmt.Errorf("%w: %v", objstore.ErrConflict, err))
+			return false, opErr("put-if-absent", key, fmt.Errorf("%w: %v", objstore.ErrConflict, err))
 		}
-		return false, objstore.OpErr("put-if-absent", key, err)
+		return false, opErr("put-if-absent", key, err)
 	}
 	return true, nil
 }
@@ -231,9 +251,9 @@ func (s *Backend) Get(ctx context.Context, key string) ([]byte, error) {
 	out, err := s.client.GetObject(ctx, &awss3.GetObjectInput{Bucket: &s.bucket, Key: &key})
 	if err != nil {
 		if apiErrorCode(err) == "NoSuchKey" {
-			return nil, objstore.OpErr("get", key, objstore.ErrNotFound)
+			return nil, opErr("get", key, objstore.ErrNotFound)
 		}
-		return nil, objstore.OpErr("get", key, err)
+		return nil, opErr("get", key, err)
 	}
 	return readBody("get", key, out.Body, out.ContentLength)
 }
@@ -246,7 +266,7 @@ func (s *Backend) ListPage(ctx context.Context, prefix, after string, limit int)
 	}
 	page, err := s.client.ListObjectsV2(ctx, in)
 	if err != nil {
-		return nil, "", objstore.OpErr("list-page", prefix, err)
+		return nil, "", opErr("list-page", prefix, err)
 	}
 	keys := make([]string, 0, len(page.Contents))
 	for _, obj := range page.Contents {
@@ -273,7 +293,7 @@ func (s *Backend) ListPrefixesPage(ctx context.Context, prefix, after string, li
 	for {
 		page, err := s.client.ListObjectsV2(ctx, in)
 		if err != nil {
-			return nil, "", objstore.OpErr("list-prefixes-page", prefix, err)
+			return nil, "", opErr("list-prefixes-page", prefix, err)
 		}
 		truncated := page.IsTruncated != nil && *page.IsTruncated
 		if len(page.CommonPrefixes) == 0 && truncated && page.NextContinuationToken != nil {
@@ -294,7 +314,7 @@ func (s *Backend) ListPrefixesPage(ctx context.Context, prefix, after string, li
 // Delete removes key. A missing key is not an error.
 func (s *Backend) Delete(ctx context.Context, key string) error {
 	_, err := s.client.DeleteObject(ctx, &awss3.DeleteObjectInput{Bucket: &s.bucket, Key: &key})
-	return objstore.OpErr("delete", key, err)
+	return opErr("delete", key, err)
 }
 
 // deleteBatch is the most keys one DeleteObjects request may carry.
@@ -318,11 +338,11 @@ func (s *Backend) DeleteMany(ctx context.Context, keys ...string) error {
 			Delete: &types.Delete{Objects: objs[i:end], Quiet: aws.Bool(true)},
 		})
 		if err != nil {
-			return objstore.OpErr("delete-many", keys[i], err)
+			return opErr("delete-many", keys[i], err)
 		}
 		if len(out.Errors) > 0 {
 			e := out.Errors[0]
-			return objstore.OpErr("delete-many", aws.ToString(e.Key), fmt.Errorf("%s: %s (%d keys failed)", aws.ToString(e.Code), aws.ToString(e.Message), len(out.Errors)))
+			return opErr("delete-many", aws.ToString(e.Key), fmt.Errorf("%s: %s (%d keys failed)", aws.ToString(e.Code), aws.ToString(e.Message), len(out.Errors)))
 		}
 	}
 	return nil
@@ -337,7 +357,7 @@ func (s *Backend) EnsureBucket(ctx context.Context) error {
 		return nil
 	}
 	if code := apiErrorCode(err); code != "NotFound" && code != "NoSuchBucket" {
-		return objstore.OpErr("head-bucket", s.bucket, err)
+		return opErr("head-bucket", s.bucket, err)
 	}
 	_, err = s.client.CreateBucket(ctx, &awss3.CreateBucketInput{Bucket: &s.bucket})
 	var owned *types.BucketAlreadyOwnedByYou
@@ -345,7 +365,7 @@ func (s *Backend) EnsureBucket(ctx context.Context) error {
 	if errors.As(err, &owned) || errors.As(err, &exists) {
 		return nil
 	}
-	return objstore.OpErr("create-bucket", s.bucket, err)
+	return opErr("create-bucket", s.bucket, err)
 }
 
 // DropBucket empties the bucket (List + DeleteMany, both already bounded
@@ -358,20 +378,20 @@ func (s *Backend) DropBucket(ctx context.Context) error {
 			return nil
 		}
 		if err != nil {
-			return objstore.OpErr("drop-bucket", s.bucket, err)
+			return opErr("drop-bucket", s.bucket, err)
 		}
 		if len(keys) == 0 {
 			break
 		}
 		if err := s.DeleteMany(ctx, keys...); err != nil {
-			return objstore.OpErr("drop-bucket", s.bucket, err)
+			return opErr("drop-bucket", s.bucket, err)
 		}
 	}
 	_, err := s.client.DeleteBucket(ctx, &awss3.DeleteBucketInput{Bucket: &s.bucket})
 	if apiErrorCode(err) == "NoSuchBucket" {
 		return nil
 	}
-	return objstore.OpErr("drop-bucket", s.bucket, err)
+	return opErr("drop-bucket", s.bucket, err)
 }
 
 // GetWithETag returns the object and its ETag for conditional replacement.
@@ -379,9 +399,9 @@ func (s *Backend) GetWithETag(ctx context.Context, key string) ([]byte, string, 
 	out, err := s.client.GetObject(ctx, &awss3.GetObjectInput{Bucket: &s.bucket, Key: &key})
 	if err != nil {
 		if apiErrorCode(err) == "NoSuchKey" {
-			return nil, "", objstore.OpErr("get-with-etag", key, objstore.ErrNotFound)
+			return nil, "", opErr("get-with-etag", key, objstore.ErrNotFound)
 		}
-		return nil, "", objstore.OpErr("get-with-etag", key, err)
+		return nil, "", opErr("get-with-etag", key, err)
 	}
 	data, err := readBody("get-with-etag", key, out.Body, out.ContentLength)
 	if err != nil {
@@ -409,7 +429,7 @@ func (s *Backend) GetIfChanged(ctx context.Context, key, etag string) ([]byte, s
 		if apiErrorCode(err) == "NoSuchKey" {
 			err = objstore.ErrNotFound
 		}
-		return nil, "", false, objstore.OpErr("get-if-changed", key, err)
+		return nil, "", false, opErr("get-if-changed", key, err)
 	}
 	data, err := readBody("get-if-changed", key, out.Body, out.ContentLength)
 	if err != nil {
@@ -432,7 +452,7 @@ func (s *Backend) GetIfChanged(ctx context.Context, key, etag string) ([]byte, s
 // 9110 (quoted); whether it accepts the unquoted form is unverified, and
 // TestR2 is the check. TestS3PutIfMatchSendsUnquotedETag pins the header.
 func (s *Backend) PutIfMatch(ctx context.Context, key string, data []byte, etag string) (bool, error) {
-	in := s.putInput(key, data)
+	in := s.putInput(ctx, key, data)
 	in.IfMatch = aws.String(strings.Trim(etag, `"`))
 	_, err := s.client.PutObject(ctx, in)
 	if err != nil {
@@ -440,9 +460,9 @@ func (s *Backend) PutIfMatch(ctx context.Context, key string, data []byte, etag 
 		case "PreconditionFailed", "NoSuchKey":
 			return false, nil
 		case "ConditionalRequestConflict":
-			return false, objstore.OpErr("put-if-match", key, fmt.Errorf("%w: %v", objstore.ErrConflict, err))
+			return false, opErr("put-if-match", key, fmt.Errorf("%w: %v", objstore.ErrConflict, err))
 		}
-		return false, objstore.OpErr("put-if-match", key, err)
+		return false, opErr("put-if-match", key, err)
 	}
 	return true, nil
 }
@@ -460,18 +480,18 @@ func (s *Backend) GetRange(ctx context.Context, key string, offset, length int64
 		case "InvalidRange":
 			err = objstore.ErrRange
 		}
-		return nil, objstore.OpErr("get-range", key, err)
+		return nil, opErr("get-range", key, err)
 	}
 	// Check both the returned range and length: a server ignoring Range must
 	// not turn a block read into an unbounded whole-object download.
 	var first, last, total int64
 	if out.ContentRange == nil || out.ContentLength == nil || *out.ContentLength != length {
 		out.Body.Close()
-		return nil, objstore.OpErr("get-range", key, objstore.ErrRange)
+		return nil, opErr("get-range", key, objstore.ErrRange)
 	}
 	if n, _ := fmt.Sscanf(*out.ContentRange, "bytes %d-%d/%d", &first, &last, &total); n != 3 || first != offset || last != offset+length-1 || total <= last {
 		out.Body.Close()
-		return nil, objstore.OpErr("get-range", key, objstore.ErrRange)
+		return nil, opErr("get-range", key, objstore.ErrRange)
 	}
 	return readBody("get-range", key, out.Body, out.ContentLength)
 }

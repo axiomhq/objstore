@@ -32,6 +32,12 @@ type paced struct {
 	pace *pacer
 }
 
+// SupportsKMS passes the wrapped backend's answer through (Store.KMS).
+func (p *paced) SupportsKMS() bool {
+	k, ok := p.Backend.(interface{ SupportsKMS() bool })
+	return ok && k.SupportsKMS()
+}
+
 func (p *paced) Put(ctx context.Context, key string, data []byte) error {
 	if err := p.pace.wait(ctx); err != nil {
 		return err

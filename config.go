@@ -2,9 +2,6 @@ package objstore
 
 import (
 	"context"
-	"time"
-
-	"github.com/axiomhq/objstore/kms"
 )
 
 // urgentKey marks a context whose requests bypass the pacer: a lease
@@ -25,14 +22,27 @@ func Urgent(ctx context.Context) context.Context { return context.WithValue(ctx,
 // their own fast paths (the file store writes an urgent object whole).
 func IsUrgent(ctx context.Context) bool { v, _ := ctx.Value(urgentKey{}).(bool); return v }
 
+// KMSKeyFunc names the KMS key an object is written with; "" writes it under
+// the bucket's own encryption policy. It runs on every Put, PutIfAbsent and
+// PutIfMatch, before the write takes a slot.
+type KMSKeyFunc func(ctx context.Context, key string) (string, error)
+
+type kmsKey struct{}
+
+// WithKMSKey returns ctx whose writes are encrypted server-side with KMS key
+// id: S3 SSE-KMS with that key id, GCS kmsKeyName. On a Store with a
+// KMSKeyFunc (WithKMSKeys) the function decides; it can read id with KMSKey.
+func WithKMSKey(ctx context.Context, id string) context.Context {
+	return context.WithValue(ctx, kmsKey{}, id)
+}
+
+// KMSKey is the KMS key id a write under ctx carries, "" for none. Backends
+// read it; so do backend wrappers (storetest.KMS).
+func KMSKey(ctx context.Context) string { v, _ := ctx.Value(kmsKey{}).(string); return v }
+
 // Config is what Open adds around any backend. Provider-specific settings
-// (endpoint, credentials, server-side encryption) live in each provider
-// package's own Config.
-//
-// Reserved key space: with encryption configured, every key under
-// ns/<name>/ is encrypted with name's data key, and cmek/<name> holds that
-// key's envelope record. Do not store unrelated objects under either
-// prefix in a bucket that uses encryption.
+// (endpoint, credentials, bucket-wide server-side encryption) live in each
+// provider package's own Config.
 type Config struct {
 	// RequestsPerSecond paces every request to the object store; 0 = no
 	// pacing. A burst past what the provider serves does not fail, it
@@ -47,41 +57,4 @@ type Config struct {
 	// publishes thousands of objects in a burst; without a bound they queue
 	// ahead of the write path's own small requests on the store.
 	MaxInflightWrites int
-	// KeyProvider, when set, enables envelope encryption of every object
-	// under ns/<name>/ for each name with a key record (see
-	// InstallNamespaceKey). It is the same as calling ConfigureCMEK before
-	// first use.
-	//
-	// Cost in a namespace without a key record: every write and every range
-	// read first reads the record (one GET, shared by concurrent callers of
-	// the namespace), because trusting a cached "no record" there could
-	// store plaintext in, or return ciphertext from, a namespace another
-	// process has just keyed. Whole-object reads trust a cached "no record"
-	// for one second (they re-check what they read).
-	KeyProvider kms.KeyProvider
-	// KeyRefreshInterval ties access and rotation probes for keys whose
-	// provider is lease-cadenced (kms.LeaseCadencer, AWS KMS) to the lease
-	// heartbeat cadence; 0 = no such probes. SetCMEKRefreshInterval sets it
-	// after Open. It holds with or without KeyProvider, so a later
-	// ConfigureCMEK uses it.
-	KeyRefreshInterval time.Duration
-	// AcceptPlaintext decides whether bytes read from an encrypted
-	// namespace that do NOT carry the encrypted-object header are a
-	// deliberate plaintext object, returned as-is and unauthenticated. It
-	// sees the key and the stored bytes. Bytes carrying the header are
-	// always decrypted, whatever it says; bytes it refuses fail to decrypt.
-	// GetRange never consults it: a range of an encrypted namespace is
-	// always decrypted. nil = DefaultAcceptPlaintext. Whatever it accepts,
-	// anyone with write access to the bucket can forge: keep it as narrow
-	// as the application's layout allows.
-	AcceptPlaintext func(key string, data []byte) bool
-}
-
-// DefaultAcceptPlaintext accepts the plaintext objects RetireNamespaceKey
-// leaves behind: ns/<name>/manifest holding a JSON head with state
-// "deleted" and a non-empty incarnation (the name-reuse fence), and
-// ns/<name>/lease and ns/<name>/compactor holding any valid JSON. Compose
-// it to add exemptions of your own.
-func DefaultAcceptPlaintext(key string, data []byte) bool {
-	return plaintextDeletedManifest(key, data) || plaintextFence(key, data)
 }

@@ -165,9 +165,7 @@ type Fault struct {
 //
 // It watches every key, including ones mutable by design (a lease, a
 // manifest head). Filter Rewrites by the keys your test considers
-// write-once. The digest covers the bytes the backend stores: on a store
-// with CMEK that is ciphertext, so rewriting a key with the same plaintext
-// under a fresh data key counts as a rewrite.
+// write-once. The digest covers the bytes the backend is handed.
 func (f *Fault) WatchRewrites() {
 	f.mu.Lock()
 	defer f.mu.Unlock()

@@ -7,7 +7,7 @@ go get github.com/axiomhq/objstore
 Object storage with compare-and-swap, for Go. One `Store` over an S3 bucket
 (`objstore/aws/s3`), Google Cloud Storage (`objstore/gcp/gcs`), or a durable
 local directory (`objstore/fs`). Packages are laid out by provider: `aws/`
-holds `s3` and `kms`, `gcp/` holds `gcs` and `kms`. Cloudflare R2 (at
+holds `s3`, `gcp/` holds `gcs`. Cloudflare R2 (at
 `https://<account-id>.r2.cloudflarestorage.com` with `AWS_REGION=auto`),
 MinIO, Ceph and Hetzner use `aws/s3` because they speak the S3 API. With:
 
@@ -15,7 +15,8 @@ MinIO, Ceph and Hetzner use `aws/s3` because they speak the S3 API. With:
 - paginated list, delimited list, batch delete
 - one package per provider, so a binary links only the SDKs it uses
 - a file store (`objstore/fs`) that fsyncs every object and writes large ones back in chunks, so a small urgent write never waits behind a big one
-- envelope encryption per name (`objstore/kms`, stdlib only), with AWS KMS and GCP KMS providers in `objstore/aws/kms` and `objstore/gcp/kms`
+- a KMS key per object, applied by the store (S3 SSE-KMS, GCS `kmsKeyName`), picked by a function of the key
+- a startup probe that the store honours conditional writes
 - a conformance suite, fault injection and metering for tests (`objstore/storetest`)
 - a write-ahead log: one entry per second, conditional PUT, nonce read-back (`objstore/wal`)
 - a memory and disk object cache with singleflight and per-request stats (`objstore/cache`)
@@ -29,7 +30,7 @@ Imports: `github.com/axiomhq/objstore/aws/s3`, `github.com/axiomhq/objstore/gcp/
 1. Open a store: `s, err := s3.Open(ctx, s3.Config{Endpoint: "https://s3.us-east-1.amazonaws.com", Bucket: "my-bucket"}, objstore.Config{})`.
    GCS: `s, err := gcs.Open(ctx, gcs.Config{Bucket: "my-bucket"}, objstore.Config{})`. Local: `s := fs.Open("/var/lib/data", "bucket", objstore.Config{})` (Unix only).
    Any other `objstore.Backend`: `s := objstore.Open(b, objstore.Config{})`.
-   `s3.Config` adds SSE, an endpoint allow-list and a request timeout; `objstore.Config` adds pacing (`RequestsPerSecond`), a write bound (`MaxInflightWrites`) and encryption (`KeyProvider`).
+   `s3.Config` adds SSE, an endpoint allow-list and a request timeout; `objstore.Config` adds pacing (`RequestsPerSecond`), and a write bound (`MaxInflightWrites`).
 2. Create the bucket if you need to: `s.EnsureBucket(ctx)`.
 3. Write once: `created, err := s.PutIfAbsent(ctx, key, data)`. `created` is false when the key existed.
 4. Swap: `body, etag, err := s.GetWithETag(ctx, key)`, then `ok, err := s.PutIfMatch(ctx, key, next, etag)`. `ok` false means someone else won: re-read and retry. `objstore.ErrConflict` (S3's 409) means the store never decided: retry.
@@ -48,11 +49,8 @@ instead of in chunks.
 | `objstore.New(ctx, endpoint, bucket)` | `s3.Open(ctx, s3.Config{Endpoint: endpoint, Bucket: bucket}, objstore.Config{})`; for `file://root`, `fs.Open(root, bucket, objstore.Config{})` |
 | `Config.Endpoint`, `Bucket`, `SSE`, `KMSKeyID`, `AllowedEndpoints`, `RequestTimeout` | `s3.Config` |
 | `Store.SSE()`, `objstore.ErrEndpointDenied` | `(*s3.Backend).SSE()` (from `s3.New`), `s3.ErrEndpointDenied` |
-| `s.ConfigureCMEK(p)` | still works; or `objstore.Config{KeyProvider: p}` |
-| built-in plaintext exemptions | `Config.AcceptPlaintext` (nil = `objstore.DefaultAcceptPlaintext`) |
+| `s.ConfigureCMEK(p)`, `InstallNamespaceKey`, `RotateNamespaceKey`, `CheckNamespaceKey`, package `kms` | gone: `s = s.WithKMSKeys(fn)`, and the store encrypts (see [Encryption](#encryption)) |
 | `Timings.LogAttrs()` | `Timings.Attrs()` |
-| `kms.AWSKMS{Client: c}`, `kms.GCPKMS{Client: c}` | `awskms.Provider{Client: c}`, `gcpkms.Provider{Client: c}`, with `awskms "github.com/axiomhq/objstore/aws/kms"` and `gcpkms "github.com/axiomhq/objstore/gcp/kms"` (both are package `kms`) |
-| `kms.Router{Local: l, AWS: a, GCP: g, Default: d}` | `kms.Router{Routes: map[string]kms.KeyProvider{"local:": l, awskms.Scheme: a, gcpkms.Scheme: g}, Default: d, DefaultScheme: "local:"}` (the scheme of `d`) |
 | `l.Release()`, `ref.Release()` | `l.Release(ctx)`, `ref.Release(ctx)` |
 | `l.Log = logger` | `l.SetLogger(logger)` |
 | `l, err = l.Acquire(ctx)` | `err = l.Acquire(ctx)` |
@@ -60,9 +58,8 @@ instead of in chunks.
 | `r := rangeread.New(...)`; `r.Cfg` | `r, err := rangeread.New(...)`; `r.Config()` |
 | `storetest.New(t)`, `storetest.NewFaulty(t)` | `bucket.New(t)`, `bucket.NewFaulty(t)` (`objstore/storetest/bucket`) |
 
-Encrypted objects are now written in format v2, which v0.4 readers cannot
-read: upgrade every reader before any writer. See [CHANGELOG.md](CHANGELOG.md)
-for the rest, including the v1 empty-object rule.
+Objects v0.4 sealed client-side stay ciphertext: v0.5 does not decrypt
+them. See [CHANGELOG.md](CHANGELOG.md) for the rest.
 
 ## Methods
 
@@ -82,6 +79,7 @@ for the rest, including the v1 empty-object rule.
 | `Delete(ctx, key)` | delete one key; never needs the namespace key |
 | `DeleteMany(ctx, keys...)` | batch delete |
 | `EnsureBucket(ctx)`, `DropBucket(ctx)` | create or remove the bucket |
+| `CheckConditionalWrites(ctx)` | prove the store honours If-None-Match (3 requests under `_probe/`); call once before writing |
 
 `ctx = objstore.WithTimings(ctx, &t)` has the store add the wall time and
 count of every call made under `ctx` to `t`, per `objstore.Call`;
@@ -162,29 +160,19 @@ Every write carries a fresh nonce, so the read-back tells "my write landed" from
 
 ## Encryption
 
-1. Pick a provider: `kms.LocalFile{Dir: dir}` (key names `local:<file>`), `awskms.Provider{Client: c}` (`aws:arn:aws:kms:...`), `gcpkms.Provider{Client: c}` (`gcp:projects/.../cryptoKeys/<k>`), or a `kms.Router` over several:
-   ```go
-   p := kms.Router{Routes: map[string]kms.KeyProvider{
-       "local:":      kms.LocalFile{Dir: "/etc/objstore/keys"},
-       awskms.Scheme: awskms.Provider{Client: awsClient},
-       gcpkms.Scheme: gcpkms.Provider{Client: gcpClient},
-   }}
-   ```
-   `awskms` and `gcpkms` are import aliases for `github.com/axiomhq/objstore/aws/kms` and `github.com/axiomhq/objstore/gcp/kms`; both are package `kms`, like the interface package.
-   The longest matching scheme wins; a name matching none goes to `Default` as `DefaultScheme+name`. Import only the provider packages you use.
-2. Turn it on: `objstore.Config{KeyProvider: p}` at open (or `s.ConfigureCMEK(p)` before first use). Every object under `ns/<name>/` of a name with a key record is now encrypted with that name's data key.
-3. Before the first write for a name, wrap a fresh `kms.DEKSize`-byte key and install it: `wrapped, ver, err := p.Wrap(ctx, keyName, dek)`, then `s.InstallNamespaceKey(ctx, name, objstore.Envelope{Mode: objstore.EncryptionCustomerManaged, KeyName: keyName, KeyVersion: ver, DEKWrapped: wrapped})`.
-4. Rotate with `s.RotateNamespaceKey(ctx, name)`. It re-wraps the data key, so no object is rewritten.
-5. Check access with `s.CheckNamespaceKey(ctx, name)`. A revoked key returns `kms.ErrKeyUnavailable`; a failed read of the key record returns the storage error. `Delete` and `DeleteMany` never need the key, so crypto-shredding works after revocation.
+1. Say which key each object gets: `s = s.WithKMSKeys(func(ctx context.Context, key string) (string, error) { ... })`. Return `""` for the bucket's own policy.
+2. Write as usual. S3 stores each keyed object with `x-amz-server-side-encryption: aws:kms` and that key id; GCS with that `kmsKeyName`.
+3. Read as usual. The store decrypts with the key the object was written under; nothing to pass.
+4. For one write only: `ctx = objstore.WithKMSKey(ctx, id)`. On a store with a `WithKMSKeys` function, the function decides; it reads `objstore.KMSKey(ctx)` to honour it.
 
-Reserved key space: `ns/<name>/` is encrypted per name and `cmek/<name>` holds
-its key record; store nothing else there. `Config.AcceptPlaintext` decides
-which header-less bytes in an encrypted namespace pass as plaintext (nil =
-`objstore.DefaultAcceptPlaintext`); anything it accepts can be forged by
-whoever can write the bucket. While a provider is set, every write and range
-read in a namespace without a key record first reads `cmek/<name>` (one GET,
-shared). `LocalFile` rotation: copy `Dir/<name>` to `Dir/<name>.<version>`,
-then replace `Dir/<name>`; keep the old file until every key is re-wrapped.
+| case | what happens |
+| --- | --- |
+| key disabled, deleted or grant removed | reads and writes of its objects fail with an error wrapping `objstore.ErrAccessDenied` |
+| key rotated in KMS | nothing to do; the store uses the key's current version |
+| `s.KMS()` | `true` on S3 and GCS; `false` on `fs`, which ignores keys and encrypts nothing |
+| tests | `s, k := storetest.NewKMS(s)` records each object's key (`k.KeyOf`) and revokes one (`k.Revoke`, `k.Restore`) |
+
+`s3.Config.SSE` and `KMSKeyID` still set one policy for the whole bucket.
 
 ## Tests with faults
 
@@ -196,7 +184,7 @@ then replace `Dir/<name>`; keep the old file until every key is re-wrapped.
 
 `f.SetShape(storetest.Shape{Latency, BytesPerSecond, ErrorRate, Seed})` adds
 seeded latency, bandwidth and errors to every call. `f.WatchRewrites()` flags
-any key rewritten with different bytes (ciphertext, under encryption).
+any key rewritten with different bytes.
 
 ## Test
 

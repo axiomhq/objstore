@@ -1,6 +1,8 @@
 package objstore_test
 
 import (
+	"context"
+	"strings"
 	"testing"
 	"time"
 
@@ -38,5 +40,49 @@ func TestTimingsAttrs(t *testing.T) {
 	}
 	if objstore.CallDirSync.String() != "dirsync" || objstore.Call(99).String() != "Call(99)" {
 		t.Fatalf("Call.String: %q %q", objstore.CallDirSync, objstore.Call(99))
+	}
+}
+
+// ignoresIfNoneMatch is a backend that drops the If-None-Match header:
+// every PutIfAbsent overwrites and reports that it created the key.
+type ignoresIfNoneMatch struct{ objstore.Backend }
+
+func (b ignoresIfNoneMatch) PutIfAbsent(ctx context.Context, key string, data []byte) (bool, error) {
+	return true, b.Put(ctx, key, data)
+}
+
+func TestCheckConditionalWrites(t *testing.T) {
+	ctx := context.Background()
+	s := bucket.New(t)
+	if err := s.CheckConditionalWrites(ctx); err != nil {
+		t.Fatalf("honest store: %v", err)
+	}
+	if keys, err := s.List(ctx, "_probe/"); err != nil || len(keys) != 0 {
+		t.Fatalf("probe left %v (%v)", keys, err)
+	}
+	broken := s.WithBackend(func(b objstore.Backend) objstore.Backend { return ignoresIfNoneMatch{b} })
+	if err := broken.CheckConditionalWrites(ctx); err == nil || !strings.Contains(err.Error(), "does not honour conditional writes") {
+		t.Fatalf("store ignoring If-None-Match: %v", err)
+	}
+}
+
+// TestKMSKeysDecide: a Store's KMSKeyFunc replaces the key a write's
+// context carries, and can read it.
+func TestKMSKeysDecide(t *testing.T) {
+	ctx := objstore.WithKMSKey(context.Background(), "from-ctx")
+	s, k := storetest.NewKMS(bucket.New(t))
+	s = s.WithKMSKeys(func(ctx context.Context, key string) (string, error) {
+		if key == "plain" {
+			return "", nil
+		}
+		return objstore.KMSKey(ctx), nil
+	})
+	for _, key := range []string{"plain", "keyed"} {
+		if err := s.Put(ctx, key, []byte(key)); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if k.KeyOf("plain") != "" || k.KeyOf("keyed") != "from-ctx" {
+		t.Fatalf("plain=%q keyed=%q", k.KeyOf("plain"), k.KeyOf("keyed"))
 	}
 }

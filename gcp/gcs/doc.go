@@ -1,5 +1,6 @@
-// Package gcs is the Google Cloud Storage backend for objstore. The Google
-// Cloud KMS key provider is github.com/axiomhq/objstore/gcp/kms.
+// Package gcs is the Google Cloud Storage backend for objstore. A write
+// whose context carries objstore.WithKMSKey is stored under that Cloud KMS
+// key (kmsKeyName).
 //
 // The ETag this backend hands out is the object generation as a decimal
 // string, never the HTTP ETag: generations are what GCS preconditions

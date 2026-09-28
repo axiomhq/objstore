@@ -3,10 +3,10 @@ package objstore
 import (
 	"cmp"
 	"context"
+	"crypto/rand"
 	"errors"
 	"fmt"
 	"math"
-	"sync/atomic"
 	"time"
 
 	"golang.org/x/sync/semaphore"
@@ -30,6 +30,10 @@ var ErrInvalidKey = errors.New("store: invalid key")
 // written; the caller retries. It is never a lost race, which is
 // (false, nil).
 var ErrConflict = errors.New("store: conditional write conflict, retry")
+
+// ErrAccessDenied is wrapped by every error for a request the store refused
+// (403), or for an object whose KMS key is disabled, deleted or out of reach.
+var ErrAccessDenied = errors.New("store: access denied")
 
 // MaxListPage is the largest limit ListPage and ListPrefixesPage accept,
 // S3's own page size.
@@ -68,43 +72,28 @@ type Backend interface {
 // log and a manifest build on (PutIfAbsent to append, PutIfMatch to swap).
 type Store struct {
 	b Backend
-	// cmek is shared with every Store WithBackend derives, so a key cached
-	// or configured through one is seen through all. It holds nil without
-	// encryption.
-	cmek *atomic.Pointer[cmekState]
-	// refresh is Config.KeyRefreshInterval, shared the same way and with
-	// the encryption state, so it holds whether set before or after a
-	// provider is configured.
-	refresh *atomic.Int64
-	// accept is Config.AcceptPlaintext, or DefaultAcceptPlaintext.
-	accept func(key string, data []byte) bool
+	// kmsKeys names the KMS key each written object gets (WithKMSKeys).
+	kmsKeys KMSKeyFunc
 	// writes bounds non-urgent object writes and deletes in flight; see
 	// Config.MaxInflightWrites. nil means unbounded.
 	writes *semaphore.Weighted
 }
 
 // Open returns a Store over b with cfg's pacing, write bound and
-// encryption. The provider packages (fs, s3, gcs) each have an Open that
+// KMS keys. The provider packages (fs, s3, gcs) each have an Open that
 // builds the backend and calls this.
 func Open(b Backend, cfg Config) *Store {
 	if cfg.RequestsPerSecond > 0 {
 		b = &paced{Backend: b, pace: newPacer(cfg.RequestsPerSecond)}
 	}
-	s := &Store{b: b, cmek: new(atomic.Pointer[cmekState]), refresh: new(atomic.Int64), accept: cfg.AcceptPlaintext}
-	s.refresh.Store(int64(cfg.KeyRefreshInterval))
-	if s.accept == nil {
-		s.accept = DefaultAcceptPlaintext
-	}
+	s := &Store{b: b}
 	if cfg.MaxInflightWrites >= 0 {
 		s.writes = semaphore.NewWeighted(int64(cmp.Or(cfg.MaxInflightWrites, defaultMaxInflightWrites)))
-	}
-	if cfg.KeyProvider != nil {
-		s.cmek.Store(newCMEKState(cfg.KeyProvider, s.refresh))
 	}
 	return s
 }
 
-// WithBackend returns a Store over wrap(s's backend) with s's encryption
+// WithBackend returns a Store over wrap(s's backend) with s's KMS keys
 // and write bound: the same bucket seen through a wrapper.
 func (s *Store) WithBackend(wrap func(Backend) Backend) *Store {
 	c := *s
@@ -139,23 +128,32 @@ func (s *Store) enterWrite(ctx context.Context) (func(), error) {
 	return func() { s.writes.Release(1) }, nil
 }
 
-// seal returns data as it is stored: encrypted when key lies in a
-// namespace with a key record.
-func (s *Store) seal(ctx context.Context, op, key string, data []byte) ([]byte, error) {
-	aead, err := s.objectKey(ctx, key, false)
+// WithKMSKeys returns s with every write asking fn for its object's KMS
+// key. fn decides: its answer replaces any WithKMSKey on the write's
+// context, which fn can read with KMSKey. The store encrypts and decrypts: reads need no key, and an object
+// whose key is disabled or revoked fails with ErrAccessDenied. The file
+// backend ignores keys (KMS reports false).
+func (s *Store) WithKMSKeys(fn KMSKeyFunc) *Store {
+	c := *s
+	c.kmsKeys = fn
+	return &c
+}
+
+// withKMSKey returns ctx carrying the KMS key s.kmsKeys names for key.
+func (s *Store) withKMSKey(ctx context.Context, op, key string) (context.Context, error) {
+	if s.kmsKeys == nil {
+		return ctx, nil
+	}
+	id, err := s.kmsKeys(ctx, key)
 	if err != nil {
-		return nil, OpErr(op, key, err)
+		return ctx, OpErr(op, key, err)
 	}
-	if aead == nil {
-		return data, nil
-	}
-	sealed, err := encryptObject(key, data, aead)
-	return sealed, OpErr(op, key, err)
+	return WithKMSKey(ctx, id), nil
 }
 
 // Put writes key unconditionally, replacing any object there.
 func (s *Store) Put(ctx context.Context, key string, data []byte) error {
-	data, err := s.seal(ctx, "put", key, data)
+	ctx, err := s.withKMSKey(ctx, "put", key)
 	if err != nil {
 		return err
 	}
@@ -171,7 +169,7 @@ func (s *Store) Put(ctx context.Context, key string, data []byte) error {
 // when the key existed. This is the OCC primitive a write-ahead log builds
 // on. See Backend for the one case where ok is true alongside an error.
 func (s *Store) PutIfAbsent(ctx context.Context, key string, data []byte) (bool, error) {
-	data, err := s.seal(ctx, "put-if-absent", key, data)
+	ctx, err := s.withKMSKey(ctx, "put-if-absent", key)
 	if err != nil {
 		return false, err
 	}
@@ -185,21 +183,11 @@ func (s *Store) PutIfAbsent(ctx context.Context, key string, data []byte) (bool,
 
 // Get returns the whole object at key; a missing object wraps ErrNotFound.
 func (s *Store) Get(ctx context.Context, key string) ([]byte, error) {
-	aead, err := s.objectKey(ctx, key, true)
-	if err != nil {
-		return nil, OpErr("get", key, err)
-	}
-	data, err := s.b.Get(ctx, key)
-	if err != nil {
-		return nil, err
-	}
-	return s.open(ctx, "get", key, data, aead)
+	return s.b.Get(ctx, key)
 }
 
 // GetRange reads exactly length bytes starting at offset. Short/out-of-bounds
 // ranges fail instead of returning a plausible partial index block.
-// In an encrypted namespace the range is always decrypted:
-// Config.AcceptPlaintext is never consulted.
 func (s *Store) GetRange(ctx context.Context, key string, offset, length int64) ([]byte, error) {
 	if offset < 0 || length <= 0 || offset > math.MaxInt64-length {
 		return nil, OpErr("get-range", key, ErrRange)
@@ -207,31 +195,12 @@ func (s *Store) GetRange(ctx context.Context, key string, offset, length int64) 
 	if err := ctx.Err(); err != nil {
 		return nil, err
 	}
-	aead, err := s.objectKey(ctx, key, false)
-	if err != nil {
-		return nil, OpErr("get-range", key, err)
-	}
-	if aead == nil {
-		return s.b.GetRange(ctx, key, offset, length)
-	}
-	return s.encryptedRange(ctx, key, offset, length, aead)
+	return s.b.GetRange(ctx, key, offset, length)
 }
 
 // GetWithETag returns the object and its ETag for conditional replacement.
 func (s *Store) GetWithETag(ctx context.Context, key string) ([]byte, string, error) {
-	aead, err := s.objectKey(ctx, key, true)
-	if err != nil {
-		return nil, "", OpErr("get-with-etag", key, err)
-	}
-	data, tag, err := s.b.GetWithETag(ctx, key)
-	if err != nil {
-		return nil, "", err
-	}
-	plain, err := s.open(ctx, "get-with-etag", key, data, aead)
-	if err != nil {
-		return nil, "", err
-	}
-	return plain, tag, nil
+	return s.b.GetWithETag(ctx, key)
 }
 
 // GetIfChanged conditionally reads one revision. Empty etag is unconditional.
@@ -242,19 +211,7 @@ func (s *Store) GetIfChanged(ctx context.Context, key, etag string) ([]byte, str
 	if err := ctx.Err(); err != nil {
 		return nil, "", false, err
 	}
-	aead, err := s.objectKey(ctx, key, true)
-	if err != nil {
-		return nil, "", false, OpErr("get-if-changed", key, err)
-	}
-	data, tag, unchanged, err := s.b.GetIfChanged(ctx, key, etag)
-	if err != nil || unchanged {
-		return data, tag, unchanged, err
-	}
-	plain, err := s.open(ctx, "get-if-changed", key, data, aead)
-	if err != nil {
-		return nil, "", false, err
-	}
-	return plain, tag, false, nil
+	return s.b.GetIfChanged(ctx, key, etag)
 }
 
 // PutIfMatch replaces key only if its current ETag equals etag — compare-and-
@@ -262,7 +219,7 @@ func (s *Store) GetIfChanged(ctx context.Context, key, etag string) ([]byte, str
 // object changed under us, or no longer exists. See Backend for the one
 // case where ok is true alongside an error.
 func (s *Store) PutIfMatch(ctx context.Context, key string, data []byte, etag string) (bool, error) {
-	data, err := s.seal(ctx, "put-if-match", key, data)
+	ctx, err := s.withKMSKey(ctx, "put-if-match", key)
 	if err != nil {
 		return false, err
 	}
@@ -332,8 +289,7 @@ func (s *Store) ListPrefixesPage(ctx context.Context, prefix, after string, limi
 	return s.b.ListPrefixesPage(ctx, prefix, after, limit)
 }
 
-// Delete removes key. A missing key is not an error. It never needs the
-// namespace key, so deleting (crypto-shredding) works after revocation.
+// Delete removes key. A missing key is not an error.
 func (s *Store) Delete(ctx context.Context, key string) error {
 	release, err := s.enterWrite(ctx)
 	if err != nil {
@@ -344,7 +300,7 @@ func (s *Store) Delete(ctx context.Context, key string) error {
 }
 
 // DeleteMany removes keys. Missing keys are not an error. Empty input is a
-// no-op. Like Delete it never needs the namespace key.
+// no-op.
 func (s *Store) DeleteMany(ctx context.Context, keys ...string) error {
 	release, err := s.enterWrite(ctx)
 	if err != nil {
@@ -361,3 +317,40 @@ func (s *Store) EnsureBucket(ctx context.Context) error { return s.b.EnsureBucke
 // teardown; the harness's fresh bucket per test must not outlive the test).
 // A bucket that is already gone is not an error.
 func (s *Store) DropBucket(ctx context.Context) error { return s.b.DropBucket(ctx) }
+
+// KMS reports whether the backend applies per-object KMS keys
+// (WithKMSKeys). The file backend does not: it ignores them and
+// encrypts nothing.
+func (s *Store) KMS() bool {
+	k, ok := s.b.(interface{ SupportsKMS() bool })
+	return ok && k.SupportsKMS()
+}
+
+// CheckConditionalWrites proves the backend honours If-None-Match: a first
+// PutIfAbsent of a fresh _probe/ifnonematch/ key must create it and a second
+// must not. A store that ignores the header would let two log writers both
+// win one sequence. Three requests; call it once before writing.
+func (s *Store) CheckConditionalWrites(ctx context.Context) error {
+	name := fmt.Sprintf("%T", s.b)
+	if n, ok := s.b.(fmt.Stringer); ok {
+		name = n.String()
+	}
+	key := "_probe/ifnonematch/" + rand.Text()
+	first, err := s.PutIfAbsent(ctx, key, []byte("1"))
+	if err != nil {
+		return fmt.Errorf("store %s: conditional write probe: %w", name, err)
+	}
+	second, err := s.PutIfAbsent(ctx, key, []byte("2"))
+	if first {
+		if derr := s.Delete(ctx, key); err == nil {
+			err = derr
+		}
+	}
+	if err != nil {
+		return fmt.Errorf("store %s: conditional write probe: %w", name, err)
+	}
+	if !first || second {
+		return fmt.Errorf("store %s does not honour conditional writes (If-None-Match): PutIfAbsent on a fresh key = %v, on an existing key = %v", name, first, second)
+	}
+	return nil
+}

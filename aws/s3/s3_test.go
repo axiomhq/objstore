@@ -344,7 +344,7 @@ func TestSSEPutInput(t *testing.T) {
 		{"aws:kms", "arn:aws:kms:us-east-1:1:key/x"},
 	} {
 		s := &Backend{sse: tc.mode, kmsKeyID: tc.key}
-		in := s.putInput("k", []byte("v"))
+		in := s.putInput(context.Background(), "k", []byte("v"))
 		if string(in.ServerSideEncryption) != tc.mode || tc.key != "" && *in.SSEKMSKeyId != tc.key {
 			t.Fatalf("mode %q input = %+v", tc.mode, in)
 		}
@@ -439,5 +439,57 @@ func TestS3DropBucketMissingBucket(t *testing.T) {
 				t.Fatalf("DropBucket: %v, want error %v", err, tc.wantErr)
 			}
 		})
+	}
+}
+
+// TestS3KMSKeyPerObject: the Store's KMSKeys rides on the PUT as SSE-KMS
+// headers, an unkeyed object carries none, and a 403 or KMS.* error comes
+// back as ErrAccessDenied.
+func TestS3KMSKeyPerObject(t *testing.T) {
+	var sse, keyID, fail atomic.Value
+	fail.Store("")
+	b := fakeS3(t, func(w http.ResponseWriter, r *http.Request) {
+		switch code := fail.Load().(string); code {
+		case "AccessDenied":
+			s3Error(w, http.StatusForbidden, code)
+			return
+		case "KMS.DisabledException":
+			s3Error(w, http.StatusBadRequest, code)
+			return
+		}
+		sse.Store(r.Header.Get("X-Amz-Server-Side-Encryption"))
+		keyID.Store(r.Header.Get("X-Amz-Server-Side-Encryption-Aws-Kms-Key-Id"))
+		w.WriteHeader(http.StatusOK)
+	})
+	s := objstore.Open(b, objstore.Config{}).WithKMSKeys(func(_ context.Context, key string) (string, error) {
+		if strings.HasPrefix(key, "a/") {
+			return "key-a", nil
+		}
+		return "", nil
+	})
+	if !s.KMS() || !objstore.Open(b, objstore.Config{RequestsPerSecond: 100}).KMS() {
+		t.Fatal("S3 store, paced or not, must report per-object keys")
+	}
+	ctx := context.Background()
+	if err := s.Put(ctx, "a/x", []byte("x")); err != nil {
+		t.Fatal(err)
+	}
+	if sse.Load() != "aws:kms" || keyID.Load() != "key-a" {
+		t.Fatalf("keyed PUT headers: sse=%v key=%v", sse.Load(), keyID.Load())
+	}
+	if _, err := s.PutIfMatch(ctx, "b/x", []byte("x"), "etag"); err != nil {
+		t.Fatal(err)
+	}
+	if sse.Load() != "" || keyID.Load() != "" {
+		t.Fatalf("unkeyed PUT headers: sse=%v key=%v", sse.Load(), keyID.Load())
+	}
+	for _, code := range []string{"AccessDenied", "KMS.DisabledException"} {
+		fail.Store(code)
+		if _, err := s.Get(ctx, "a/x"); !errors.Is(err, objstore.ErrAccessDenied) {
+			t.Fatalf("GET on %s: %v", code, err)
+		}
+		if err := s.Put(ctx, "a/x", []byte("x")); !errors.Is(err, objstore.ErrAccessDenied) {
+			t.Fatalf("PUT on %s: %v", code, err)
+		}
 	}
 }

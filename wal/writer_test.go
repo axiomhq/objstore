@@ -820,3 +820,36 @@ func TestDurableEntryIsOneConditionalPut(t *testing.T) {
 		t.Fatal("a first attempt was reported to the oracle as a retry")
 	}
 }
+
+// TestWriterFailsFastOnRefusedPut: a store refusal (a revoked KMS key) on a
+// batch's first PUT fails its callers at once, leaves the sequence free, and
+// the next batch commits there once the key is back.
+func TestWriterFailsFastOnRefusedPut(t *testing.T) {
+	ctx := context.Background()
+	s, kms := storetest.NewKMS(bucket.New(t))
+	s = s.WithKMSKeys(func(context.Context, string) (string, error) { return "k", nil })
+	w := NewWriter[Bytes](s, testPrefix, 1, nil)
+	defer w.Close()
+	kms.Revoke("k")
+	done := make(chan error, 1)
+	go func() { done <- w.Append(ctx, rows("refused")) }()
+	select {
+	case err := <-done:
+		if !errors.Is(err, objstore.ErrAccessDenied) {
+			t.Fatalf("refused append: %v", err)
+		}
+	case <-time.After(10 * time.Second):
+		t.Fatal("refused append still waiting: the batch was retried")
+	}
+	kms.Restore("k")
+	if err := w.Append(ctx, rows("after")); err != nil {
+		t.Fatal(err)
+	}
+	entries, err := replay(ctx, s, testPrefix, 0)
+	if err != nil || len(entries) != 1 || !slices.Equal(ids(entries[0]), []string{"after"}) {
+		t.Fatalf("history: %+v, %v", entries, err)
+	}
+	if _, err := s.Get(ctx, Key(testPrefix, 1)); err != nil {
+		t.Fatalf("the next batch did not take the freed sequence 1: %v", err)
+	}
+}

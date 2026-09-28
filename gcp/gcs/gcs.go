@@ -59,8 +59,7 @@ func New(ctx context.Context, cfg Config) (*Backend, error) {
 	return &Backend{bucket: client.Bucket(cfg.Bucket), name: cfg.Bucket, project: cfg.ProjectID}, nil
 }
 
-// Open returns a Store over New(ctx, cfg) with ocfg's pacing, write bound
-// and encryption.
+// Open returns a Store over New(ctx, cfg) with ocfg's pacing and write bound.
 func Open(ctx context.Context, cfg Config, ocfg objstore.Config) (*objstore.Store, error) {
 	b, err := New(ctx, cfg)
 	if err != nil {
@@ -75,6 +74,20 @@ func httpCode(err error) int {
 		return e.Code
 	}
 	return 0
+}
+
+// SupportsKMS: GCS applies a per-object Cloud KMS key
+// (objstore.Store.KMS).
+func (g *Backend) SupportsKMS() bool { return true }
+
+// opErr is objstore.OpErr, adding objstore.ErrAccessDenied for a 403: the
+// caller lacks access, or the object's Cloud KMS key is disabled or its
+// grant is gone.
+func opErr(op, key string, err error) error {
+	if httpCode(err) == http.StatusForbidden {
+		err = fmt.Errorf("%w: %w", objstore.ErrAccessDenied, err)
+	}
+	return objstore.OpErr(op, key, err)
 }
 
 func isNotFound(err error) bool {
@@ -96,13 +109,14 @@ func etagOf(gen int64) string { return strconv.FormatInt(gen, 10) }
 // client does not check ctx before every request: against fake-gcs-server
 // a List and a Delete under a cancelled ctx succeeded.
 func done(ctx context.Context, op, key string) error {
-	return objstore.OpErr(op, key, ctx.Err())
+	return opErr(op, key, ctx.Err())
 }
 
 // write uploads data through obj. The upload error surfaces on Close.
 func write(ctx context.Context, obj *storage.ObjectHandle, data []byte) error {
 	w := obj.NewWriter(ctx)
 	w.ContentType = "application/octet-stream"
+	w.KMSKeyName = objstore.KMSKey(ctx)
 	if len(data) < singleShotMax {
 		// One request instead of a resumable session, with the object
 		// buffered so a transient failure can be retried. ChunkSize 0 would
@@ -121,7 +135,7 @@ func (g *Backend) Put(ctx context.Context, key string, data []byte) error {
 	if err := done(ctx, "put", key); err != nil {
 		return err
 	}
-	return objstore.OpErr("put", key, write(ctx, g.bucket.Object(key), data))
+	return opErr("put", key, write(ctx, g.bucket.Object(key), data))
 }
 
 // PutIfAbsent writes key only if no live object exists (ifGenerationMatch=0).
@@ -135,7 +149,7 @@ func (g *Backend) PutIfAbsent(ctx context.Context, key string, data []byte) (boo
 		if httpCode(err) == http.StatusPreconditionFailed {
 			return false, nil
 		}
-		return false, objstore.OpErr("put-if-absent", key, err)
+		return false, opErr("put-if-absent", key, err)
 	}
 	return true, nil
 }
@@ -156,7 +170,7 @@ func (g *Backend) PutIfMatch(ctx context.Context, key string, data []byte, etag 
 		if code := httpCode(err); code == http.StatusPreconditionFailed || isNotFound(err) {
 			return false, nil
 		}
-		return false, objstore.OpErr("put-if-match", key, err)
+		return false, opErr("put-if-match", key, err)
 	}
 	return true, nil
 }
@@ -172,28 +186,28 @@ func readAll(op, key string, r *storage.Reader) ([]byte, error) {
 		// enormous make.
 		data, err := io.ReadAll(r)
 		if err != nil {
-			return nil, objstore.OpErr(op, key, err)
+			return nil, opErr(op, key, err)
 		}
 		if int64(len(data)) != size {
-			return nil, objstore.OpErr(op, key, fmt.Errorf("short read: got %d bytes, object size is %d", len(data), size))
+			return nil, opErr(op, key, fmt.Errorf("short read: got %d bytes, object size is %d", len(data), size))
 		}
 		return data, nil
 	}
 	data := make([]byte, size)
 	n, err := io.ReadFull(r, data)
 	if errors.Is(err, io.ErrUnexpectedEOF) || errors.Is(err, io.EOF) {
-		return nil, objstore.OpErr(op, key, fmt.Errorf("short read: got %d bytes, object size is %d", n, size))
+		return nil, opErr(op, key, fmt.Errorf("short read: got %d bytes, object size is %d", n, size))
 	}
 	if err != nil {
-		return nil, objstore.OpErr(op, key, err)
+		return nil, opErr(op, key, err)
 	}
 	// Read on to EOF: the client validates its checksum there, and a body
 	// longer than the size is as wrong as a short one.
 	var extra [1]byte
 	if _, err := io.ReadFull(r, extra[:]); err == nil {
-		return nil, objstore.OpErr(op, key, fmt.Errorf("long read: body exceeds object size %d", size))
+		return nil, opErr(op, key, fmt.Errorf("long read: body exceeds object size %d", size))
 	} else if !errors.Is(err, io.EOF) {
-		return nil, objstore.OpErr(op, key, err)
+		return nil, opErr(op, key, err)
 	}
 	return data, nil
 }
@@ -207,7 +221,7 @@ func (g *Backend) get(ctx context.Context, op, key string) ([]byte, string, erro
 		if isNotFound(err) {
 			err = objstore.ErrNotFound
 		}
-		return nil, "", objstore.OpErr(op, key, err)
+		return nil, "", opErr(op, key, err)
 	}
 	gen := r.Attrs.Generation
 	data, err := readAll(op, key, r)
@@ -253,7 +267,7 @@ func (g *Backend) GetIfChanged(ctx context.Context, key, etag string) ([]byte, s
 		if isNotFound(err) {
 			err = objstore.ErrNotFound
 		}
-		return nil, "", false, objstore.OpErr("get-if-changed", key, err)
+		return nil, "", false, opErr("get-if-changed", key, err)
 	}
 	if ok && r.Attrs.Generation == gen {
 		r.Close()
@@ -281,20 +295,20 @@ func (g *Backend) GetRange(ctx context.Context, key string, offset, length int64
 		case httpCode(err) == http.StatusRequestedRangeNotSatisfiable:
 			err = objstore.ErrRange
 		}
-		return nil, objstore.OpErr("get-range", key, err)
+		return nil, opErr("get-range", key, err)
 	}
 	defer r.Close()
 	// A server ignoring Range must not turn a block read into an unbounded
 	// whole-object download.
 	if r.Remain() != length {
-		return nil, objstore.OpErr("get-range", key, objstore.ErrRange)
+		return nil, opErr("get-range", key, objstore.ErrRange)
 	}
 	data := make([]byte, length)
 	if _, err := io.ReadFull(r, data); err != nil {
 		if errors.Is(err, io.ErrUnexpectedEOF) || errors.Is(err, io.EOF) {
 			err = objstore.ErrRange
 		}
-		return nil, objstore.OpErr("get-range", key, err)
+		return nil, opErr("get-range", key, err)
 	}
 	return data, nil
 }
@@ -303,7 +317,7 @@ func (g *Backend) GetRange(ctx context.Context, key string, offset, length int64
 func (g *Backend) ListPage(ctx context.Context, prefix, after string, limit int) ([]string, string, error) {
 	q := &storage.Query{Prefix: prefix, StartOffset: after}
 	if err := q.SetAttrSelection([]string{"Name"}); err != nil {
-		return nil, "", objstore.OpErr("list-page", prefix, err)
+		return nil, "", opErr("list-page", prefix, err)
 	}
 	it := g.bucket.Objects(ctx, q)
 	// StartOffset is inclusive: room for after itself plus one extra key
@@ -320,7 +334,7 @@ func (g *Backend) ListPage(ctx context.Context, prefix, after string, limit int)
 			return keys, "", nil
 		}
 		if err != nil {
-			return nil, "", objstore.OpErr("list-page", prefix, err)
+			return nil, "", opErr("list-page", prefix, err)
 		}
 		if attrs.Name <= after {
 			continue
@@ -346,7 +360,7 @@ func (g *Backend) ListPage(ctx context.Context, prefix, after string, limit int)
 func (g *Backend) ListPrefixesPage(ctx context.Context, prefix, after string, limit int) ([]string, string, error) {
 	q := &storage.Query{Prefix: prefix, Delimiter: "/", StartOffset: after}
 	if err := q.SetAttrSelection([]string{"Name"}); err != nil {
-		return nil, "", objstore.OpErr("list-prefixes-page", prefix, err)
+		return nil, "", opErr("list-prefixes-page", prefix, err)
 	}
 	it := g.bucket.Objects(ctx, q)
 	it.PageInfo().MaxSize = min(limit+2, objstore.MaxListPage)
@@ -360,7 +374,7 @@ func (g *Backend) ListPrefixesPage(ctx context.Context, prefix, after string, li
 			return out, "", nil
 		}
 		if err != nil {
-			return nil, "", objstore.OpErr("list-prefixes-page", prefix, err)
+			return nil, "", opErr("list-prefixes-page", prefix, err)
 		}
 		// Objects at the prefix level are skipped; StartOffset = after
 		// brings after's own prefix back, so it is skipped too.
@@ -386,7 +400,7 @@ func (g *Backend) delete(ctx context.Context, key string) error {
 
 // Delete removes key. A missing key is not an error.
 func (g *Backend) Delete(ctx context.Context, key string) error {
-	return objstore.OpErr("delete", key, g.delete(ctx, key))
+	return opErr("delete", key, g.delete(ctx, key))
 }
 
 // DeleteMany removes keys with bounded parallelism (GCS has no batch delete
@@ -397,7 +411,7 @@ func (g *Backend) DeleteMany(ctx context.Context, keys ...string) error {
 	eg.SetLimit(deleteParallelism)
 	for _, key := range keys {
 		eg.Go(func() error {
-			return objstore.OpErr("delete-many", key, g.delete(ctx, key))
+			return opErr("delete-many", key, g.delete(ctx, key))
 		})
 	}
 	return eg.Wait()
@@ -413,16 +427,16 @@ func (g *Backend) EnsureBucket(ctx context.Context) error {
 		return nil
 	}
 	if !bucketMissing(err) {
-		return objstore.OpErr("head-bucket", g.name, err)
+		return opErr("head-bucket", g.name, err)
 	}
 	if g.project == "" {
-		return objstore.OpErr("create-bucket", g.name, errors.New("bucket does not exist and Config.ProjectID is empty"))
+		return opErr("create-bucket", g.name, errors.New("bucket does not exist and Config.ProjectID is empty"))
 	}
 	err = g.bucket.Create(ctx, g.project, nil)
 	if httpCode(err) == http.StatusConflict {
 		return nil
 	}
-	return objstore.OpErr("create-bucket", g.name, err)
+	return opErr("create-bucket", g.name, err)
 }
 
 // DropBucket empties the bucket and deletes it. A bucket that is already
@@ -437,18 +451,18 @@ func (g *Backend) DropBucket(ctx context.Context) error {
 			if bucketMissing(err) {
 				return nil
 			}
-			return objstore.OpErr("drop-bucket", g.name, err)
+			return opErr("drop-bucket", g.name, err)
 		}
 		if len(keys) == 0 {
 			break
 		}
 		if err := g.DeleteMany(ctx, keys...); err != nil {
-			return objstore.OpErr("drop-bucket", g.name, err)
+			return opErr("drop-bucket", g.name, err)
 		}
 	}
 	err := g.bucket.Delete(ctx)
 	if bucketMissing(err) {
 		return nil
 	}
-	return objstore.OpErr("drop-bucket", g.name, err)
+	return opErr("drop-bucket", g.name, err)
 }

@@ -40,6 +40,12 @@ func New(s *objstore.Store, objects *cache.Cache, cfg Config) (*Reader, error) {
 // Config is the normalized configuration the Reader was built with.
 func (r *Reader) Config() Config { return r.config }
 
+// Objects is the cache the Reader reads through.
+func (r *Reader) Objects() *cache.Cache { return r.objects }
+
+// Store is the store the Reader's ranged GETs go to.
+func (r *Reader) Store() *objstore.Store { return r.store }
+
 // Fetch returns an immutable object via the cache. Cached bytes must never
 // be mutated: every decoder copies out. Concurrent misses for the same key
 // share one GET under the leader's ctx, but each caller waits under its

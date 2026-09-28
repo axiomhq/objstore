@@ -5,10 +5,13 @@ package gcs_test
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"io"
 	"net/http"
 	"os"
+	"strings"
+	"sync"
 	"testing"
 	"time"
 
@@ -102,4 +105,76 @@ func TestConformanceReal(t *testing.T) {
 		}
 	})
 	storetest.Conformance(t, s)
+}
+
+// kmsTransport records the kmsKeyName of each upload and, while deny is
+// set, answers every request 403 as GCS does for a disabled key.
+type kmsTransport struct {
+	next http.RoundTripper
+	mu   sync.Mutex
+	keys []string
+	deny bool
+}
+
+func (k *kmsTransport) RoundTrip(req *http.Request) (*http.Response, error) {
+	k.mu.Lock()
+	deny := k.deny
+	if strings.Contains(req.URL.Path, "/upload/") {
+		k.keys = append(k.keys, req.URL.Query().Get("kmsKeyName"))
+	}
+	k.mu.Unlock()
+	if deny {
+		return &http.Response{StatusCode: http.StatusForbidden, Status: "403 Forbidden", Proto: "HTTP/1.1", ProtoMajor: 1, ProtoMinor: 1,
+			Header:  http.Header{"Content-Type": []string{"application/json"}},
+			Body:    io.NopCloser(strings.NewReader(`{"error":{"code":403,"message":"Permission denied on Cloud KMS key"}}`)),
+			Request: req}, nil
+	}
+	return k.next.RoundTrip(req)
+}
+
+// TestKMSKeyPerObject: the Store's WithKMSKeys rides on the upload as
+// kmsKeyName, an unkeyed object carries none, and a 403 is ErrAccessDenied.
+func TestKMSKeyPerObject(t *testing.T) {
+	server := fakestorage.NewServer(nil)
+	t.Cleanup(server.Stop)
+	tr := &kmsTransport{next: server.HTTPClient().Transport}
+	s, err := gcs.Open(context.Background(), gcs.Config{
+		Bucket: "kms", ProjectID: "test",
+		Options: []option.ClientOption{
+			option.WithEndpoint(server.URL() + "/storage/v1/"),
+			option.WithoutAuthentication(),
+			option.WithHTTPClient(&http.Client{Transport: tr}),
+		},
+	}, objstore.Config{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	ctx := context.Background()
+	if err := s.EnsureBucket(ctx); err != nil {
+		t.Fatal(err)
+	}
+	if !s.KMS() {
+		t.Fatal("GCS store must report per-object keys")
+	}
+	const key = "projects/p/locations/l/keyRings/r/cryptoKeys/k"
+	s = s.WithKMSKeys(func(_ context.Context, object string) (string, error) {
+		if object == "secret" {
+			return key, nil
+		}
+		return "", nil
+	})
+	for _, object := range []string{"secret", "plain"} {
+		if err := s.Put(ctx, object, []byte(object)); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if len(tr.keys) != 2 || tr.keys[0] != key || tr.keys[1] != "" {
+		t.Fatalf("upload kmsKeyName: %q", tr.keys)
+	}
+	tr.mu.Lock()
+	tr.deny = true
+	tr.mu.Unlock()
+	if _, err := s.Get(ctx, "secret"); !errors.Is(err, objstore.ErrAccessDenied) {
+		t.Fatalf("GET under a denied key: %v", err)
+	}
 }

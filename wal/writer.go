@@ -682,6 +682,9 @@ func (w *Writer[R]) mintNonceLocked() string {
 //   - claim lost, read-back shows b's nonce: our own earlier PUT for exactly
 //     this batch landed and the response was lost — durable, advance.
 //   - claim lost, foreign nonce: proven split brain — ErrLostRace.
+//   - the store refusing the batch's first PUT on its first attempt
+//     (objstore.ErrAccessDenied): nothing was written; the error, and the
+//     writer goes on at the same sequence.
 //   - anything unverifiable (PUT transport error, read-back failure, or this
 //     attempt's deadline): errRetry; the batch stays in flight, retried with
 //     the SAME seq and nonce, from the first page not yet proven.
@@ -757,6 +760,12 @@ func (w *Writer[R]) putPages(ctx context.Context, b *batch[R], floor func(contex
 		// object writes for a store slot.
 		startedAt := time.Now()
 		ok, err := w.store.PutIfAbsent(objstore.Urgent(ctx), key, b.pages[i])
+		if err != nil && i == 0 && b.attempts == 1 && errors.Is(err, objstore.ErrAccessDenied) {
+			// A refusal is an outcome: nothing of this batch was ever
+			// written, so its callers fail now and the sequence stays free.
+			// Retrying would hold every later write behind a revoked key.
+			return fmt.Errorf("wal: put %s: %w", key, err)
+		}
 		if err != nil {
 			return w.retry("put", key, err)
 		}

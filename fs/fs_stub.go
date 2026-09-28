@@ -32,7 +32,7 @@ func New(root, bucket string) *Backend {
 }
 
 // Open returns a Store over New(root, bucket) with cfg's pacing, write
-// bound and encryption.
+// bound.
 func Open(root, bucket string, cfg objstore.Config) *objstore.Store {
 	return objstore.Open(New(root, bucket), cfg)
 }

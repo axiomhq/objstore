@@ -1,14 +1,14 @@
 # Changelog
 
-## v0.5.0 (unreleased)
+## v0.5.0
 
 ### Breaking changes
 
-**Encrypted object format**
+**Encryption moves to the store**
 
-- Every encrypted object is now written with header version 2. A non-empty v2 object has the v1 layout except the version byte; an empty v2 object carries a GCM tag (41 bytes, was 25).
-- Readers older than v0.5.0 cannot read v2 objects: they fail with `invalid encrypted object header`. Worse, an old reader holding a stale cached "no key record" for a namespace treats v2 ciphertext as plaintext and returns it. Roll out v0.5.0 readers everywhere before any v0.5.0 writer; do not run a mixed fleet.
-- v0.5.0 reads v1 non-empty objects unchanged, but rejects a v1 empty object with an error wrapping `objstore.ErrLegacyEmptyObject`. Such objects are 25 bytes, starting `DWEK` and version byte 1. Rewrite (Put the empty value again) or delete every one. Only a v0.5.0 writer produces the v2 form.
+- The client-side envelope is gone: `ConfigureCMEK`, `SetCMEKRefreshInterval`, `InstallNamespaceKey`, `RetireNamespaceKey`, `RotateNamespaceKey`, `CheckNamespaceKey`, `Envelope`, `EncryptionCustomerManaged`, `Config.KeyProvider`, `Config.KeyRefreshInterval`, `Config.AcceptPlaintext`, `DefaultAcceptPlaintext`, and packages `kms`, `aws/kms` and `gcp/kms`.
+- In its place, `Store.WithKMSKeys(fn)` names a KMS key per written object; S3 stores it with SSE-KMS under that key, GCS with that `kmsKeyName`. Reads need no key. `WithKMSKey(ctx, id)` keys one write; on a Store with a `WithKMSKeys` function, the function decides and can read it with `KMSKey(ctx)`.
+- Objects a v0.4 store sealed client-side (`DWEK` header) are returned as stored, still ciphertext. Rewrite or delete them before upgrading.
 
 **objstore**
 
@@ -19,9 +19,6 @@
 - `Timings.LogAttrs() []any` → `Timings.Attrs() []slog.Attr`.
 - `ErrNotFound` and `ErrRange` messages now start with `store:`. `errors.Is` is unaffected.
 - An S3 409 `ConditionalRequestConflict` now wraps `objstore.ErrConflict`. It means retry, not a lost race.
-- The built-in plaintext exemptions are now `Config.AcceptPlaintext` (nil = `DefaultAcceptPlaintext`, same exemptions). Bytes carrying the encrypted header are always decrypted. `GetRange` never consults it.
-- `InstallNamespaceKey` returns `ErrInvalidEnvelope` for a bad envelope (was `kms.ErrKeyUnavailable`), and an error wrapping `ErrKeyRecordExists` when a different record exists.
-- A key-lookup timeout reads `key lookup timed out after …` and no longer matches `errors.Is(err, context.DeadlineExceeded)`. A caller's own cancel still returns `ctx.Err()`.
 
 **fs** (was the `file://` endpoint of `objstore.New`)
 
@@ -29,15 +26,6 @@
 - Keys containing `/wal/` no longer get lock stripes of their own. Set `fs.Backend.IsolatedKeys` before first use, the same in every process.
 - Unix with flock only (not Solaris or AIX; illumos works). Elsewhere it builds and every call fails with `errors.ErrUnsupported`.
 - Invalid keys wrap `objstore.ErrInvalidKey`.
-
-**kms**
-
-- `kms` imports only the standard library.
-- `kms.AWSKMS`, `kms.AWSClient` → `awskms.Provider`, `awskms.Client` (package `kms` at `objstore/aws/kms`; import it as `awskms` next to `objstore/kms`).
-- `kms.GCPKMS`, `kms.GCPClient` → `gcpkms.Provider`, `gcpkms.Client` (package `kms` at `objstore/gcp/kms`; import it as `gcpkms` next to `objstore/kms`).
-- `kms.Router{Local, AWS, GCP, Default}` → `kms.Router{Routes, Default, DefaultScheme}`. The longest scheme prefix in `Routes` wins. An unmatched name goes to `Default` as `DefaultScheme+name`; the scheme is no longer guessed from `Default`'s type.
-- `ErrKeyUnavailable` text is `kms: customer-managed encryption key unavailable`.
-- A DEK that is not `kms.DEKSize` bytes is a caller error (`kms.CheckDEK`), not `ErrKeyUnavailable`.
 
 **wal**
 
@@ -67,7 +55,7 @@
 **rangeread**
 
 - `rangeread.New` returns `(*Reader, error)`. Zero `Config` fields take defaults; invalid ones are an error. A zero `Config` used to skip every `FetchRanges`.
-- `Reader.Store`, `Objects`, `Cfg`, `Memory` are unexported. Use `(*Reader).Config()`.
+- `Reader.Store`, `Objects` and `Cfg` fields → `(*Reader).Store()`, `Objects()`, `Config()`. `Memory` is unexported.
 - Invalid caller input (bad extent, empty `Load.Key`, one Key with two extents) is `ErrInvalidExtent` (was `ErrCorrupt`). `ErrCorrupt` now means a wrong-length read only.
 
 **storetest**
@@ -80,21 +68,13 @@
 
 ### Fixed
 
-- objstore: a cancelled caller no longer opens a namespace's KMS backoff or reports `kms.ErrKeyUnavailable`.
-- objstore: concurrent cold key lookups of one namespace share one record GET and one Unwrap. `Urgent` callers share a lookup of their own and never join a bulk caller's paced one.
-- objstore: a failed or unparseable key-record read is a storage error, not `kms.ErrKeyUnavailable`, and keeps a still-valid cached key.
-- objstore: `Delete` and `DeleteMany` no longer need the namespace key; crypto-shredding works after revocation.
-- objstore: a cached "no key record" is trusted only by whole-object reads, so another process installing a key cannot make this one write plaintext or return ciphertext.
-- objstore: a lookup that began before an Install or Retire cannot cache its stale answer.
-- objstore: an empty encrypted object is authenticated; a bare header no longer passes as one.
-- objstore: small encrypted ranges are copied out instead of pinning decrypted blocks.
+- wal: a batch whose first PUT the store refuses (`objstore.ErrAccessDenied`) on its first attempt fails its callers at once and leaves the sequence free, instead of retrying behind a revoked key.
+
 - objstore: `Config.MaxInflightWrites < 0` means unbounded (was a deadlock).
 - fs: a `PutIfAbsent` retry after a failed directory sync syncs the directory, so `(false, nil)` means durable.
 - fs: `PutIfMatch` writes and fsyncs its temp file before taking the key lock.
 - fs: a list page walks from the prefix's directory and stops after one page (was a whole-bucket walk).
 - s3: `DropBucket` on a missing bucket returns nil.
-- kms: `LocalFile` opens keys through `os.OpenRoot` and refuses symlinks; a missing rotated key file reports why.
-- kms: AWS and GCP SDK errors are wrapped with `%w`.
 - wal: a record that fails to encode fails only its own Append (`ErrInvalidRecord`).
 - wal: a batch is paced once and its pages go out back to back; a retry resumes after the pages already proven.
 - wal: adopting our own earlier PUT no longer delays the next batch.
@@ -127,10 +107,11 @@
 
 ### Added
 
-- Packages `fs`, `aws/s3`, `gcp/gcs` (Google Cloud Storage), `aws/kms`, `gcp/kms`, `storetest/bucket`. Provider packages live under `aws/` and `gcp/`; R2, MinIO, Ceph and Hetzner use `aws/s3`.
-- objstore: `Open`, `OpErr`, `IsUrgent`, `TimingsOf`, `Timings.Since`, `Call.String`, `ErrConflict`, `ErrInvalidKey`, `ErrInvalidEnvelope`, `ErrKeyRecordExists`, `ErrLegacyEmptyObject`.
-- objstore: `Config.KeyProvider`, `Config.KeyRefreshInterval`, `Config.AcceptPlaintext`, `DefaultAcceptPlaintext`.
-- kms: `DEKSize`, `CheckDEK`, `LeaseCadencer`; `awskms.Scheme` (`aws:`), `gcpkms.Scheme` (`gcp:`).
+- Packages `fs`, `aws/s3`, `gcp/gcs` (Google Cloud Storage), `storetest/bucket`. Provider packages live under `aws/` and `gcp/`; R2, MinIO, Ceph and Hetzner use `aws/s3`.
+- objstore: `Open`, `OpErr`, `IsUrgent`, `TimingsOf`, `Timings.Since`, `Call.String`, `ErrConflict`, `ErrInvalidKey`, `ErrAccessDenied` (a 403, or a KMS key the store cannot use).
+- objstore: `Store.WithKMSKeys`, `KMSKeyFunc`, `WithKMSKey`, `KMSKey`, `Store.KMS`.
+- objstore: `Store.CheckConditionalWrites(ctx)`: PutIfAbsent a fresh `_probe/ifnonematch/` key twice (must create, then must not), then delete it; any other outcome is an error naming the backend.
+- storetest: `NewKMS` stands in for SSE-KMS: it records each object's key and revokes one.
 - wal: `ErrRecordTooLarge`, `ErrInvalidRecord`, `ErrWriterFailed`, `Stats.Lost`, `Stats.Terminal`, `WalkParallelWithGet`. `WriteError` implements `error` and `Unwrap`.
 - cache: `ByteCache.GenerationOf`, `Resident.GenerationOf`, `EntryOverhead`, `Cache.Logger`, `Disk.Logger` (nil = `slog.Default()`), `Outcome.String`, `Class.String`. Windows gets a real directory lock (`LockFileEx`).
 - lease: `lease.Store`, `(*Lease).SetLogger`.
@@ -141,11 +122,7 @@
 
 ### Known limitations / accepted debt
 
-- AWS and GCP KMS wraps carry no encryption context (AAD). Binding the key name would break existing wrapped DEKs.
-- AES-GCM uses a random 96-bit nonce per object under one DEK per namespace: keep each namespace well under 2^32 encrypted writes. `RotateNamespaceKey` re-wraps the same DEK, so it does not reset the count.
-- `GetRange` on an encrypted object does two GETs: the header, then the covering blocks.
 - cache: several overlapping fetch entry points (`FetchWith`, `FetchCached`, `FetchCachedRange`, `FromDisk`, `CachedRange`, `Gated`), and stage results and budgets travel in the context (`WithResults`, `WithBudget`). A later `FetchRanges` replaces the earlier scope.
-- While a `KeyProvider` is configured, every write and range read in a namespace without a key record first GETs its record (shared by concurrent callers).
 - MinIO creates the object on a `PutIfMatch` of a missing key. The MinIO CI job skips `ETagCASMissing`.
 - Test hooks stay exported: `lease.Before`, `lease.Steal`, `Lease.Expire`, `Lease.Continuous`, `Lease.FloorProven`, `Disk.FirstFile`, `Disk.KeysForTest`, `Disk.SetMaxPinnedNamespaces`.
 - The Windows disk-cache lock is vetted in CI, never run there.
