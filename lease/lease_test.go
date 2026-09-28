@@ -20,13 +20,7 @@ import (
 
 func TestLease(t *testing.T) {
 	ctx := context.Background()
-	// Every wait below is a multiple of ttl, and a renewal gets ttl/2 per
-	// attempt: on a real S3 endpoint that must clear the store's tail
-	// latency (a dev MinIO's p99 small PUT was 144ms, its max 1.5s).
-	ttl := 300 * time.Millisecond
-	if os.Getenv("OBJSTORE_TEST_S3") != "" {
-		ttl = 2 * time.Second
-	}
+	ttl := testTTL(300 * time.Millisecond)
 
 	t.Run("AcquireRenewExpireTakeover", func(t *testing.T) {
 		s := bucket.New(t)
@@ -316,7 +310,7 @@ func TestLease(t *testing.T) {
 // any other error leaves a lease whose CAS succeeded alone.
 func TestCheckHeadOnRenewal(t *testing.T) {
 	ctx := context.Background()
-	const ttl = 200 * time.Millisecond
+	ttl := testTTL(200 * time.Millisecond)
 
 	t.Run("NotCalledOnInitialTake", func(t *testing.T) {
 		s := bucket.New(t)
@@ -653,4 +647,15 @@ func waitFor(t *testing.T, cond func() bool) {
 			t.Fatal("condition never held")
 		}
 	}
+}
+
+// testTTL is base on the file backend and 2 s on a real S3 endpoint: every
+// wait in these tests is a multiple of the TTL, and a renewal gets TTL/2
+// per attempt, which must clear the store's tail latency (a dev MinIO's
+// p99 small PUT was 144 ms, its max 1.5 s).
+func testTTL(base time.Duration) time.Duration {
+	if os.Getenv("OBJSTORE_TEST_S3") != "" {
+		return 2 * time.Second
+	}
+	return base
 }

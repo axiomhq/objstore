@@ -239,7 +239,11 @@ func TestLostRaceLatches(t *testing.T) {
 // forever).
 func TestMultiPageBatchWithinOneAttempt(t *testing.T) {
 	const interval = 500 * time.Millisecond
-	s, f := bucket.NewFaulty(t)
+	// The file backend: the property is that the pages of one batch go out
+	// back to back within one attempt, which does not depend on the store,
+	// and a real S3 endpoint's PUT of a 17 MiB page can outlast the short
+	// attempt used here.
+	s, f := storetest.Faulty(t, bucket.NewFS(t))
 	w := NewWriter[Bytes](s, testPrefix, 1, nil, WithCommitInterval(interval))
 	w.SetAttemptTimeout(interval)
 	defer w.Close()
