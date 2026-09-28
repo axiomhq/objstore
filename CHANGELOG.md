@@ -81,7 +81,7 @@
 ### Fixed
 
 - objstore: a cancelled caller no longer opens a namespace's KMS backoff or reports `kms.ErrKeyUnavailable`.
-- objstore: concurrent cold key lookups of one namespace share one record GET and one Unwrap. `Urgent` callers share a lookup of their own, so they never wait behind the pacer.
+- objstore: concurrent cold key lookups of one namespace share one record GET and one Unwrap. `Urgent` callers share a lookup of their own and never join a bulk caller's paced one.
 - objstore: a failed or unparseable key-record read is a storage error, not `kms.ErrKeyUnavailable`, and keeps a still-valid cached key.
 - objstore: `Delete` and `DeleteMany` no longer need the namespace key; crypto-shredding works after revocation.
 - objstore: a cached "no key record" is trusted only by whole-object reads, so another process installing a key cannot make this one write plaintext or return ciphertext.

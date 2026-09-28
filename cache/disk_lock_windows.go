@@ -14,7 +14,7 @@ import (
 const sweepable = true
 
 // deleteOpenFiles is false: Go opens files without FILE_SHARE_DELETE, so
-// the lock file cannot be removed while it is open (see removeHome).
+// the lock file cannot be removed while it is open (see removeHomeClosingLockFirst).
 const deleteOpenFiles = false
 
 // lockFile opens path, creating it, and takes an exclusive, non-blocking

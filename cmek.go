@@ -122,9 +122,11 @@ type cmekState struct {
 	// move while it ran, so a lookup that saw "no record" just before an
 	// Install cannot cache that stale answer after it. Being store-wide, it
 	// can cost an unrelated in-flight lookup its cache entry, never more;
-	// it only grows, so a stale read can never match it again. open does
-	// not move it: a stale "no record" it lets through is re-checked by
-	// every read and trusted by no write.
+	// it only grows, so a stale read can never match it again. A header
+	// re-check (drop) does not move it: a stale flight finishing after a
+	// drop can at worst cache "absent" and close a backoff once, one extra
+	// lookup, because every read re-checks and no write trusts an absent
+	// entry.
 	epoch uint64
 	// sweepAt is the key cache size that triggers the next sweep.
 	sweepAt int
@@ -133,8 +135,10 @@ type cmekState struct {
 	interval *atomic.Int64
 	// flight collapses concurrent record reads and unwraps per namespace;
 	// checks does the same for CheckNamespaceKey's revalidations. Urgent
-	// callers use flights of their own (see lookup).
-	flight, checks singleflight.Group
+	// callers have groups of their own, so a heartbeat never joins a bulk
+	// caller's paced lookup; separate groups rather than a key suffix, so
+	// no namespace name can collide with another's flight.
+	flight, urgentFlight, checks, urgentChecks singleflight.Group
 	// now and ttl are time.Now and keyCacheTTL outside tests.
 	now func() time.Time
 	ttl time.Duration
@@ -357,8 +361,8 @@ func (c *cmekState) currentEpoch() uint64 {
 func (c *cmekState) put(name string, k cachedKey, ttl time.Duration) {
 	now := c.now()
 	if _, ok := c.keys[name]; !ok && len(c.keys) >= c.sweepAt {
-		for n, k := range c.keys {
-			if now.Before(k.until) {
+		for n, old := range c.keys {
+			if now.Before(old.until) {
 				continue
 			}
 			delete(c.keys, n)
@@ -400,8 +404,10 @@ func (c *cmekState) invalidate(name string, failures bool) {
 		delete(c.failures, name)
 	}
 	c.mu.Unlock()
-	forgetFlights(&c.flight, name)
-	forgetFlights(&c.checks, name)
+	c.flight.Forget(name)
+	c.urgentFlight.Forget(name)
+	c.checks.Forget(name)
+	c.urgentChecks.Forget(name)
 }
 
 // drop forgets name's cached lookup and detaches its in-flight lookups so
@@ -411,22 +417,15 @@ func (c *cmekState) drop(name string) {
 	c.mu.Lock()
 	delete(c.keys, name)
 	c.mu.Unlock()
-	forgetFlights(&c.flight, name)
+	// open never joins a check flight, so those are left alone.
+	c.flight.Forget(name)
+	c.urgentFlight.Forget(name)
 }
 
 func (c *cmekState) remember(name string, k cachedKey, ttl time.Duration) {
 	c.mu.Lock()
 	defer c.mu.Unlock()
 	c.put(name, k, ttl)
-}
-
-// urgentFlight suffixes the flight key of an Urgent caller's lookup.
-const urgentFlight = "\x00urgent"
-
-// forgetFlights detaches name's in-flight lookups in g, urgent or not.
-func forgetFlights(g *singleflight.Group, name string) {
-	g.Forget(name)
-	g.Forget(name + urgentFlight)
 }
 
 func namespaceObject(key string) string {
@@ -501,7 +500,10 @@ func (s *Store) RetireNamespaceKey(ctx context.Context, name, incarnation string
 			return err
 		}
 		plain, err = decryptObject(object, raw, aead)
-		if err != nil || !deletedHead(plain, incarnation) {
+		if err != nil {
+			return fmt.Errorf("cannot retire namespace key before deleted manifest: %w", OpErr("retire", object, err))
+		}
+		if !deletedHead(plain, incarnation) {
 			return fmt.Errorf("cannot retire namespace key before deleted manifest: %w", kms.ErrKeyUnavailable)
 		}
 		ok, err := s.b.PutIfMatch(ctx, object, plain, tag)
@@ -630,15 +632,16 @@ func (s *Store) lookup(ctx context.Context, c *cmekState, name string, check boo
 		return nil, err
 	}
 	group := &c.flight
-	if check {
+	switch urgent := IsUrgent(ctx); {
+	case check && urgent:
+		group = &c.urgentChecks
+	case check:
 		group = &c.checks
-	}
-	key := name
-	if IsUrgent(ctx) {
-		key += urgentFlight
+	case urgent:
+		group = &c.urgentFlight
 	}
 	detached := context.WithoutCancel(ctx)
-	ch := group.DoChan(key, func() (any, error) {
+	ch := group.DoChan(name, func() (any, error) {
 		lctx, cancel := context.WithTimeout(detached, keyLookupTimeout)
 		defer cancel()
 		return c.load(lctx, s.b, name, check)
@@ -938,6 +941,9 @@ func parseEncryptedHeader(header []byte) (size, blocks int64, err error) {
 }
 
 func decryptBlocks(object string, header, ciphertext []byte, aead cipher.AEAD, first, last int64) ([]byte, error) {
+	if aead == nil {
+		return nil, errors.New("no namespace key")
+	}
 	size, _, err := parseEncryptedHeader(header)
 	if err != nil {
 		return nil, err

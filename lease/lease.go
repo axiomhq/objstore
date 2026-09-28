@@ -108,8 +108,10 @@ type Lease struct {
 // Acquire takes the lease at key and starts renewing it at once: renewal
 // has to cover whatever the caller does before it can install a fence
 // (a replay, say), which may outlast a TTL. The fence callback arrives
-// later, via Start. Every failure path between the two owes the lease a
-// Release. A ttl <= 0 means DefaultTTL.
+// later, via Start; call it even if nothing needs cancelling (Start(nil)
+// works), because a fence before Start keeps Done open until Start runs.
+// Every failure path between the two owes the lease a Release. A ttl <= 0
+// means DefaultTTL.
 //
 // Each call uses a fresh handle. After a first write whose outcome was
 // lost, a fresh handle cannot recognise that write as its own and waits
@@ -155,7 +157,7 @@ func (l *Lease) Acquire(ctx context.Context) error {
 	l.mu.Lock()
 	if l.started || l.stopped() {
 		l.mu.Unlock()
-		return fmt.Errorf("lease %s: Acquire called twice, or after Retire; use a fresh New", l.key)
+		return fmt.Errorf("lease %s: Acquire called twice, or after Release or Retire; use a fresh New", l.key)
 	}
 	l.started = true
 	l.mu.Unlock()
@@ -230,12 +232,15 @@ func (l *Lease) leave() {
 
 // Start installs the fence callback, running it immediately (on the
 // caller's goroutine) if the lease was fenced in the meantime and not
-// since released or retired. Call it once, after Acquire. A later fence
-// runs the callback on its own goroutine, so the callback may call
-// anything on the lease, Release and Retire included; Retire and Release
-// do not wait for it, and it must not wait on Done(), which waits for it.
-// A Release or Retire never runs it.
+// since released or retired. Call it once, after Acquire; a nil fence
+// installs an empty callback. A later fence runs the callback on its own
+// goroutine, so the callback may call anything on the lease, Release and
+// Retire included; Retire and Release do not wait for it, and it must not
+// wait on Done(), which waits for it. A Release or Retire never runs it.
 func (l *Lease) Start(fence func()) {
+	if fence == nil {
+		fence = func() {}
+	}
 	l.mu.Lock()
 	l.fence = fence
 	owed := l.owed
@@ -522,7 +527,7 @@ func (l *Lease) renew() {
 	}
 }
 
-// Fence retires the lease in this process for good: Valid refuses until a
+// Fence ends the lease in this process for good: Valid refuses until a
 // fresh acquisition. The fence callback runs once, on the first Fence, on
 // a goroutine of its own (or on Start's, if Start has not been called
 // yet); a Fence after Release, Retire or Done runs none.
@@ -533,18 +538,18 @@ func (l *Lease) Fence() { l.fenceFor(errors.New("fenced by caller")) }
 // may be the caller here.
 func (l *Lease) fenceFor(reason error) {
 	l.mu.Lock()
-	already, fn, log := l.fenced, l.fence, l.log
+	already, stopped, fn, log := l.fenced, l.stopped(), l.fence, l.log
 	l.fenced, l.interrupted = true, true
 	// Claimed under mu, so retire (which closes stop and gives back an owed
 	// place under mu) and Start (which takes it under mu) see it whole. With
 	// no callback yet, the place is owed: Done stays open for Start.
-	claimed := !already && !l.stopped() && l.join()
+	claimed := !already && !stopped && l.join()
 	if claimed && fn == nil {
 		l.owed = true
 	}
 	l.mu.Unlock()
-	if already {
-		return
+	if already || stopped {
+		return // nothing to run or log: fenced before, or released or retired
 	}
 	if log != nil {
 		log.Warn("lease fenced", "key", l.key, "owner", l.owner, "reason", reason)
@@ -560,7 +565,8 @@ func (l *Lease) fenceFor(reason error) {
 // Retire stops renewing without touching the object. The lease then simply
 // expires for whoever wants it next. It waits for a running renewal
 // goroutine to exit (at most about one TTL), not for a fence callback. A
-// nil lease is a no-op.
+// fence callback owed to Start (the lease was fenced before Start) is
+// given up: Start will not run it. A nil lease is a no-op.
 func (l *Lease) Retire() {
 	if l == nil {
 		return
@@ -767,8 +773,8 @@ func (l *Lease) TTL() time.Duration { return l.ttl }
 //   - every fence callback has returned, including one Start runs itself
 //     because the fence came first. A fence before Start keeps Done open
 //     until Start's callback returns, or until Release or Retire gives the
-//     callback up; a lease fenced and then never started nor released
-//     never closes Done.
+//     callback up; a lease fenced and then never started, released nor
+//     retired never closes Done.
 //
 // A fence after Done has closed runs no callback.
 func (l *Lease) Done() <-chan struct{} { return l.ended }

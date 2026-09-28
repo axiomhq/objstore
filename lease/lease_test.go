@@ -8,6 +8,7 @@ import (
 	"fmt"
 	"log/slog"
 	"os"
+	"runtime"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -728,7 +729,10 @@ func waitFor(t *testing.T, cond func() bool) {
 // per attempt, which must clear the store's tail latency (a dev MinIO's
 // p99 small PUT was 144 ms, its max 1.5 s).
 func testTTL(base time.Duration) time.Duration {
-	if os.Getenv("OBJSTORE_TEST_S3") != "" {
+	if os.Getenv("OBJSTORE_TEST_S3") != "" || runtime.GOOS == "darwin" {
+		// A real S3 endpoint, and the macOS runner's fsync, both have tail
+		// latencies that a renewal at base/4 with base/2 to spare cannot
+		// clear.
 		return 2 * time.Second
 	}
 	return base
