@@ -45,14 +45,14 @@ jobs:
       - uses: actions/setup-go@v6
         with:
           go-version-file: go.mod
-      # A step, not a services: container: services cannot pass the
-      # image's command (server /data), and minio/minio ships no curl for a
-      # container health check, so readiness is polled from the host.
+      # MinIO no longer publishes public images or binaries; Bitnami's
+      # frozen legacy image still serves the same server. A step rather
+      # than a services: container so readiness can be polled from the host.
       - name: start MinIO
         run: |
           docker run -d --name minio -p 9000:9000 \
             -e MINIO_ROOT_USER=minioadmin -e MINIO_ROOT_PASSWORD=minioadmin \
-            quay.io/minio/minio server /data
+            bitnamilegacy/minio:2025.7.23-debian-12-r5
           for i in $(seq 60); do
             curl -fsS http://localhost:9000/minio/health/live && exit 0
             sleep 1
