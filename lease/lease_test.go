@@ -737,3 +737,201 @@ func testTTL(base time.Duration) time.Duration {
 	}
 	return base
 }
+
+// expireStored zeroes l's local deadline and the stored expiry, keeping the
+// owner and nonce: the acquisition has lapsed and is takeable at once.
+func expireStored(t *testing.T, l *Lease) {
+	t.Helper()
+	l.Expire()
+	body, _, err := Load(context.Background(), l.Store(), l.Key())
+	if err != nil {
+		t.Fatal(err)
+	}
+	body.Expiry = time.Time{}
+	plant(t, l.Store(), l.Key(), body)
+}
+
+func TestBeforeRequiresBothClocks(t *testing.T) {
+	start := time.Now()
+	deadline := start.Add(time.Second)
+	for _, tc := range []struct {
+		name          string
+		elapsed, wall time.Duration
+		want          bool
+	}{
+		{"live", 0, 0, true},
+		{"suspend", 0, 2 * time.Second, false},
+		{"wall boundary", 0, time.Second, false},
+		{"backward wall step", 2 * time.Second, -time.Second, false},
+		{"elapsed boundary", time.Second, 0, false},
+		{"both expired", 2 * time.Second, 2 * time.Second, false},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			if got := Before(start.Add(tc.elapsed), start.Round(0).Add(tc.wall), deadline); got != tc.want {
+				t.Fatalf("lease live = %v, want %v", got, tc.want)
+			}
+		})
+	}
+}
+
+func TestReleaseIsImmediateHandover(t *testing.T) {
+	ctx := context.Background()
+	s := bucket.New(t)
+	const ttl = time.Minute // long enough that only the release can explain it
+	a, err := Acquire(ctx, s, "n/lease", "owner-a", ttl)
+	if err != nil {
+		t.Fatal(err)
+	}
+	a.Start(func() {})
+	a.Release(context.Background())
+	b, err := Acquire(ctx, s, "n/lease", "owner-b", ttl)
+	if err != nil {
+		t.Fatalf("acquire after release: %v, want the lease handed straight over", err)
+	}
+	b.Start(func() {})
+	b.Release(context.Background())
+}
+
+func TestAcquireCannotReplaceLiveSameOwner(t *testing.T) {
+	ctx := context.Background()
+	s := bucket.New(t)
+	a, err := Acquire(ctx, s, "same/lease", "process", time.Minute)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer a.Release(context.Background())
+	b, err := Acquire(ctx, s, "same/lease", "process", time.Minute)
+	if b != nil {
+		defer b.Release(context.Background())
+	}
+	if !errors.Is(err, ErrNotOwner) {
+		t.Fatalf("fresh acquisition replaced a live acquisition with the same owner ID: %v", err)
+	}
+	if err := a.Valid(); err != nil {
+		t.Fatalf("first acquisition unexpectedly lost validity: %v", err)
+	}
+}
+
+func TestRenewalCannotReacquireAfterPausedRead(t *testing.T) {
+	ctx := context.Background()
+	s, fault := bucket.NewFaulty(t)
+	// A handle with no renewer, so the test drives Take by hand.
+	a := New(s, "gap/lease", "first", time.Minute)
+	if err := a.Take(ctx); err != nil {
+		t.Fatal(err)
+	}
+	defer a.Release(context.Background())
+	fault.Set(storetest.Plan{Op: storetest.OpGet, Key: a.Key(), N: 1, Mode: storetest.Pause})
+	defer fault.Resume()
+	done := make(chan error, 1)
+	go func() { done <- a.Take(ctx) }()
+	waitFor(t, func() bool { return fault.Fired() > 0 })
+	expireStored(t, a)
+	b, err := Acquire(ctx, s, "gap/lease", "second", time.Minute)
+	if err != nil {
+		t.Fatal(err)
+	}
+	b.Release(context.Background())
+	fault.Resume()
+	if err := <-done; !errors.Is(err, ErrNotOwner) {
+		t.Fatalf("paused renewal reacquired an abandoned handle: %v", err)
+	}
+	if err := a.Valid(); !errors.Is(err, ErrNotOwner) {
+		t.Fatalf("abandoned handle may serve after another owner released: %v", err)
+	}
+}
+
+func TestLateRenewalDoesNotExtendAnElapsedInterval(t *testing.T) {
+	ctx := context.Background()
+	s, fault := bucket.NewFaulty(t)
+	a := New(s, "late/lease", "first", time.Minute)
+	if err := a.Take(ctx); err != nil {
+		t.Fatal(err)
+	}
+	defer a.Release(context.Background())
+	fault.Set(storetest.Plan{Op: storetest.OpPutIfMatch, Key: a.Key(), N: 1, Mode: storetest.Pause})
+	defer fault.Resume()
+	done := make(chan error, 1)
+	go func() { done <- a.Take(ctx) }()
+	waitFor(t, func() bool { return fault.Fired() > 0 })
+	// The CAS can land successfully, but cannot retroactively cover the gap
+	// between the old local deadline and the delayed response.
+	a.Expire()
+	fault.Resume()
+	if err := <-done; !errors.Is(err, ErrNotOwner) {
+		t.Fatalf("late CAS revived an expired acquisition: %v", err)
+	}
+	if err := a.Valid(); !errors.Is(err, ErrNotOwner) {
+		t.Fatalf("late renewal made stale state serviceable: %v", err)
+	}
+}
+
+func TestReleaseCannotExpireNewAcquisitionWithSameOwner(t *testing.T) {
+	ctx := context.Background()
+	s := bucket.New(t)
+	a, err := Acquire(ctx, s, "same/lease", "same-owner", time.Minute)
+	if err != nil {
+		t.Fatal(err)
+	}
+	a.Retire()
+	expireStored(t, a)
+	b, err := Acquire(ctx, s, "same/lease", "same-owner", time.Minute)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer b.Release(context.Background())
+	a.Release(context.Background())
+	if other, err := Acquire(ctx, s, "same/lease", "third-owner", time.Minute); !errors.Is(err, ErrNotOwner) {
+		if other != nil {
+			other.Release(context.Background())
+		}
+		t.Fatalf("old release handed away a newer acquisition: %v", err)
+	}
+}
+
+// FuzzLoad: any bytes at the lease key load as a free lease with an ETag,
+// never an error, so a fresh owner can always CAS over garbage.
+func FuzzLoad(f *testing.F) {
+	add := func(v any) {
+		raw, err := json.Marshal(v)
+		if err != nil {
+			f.Fatal(err)
+		}
+		f.Add(raw)
+	}
+	add(Body{Owner: "host/1/abcd", Nonce: "n", Expiry: time.Unix(1788000000, 0)})
+	add(Body{})
+	for _, s := range [][]byte{
+		{}, []byte("{"), []byte("null"), []byte("[]"), []byte("0"),
+		[]byte(`{"owner":"host/1/ab","nonce":"n","expiry":"not-a-time"}`),
+		[]byte(`{"owner":"host/1/ab","nonce":"n","expiry":"9999-12-31T23:59:59Z"}`), // the far-future body
+		[]byte(`{"owner":"host/1/ab","nonce":"n","expiry":"0001-01-01T00:00:00Z"}`), // the released body
+		[]byte(`{"owner":null,"nonce":null,"expiry":null}`),
+		[]byte(`{"owner":"` + strings.Repeat("x", 4096) + `"}`),
+	} {
+		f.Add(s)
+	}
+	ctx := context.Background()
+	s := bucket.New(f)
+	const key = "x/lease"
+	f.Fuzz(func(t *testing.T, data []byte) {
+		if err := s.Put(ctx, key, data); err != nil {
+			t.Fatal(err)
+		}
+		body, etag, err := Load(ctx, s, key)
+		if err != nil {
+			t.Fatalf("Load reported failure for bytes that merely are not a lease: %v", err)
+		}
+		if etag == "" {
+			t.Fatal("Load dropped the ETag; garbage at the key could then only be PutIfAbsent'd, never CASed over")
+		}
+		// Take's whole decision, and the one thing that must hold: an
+		// unparseable body is a FREE lease, so a fresh owner can write over
+		// it. json leaves partial state on a decode error, so "zero" is the
+		// property being asserted, not "unchanged".
+		var probe Body
+		if json.Unmarshal(data, &probe) != nil && body != (Body{}) {
+			t.Fatalf("a body that does not decode came back as %+v; Take would compare a real owner against garbage", body)
+		}
+	})
+}
