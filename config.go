@@ -51,11 +51,19 @@ type Config struct {
 	// under ns/<name>/ for each name with a key record (see
 	// InstallNamespaceKey). It is the same as calling ConfigureCMEK before
 	// first use.
+	//
+	// Cost in a namespace without a key record: every write and every range
+	// read first reads the record (one GET, shared by concurrent callers of
+	// the namespace), because trusting a cached "no record" there could
+	// store plaintext in, or return ciphertext from, a namespace another
+	// process has just keyed. Whole-object reads trust a cached "no record"
+	// for one second (they re-check what they read).
 	KeyProvider kms.KeyProvider
 	// KeyRefreshInterval ties access and rotation probes for keys whose
 	// provider is lease-cadenced (kms.LeaseCadencer, AWS KMS) to the lease
 	// heartbeat cadence; 0 = no such probes. SetCMEKRefreshInterval sets it
-	// after Open.
+	// after Open. It holds with or without KeyProvider, so a later
+	// ConfigureCMEK uses it.
 	KeyRefreshInterval time.Duration
 	// AcceptPlaintext decides whether bytes read from an encrypted
 	// namespace that do NOT carry the encrypted-object header are a

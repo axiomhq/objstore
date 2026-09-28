@@ -92,6 +92,13 @@ func generation(etag string) (int64, bool) {
 
 func etagOf(gen int64) string { return strconv.FormatInt(gen, 10) }
 
+// done returns ctx's error, wrapped with op and key, once ctx is done. The
+// client does not check ctx before every request: against fake-gcs-server
+// a List and a Delete under a cancelled ctx succeeded.
+func done(ctx context.Context, op, key string) error {
+	return objstore.OpErr(op, key, ctx.Err())
+}
+
 // write uploads data through obj. The upload error surfaces on Close.
 func write(ctx context.Context, obj *storage.ObjectHandle, data []byte) error {
 	w := obj.NewWriter(ctx)
@@ -111,12 +118,18 @@ func write(ctx context.Context, obj *storage.ObjectHandle, data []byte) error {
 
 // Put writes key unconditionally.
 func (g *Backend) Put(ctx context.Context, key string, data []byte) error {
+	if err := done(ctx, "put", key); err != nil {
+		return err
+	}
 	return objstore.OpErr("put", key, write(ctx, g.bucket.Object(key), data))
 }
 
 // PutIfAbsent writes key only if no live object exists (ifGenerationMatch=0).
 // Returns false when the key existed.
 func (g *Backend) PutIfAbsent(ctx context.Context, key string, data []byte) (bool, error) {
+	if err := done(ctx, "put-if-absent", key); err != nil {
+		return false, err
+	}
 	err := write(ctx, g.bucket.Object(key).If(storage.Conditions{DoesNotExist: true}), data)
 	if err != nil {
 		if httpCode(err) == http.StatusPreconditionFailed {
@@ -131,6 +144,9 @@ func (g *Backend) PutIfAbsent(ctx context.Context, key string, data []byte) (boo
 // = precondition failed: the object changed, no longer exists, or etag is
 // not a generation this backend issued.
 func (g *Backend) PutIfMatch(ctx context.Context, key string, data []byte, etag string) (bool, error) {
+	if err := done(ctx, "put-if-match", key); err != nil {
+		return false, err
+	}
 	gen, ok := generation(etag)
 	if !ok {
 		return false, nil
@@ -183,6 +199,9 @@ func readAll(op, key string, r *storage.Reader) ([]byte, error) {
 }
 
 func (g *Backend) get(ctx context.Context, op, key string) ([]byte, string, error) {
+	if err := done(ctx, op, key); err != nil {
+		return nil, "", err
+	}
 	r, err := g.bucket.Object(key).NewReader(ctx)
 	if err != nil {
 		if isNotFound(err) {
@@ -217,6 +236,9 @@ func (g *Backend) GetWithETag(ctx context.Context, key string) ([]byte, string, 
 // the same generation back is also read as unchanged, before the body is
 // read. Any error is an error, never "unchanged".
 func (g *Backend) GetIfChanged(ctx context.Context, key, etag string) ([]byte, string, bool, error) {
+	if err := done(ctx, "get-if-changed", key); err != nil {
+		return nil, "", false, err
+	}
 	// An empty or foreign etag is no generation: read unconditionally.
 	gen, ok := generation(etag)
 	obj := g.bucket.Object(key)
@@ -248,6 +270,9 @@ func (g *Backend) GetIfChanged(ctx context.Context, key, etag string) ([]byte, s
 // GetRange reads exactly length bytes at offset. A range starting past the
 // end (416) or running past it (a short body) is ErrRange.
 func (g *Backend) GetRange(ctx context.Context, key string, offset, length int64) ([]byte, error) {
+	if err := done(ctx, "get-range", key); err != nil {
+		return nil, err
+	}
 	r, err := g.bucket.Object(key).NewRangeReader(ctx, offset, length)
 	if err != nil {
 		switch {
@@ -286,6 +311,10 @@ func (g *Backend) ListPage(ctx context.Context, prefix, after string, limit int)
 	it.PageInfo().MaxSize = min(limit+2, objstore.MaxListPage)
 	keys := make([]string, 0, limit)
 	for {
+		// Next may fetch a page; the client does not check ctx first.
+		if err := done(ctx, "list-page", prefix); err != nil {
+			return nil, "", err
+		}
 		attrs, err := it.Next()
 		if errors.Is(err, iterator.Done) {
 			return keys, "", nil
@@ -323,6 +352,9 @@ func (g *Backend) ListPrefixesPage(ctx context.Context, prefix, after string, li
 	it.PageInfo().MaxSize = min(limit+2, objstore.MaxListPage)
 	out := make([]string, 0, limit)
 	for {
+		if err := done(ctx, "list-prefixes-page", prefix); err != nil {
+			return nil, "", err
+		}
 		attrs, err := it.Next()
 		if errors.Is(err, iterator.Done) {
 			return out, "", nil
@@ -343,6 +375,9 @@ func (g *Backend) ListPrefixesPage(ctx context.Context, prefix, after string, li
 }
 
 func (g *Backend) delete(ctx context.Context, key string) error {
+	if err := ctx.Err(); err != nil {
+		return err
+	}
 	if err := g.bucket.Object(key).Delete(ctx); err != nil && !isNotFound(err) {
 		return err
 	}
@@ -370,6 +405,9 @@ func (g *Backend) DeleteMany(ctx context.Context, keys ...string) error {
 
 // EnsureBucket creates the bucket in Config.ProjectID if it is missing.
 func (g *Backend) EnsureBucket(ctx context.Context) error {
+	if err := done(ctx, "head-bucket", g.name); err != nil {
+		return err
+	}
 	_, err := g.bucket.Attrs(ctx)
 	if err == nil {
 		return nil
@@ -390,6 +428,9 @@ func (g *Backend) EnsureBucket(ctx context.Context) error {
 // DropBucket empties the bucket and deletes it. A bucket that is already
 // gone is not an error.
 func (g *Backend) DropBucket(ctx context.Context) error {
+	if err := done(ctx, "drop-bucket", g.name); err != nil {
+		return err
+	}
 	for {
 		keys, _, err := g.ListPage(ctx, "", "", objstore.MaxListPage)
 		if err != nil {

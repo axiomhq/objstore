@@ -131,7 +131,7 @@ func TestLease(t *testing.T) {
 		if err := d.Valid(); !errors.Is(err, ErrNotOwner) {
 			t.Fatalf("fenced lease still valid: %v", err)
 		}
-		<-d.Done()
+		await(t, d.Done(), "Done after a fence")
 		if got := logs.String(); !strings.Contains(got, "level=WARN msg=\"lease fenced\"") || !strings.Contains(got, "reason=") {
 			t.Fatalf("fence not logged at Warn with a reason:\n%s", got)
 		}
@@ -405,7 +405,7 @@ func TestSetLoggerRace(t *testing.T) {
 		l.SetLogger(slog.New(slog.NewTextHandler(&logs, nil)))
 		time.Sleep(ttl / 20)
 	}
-	<-l.Done()
+	await(t, l.Done(), "Done after failing renewals")
 	f.SetShape(storetest.Shape{})
 	if !strings.Contains(logs.String(), "lease renewal failed") {
 		t.Fatalf("no renewal failure logged:\n%s", logs.String())
@@ -507,11 +507,7 @@ func TestReleaseDuringRenewal(t *testing.T) {
 	go func() { l.Release(ctx); close(released) }()
 	waitFor(t, l.stopped)
 	f.Resume()
-	select {
-	case <-released:
-	case <-time.After(10 * time.Second):
-		t.Fatal("Release hung")
-	}
+	await(t, released, "Release")
 	time.Sleep(10 * time.Millisecond) // a callback goroutine would have run by now
 	if fenced.Load() || strings.Contains(logs.String(), "lease fenced") {
 		t.Fatalf("Release fenced the lease: callback=%v logs:\n%s", fenced.Load(), logs.String())
@@ -544,10 +540,10 @@ func TestReleaseDuringFirstAcquire(t *testing.T) {
 	go func() { l.Release(ctx); close(released) }()
 	waitFor(t, l.stopped)
 	f.Resume()
-	if err := <-acquired; !errors.Is(err, ErrNotOwner) {
+	if err := await(t, acquired, "Acquire"); !errors.Is(err, ErrNotOwner) {
 		t.Fatalf("Acquire racing Release: %v, want ErrNotOwner", err)
 	}
-	<-released
+	await(t, released, "Release")
 	if err := l.Valid(); !errors.Is(err, ErrNotOwner) {
 		t.Fatalf("released lease still valid: %v", err)
 	}
@@ -561,6 +557,91 @@ func TestTakeAfterRetire(t *testing.T) {
 	l.Retire()
 	if err := l.Take(context.Background()); !errors.Is(err, ErrNotOwner) {
 		t.Fatalf("Take on a retired lease: %v", err)
+	}
+}
+
+// await receives from ch, failing the test after 10s.
+func await[T any](t *testing.T, ch <-chan T, what string) T {
+	t.Helper()
+	select {
+	case v := <-ch:
+		return v
+	case <-time.After(10 * time.Second):
+		t.Fatalf("%s: timed out", what)
+		panic("unreachable")
+	}
+}
+
+// TestFenceCallbackDone: M1. Done waits for a running fence callback;
+// Release does not.
+func TestFenceCallbackDone(t *testing.T) {
+	ctx := context.Background()
+	const ttl = 200 * time.Millisecond
+	s := bucket.New(t)
+	l, err := Acquire(ctx, s, "fence/slow", "owner-a", ttl)
+	if err != nil {
+		t.Fatal(err)
+	}
+	entered, unblock := make(chan struct{}), make(chan struct{})
+	l.Start(func() { close(entered); <-unblock })
+	if err := Steal(ctx, s, "fence/slow", "owner-b", ttl); err != nil {
+		t.Fatal(err)
+	}
+	await(t, entered, "fence callback")
+	released := make(chan struct{})
+	go func() { l.Release(ctx); close(released) }()
+	await(t, released, "Release while the callback runs")
+	select {
+	case <-l.Done():
+		t.Fatal("Done closed while the fence callback was still running")
+	case <-time.After(20 * time.Millisecond):
+	}
+	close(unblock)
+	await(t, l.Done(), "Done after the callback returned")
+	l.Fence() // after Done: no callback, no panic
+}
+
+// TestReleaseAfterUnresolvedAcquire: L4. The first write landed but its
+// answer and read-back were lost; Release still hands it back.
+func TestReleaseAfterUnresolvedAcquire(t *testing.T) {
+	ctx := context.Background()
+	ls := &lossy{Store: bucket.New(t)}
+	ls.loseNextPut()
+	l := New(ls, "unres/lease", "owner-a", time.Minute)
+	if err := l.Take(ctx); err == nil || errors.Is(err, ErrNotOwner) {
+		t.Fatalf("first Take: %v, want an unresolved outcome", err)
+	}
+	l.Release(ctx)
+	if cur, _, err := Load(ctx, ls, "unres/lease"); err != nil || !cur.Expiry.IsZero() {
+		t.Fatalf("release did not hand back the unresolved write: %+v %v", cur, err)
+	}
+}
+
+// TestReleasePrefersDone: L2. With the renewer already gone, a dead ctx
+// is a failed handover, not "renewal still finishing".
+func TestReleasePrefersDone(t *testing.T) {
+	ctx := context.Background()
+	l := New(bucket.New(t), "done/lease", "owner-a", time.Minute)
+	if err := l.Take(ctx); err != nil {
+		t.Fatal(err)
+	}
+	var logs lockedBuffer
+	l.SetLogger(slog.New(slog.NewTextHandler(&logs, nil)))
+	dead, cancel := context.WithCancel(ctx)
+	cancel()
+	for range 20 {
+		l.Release(dead)
+	}
+	if strings.Contains(logs.String(), "still finishing") {
+		t.Fatalf("Release picked ctx over a closed done:\n%s", logs.String())
+	}
+}
+
+func TestStealAfterRetire(t *testing.T) {
+	l := New(bucket.New(t), "steal/retired", "owner-a", time.Minute)
+	l.Retire()
+	if err := l.Steal(context.Background()); !errors.Is(err, ErrNotOwner) {
+		t.Fatalf("Steal on a retired lease: %v", err)
 	}
 }
 

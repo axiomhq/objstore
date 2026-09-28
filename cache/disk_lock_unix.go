@@ -13,6 +13,10 @@ import (
 // NewDisk may remove the directories whose lock it can take.
 const sweepable = true
 
+// deleteOpenFiles: an open file can be unlinked, so a Disk removes its
+// directory, lock file included, while still holding the lock.
+const deleteOpenFiles = true
+
 // lockFile opens path, creating it, and takes an exclusive, non-blocking
 // flock on it. ok is false when another open file (this process's or
 // another's) holds the lock. The lock lasts until f is closed.

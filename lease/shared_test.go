@@ -125,9 +125,7 @@ func TestShared(t *testing.T) {
 			})
 			firstErr <- err
 		}()
-		for f.Fired() == 0 {
-			time.Sleep(time.Millisecond)
-		}
+		waitFor(t, func() bool { return f.Fired() != 0 })
 		held := make(chan bool, 1)
 		go func() { held <- sh.Held() }()
 		select {
@@ -152,10 +150,10 @@ func TestShared(t *testing.T) {
 		case <-time.After(50 * time.Millisecond):
 		}
 		close(release)
-		if err := <-firstErr; !errors.Is(err, context.Canceled) {
+		if err := await(t, firstErr, "hung mint"); !errors.Is(err, context.Canceled) {
 			t.Fatalf("hung mint: %v, want context.Canceled", err)
 		}
-		r := <-second
+		r := await(t, second, "second Join")
 		if r == nil || minted.Load() != 2 || !sh.Held() {
 			t.Fatalf("second Join: ref=%v minted=%d held=%v", r, minted.Load(), sh.Held())
 		}
@@ -177,9 +175,7 @@ func TestShared(t *testing.T) {
 			r.Release(ctx)
 			close(done)
 		}()
-		for f.Fired() == 0 {
-			time.Sleep(time.Millisecond)
-		}
+		waitFor(t, func() bool { return f.Fired() != 0 })
 		held := make(chan bool, 1)
 		go func() { held <- sh.Held() }()
 		select {
@@ -191,7 +187,7 @@ func TestShared(t *testing.T) {
 			t.Fatal("Held blocked behind a release")
 		}
 		f.Resume()
-		<-done
+		await(t, done, "last Release")
 	})
 }
 

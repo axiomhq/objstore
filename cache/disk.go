@@ -32,9 +32,10 @@ import (
 // nothing; every method is safe on it.
 type Disk struct {
 	// Logger receives failures the cache survives but an operator should
-	// see (a temporary file it could not remove). Nil discards them. Set it
-	// before first use. NewDisk's sweep of stale directories runs before
-	// it can be set and logs to slog.Default().
+	// see (a temporary file or a directory it could not remove). Nil logs
+	// to slog.Default(), as Cache.Logger does. Set it before first use.
+	// NewDisk's sweep of stale directories runs before it can be set and
+	// always logs to slog.Default().
 	Logger *slog.Logger
 
 	// Pin transactions include reservation and warming. Serializing them keeps
@@ -110,8 +111,9 @@ const (
 // A root may host several Disks, in this process or others: each holds an
 // exclusive lock on its directory for its lifetime, and NewDisk removes the
 // stale directories under root (a crash skips Close) whose lock is free.
-// One it cannot remove is logged and left. With root == "" nothing is
-// swept; neither is anything on platforms without flock.
+// One it cannot remove is logged to slog.Default() and left. With
+// root == "" nothing is swept; neither is anything on platforms without a
+// file lock (flock on Unix, LockFileEx on Windows).
 func NewDisk(root string, capacity int64, pinCapacity ...int64) (*Disk, error) {
 	if capacity <= 0 {
 		return nil, nil
@@ -137,8 +139,7 @@ func NewDisk(root string, capacity int64, pinCapacity ...int64) (*Disk, error) {
 	}
 	dir := filepath.Join(home, dataDir)
 	if err := os.Mkdir(dir, 0700); err != nil {
-		os.RemoveAll(home)
-		lock.Close()
+		removeHome(home, lock)
 		return nil, err
 	}
 	return &Disk{home: home, lock: lock, dir: dir, cap: capacity, pinCap: pc, maxPinned: MaxPinnedNamespaces, items: make(map[string]*list.Element), pins: make(map[string]map[string]int64), pinBytes: make(map[string]int64), pinAt: make(map[string]time.Time), pinPrevAt: make(map[string]time.Time), pinned: make(map[string]int), lastAccess: make(map[string]time.Time)}, nil
@@ -150,11 +151,16 @@ func sweepStale(root string) error {
 	if !sweepable {
 		return nil
 	}
-	stale, err := filepath.Glob(filepath.Join(root, dirPrefix+"*"))
+	// Not filepath.Glob: root may contain pattern characters.
+	entries, err := os.ReadDir(root)
 	if err != nil {
 		return err
 	}
-	for _, dir := range stale {
+	for _, e := range entries {
+		if !e.IsDir() || !strings.HasPrefix(e.Name(), dirPrefix) {
+			continue
+		}
+		dir := filepath.Join(root, e.Name())
 		lock, ok, err := lockFile(filepath.Join(dir, lockName))
 		if err != nil {
 			if !errors.Is(err, fs.ErrNotExist) { // gone meanwhile: nothing to sweep
@@ -165,10 +171,41 @@ func sweepStale(root string) error {
 		if !ok {
 			continue // a live Disk holds it
 		}
-		if err := os.RemoveAll(dir); err != nil {
+		if err := removeHome(dir, lock); err != nil {
 			slog.Warn("cache: skip stale disk directory: cannot remove it", "dir", dir, "err", err)
 		}
+	}
+	return nil
+}
+
+// removeHome removes a Disk directory whose lock the caller holds, and
+// releases the lock. Where open files can be unlinked the directory goes
+// first, lock file included, so no one can lock a half-removed directory.
+// Where they cannot (Windows), everything but the lock file goes under the
+// lock; then the lock is released and the lock file and directory are
+// removed. A Disk that took the lock in between keeps both: its lock file
+// is open, so neither can go.
+func removeHome(home string, lock *os.File) error {
+	if deleteOpenFiles {
+		err := os.RemoveAll(home)
 		lock.Close()
+		return err
+	}
+	entries, err := os.ReadDir(home)
+	for _, e := range entries {
+		if e.Name() != lockName {
+			err = errors.Join(err, os.RemoveAll(filepath.Join(home, e.Name())))
+		}
+	}
+	lock.Close()
+	if err != nil {
+		return err
+	}
+	if err := os.Remove(filepath.Join(home, lockName)); err != nil && !os.IsNotExist(err) {
+		return err
+	}
+	if err := os.Remove(home); err != nil && !os.IsNotExist(err) {
+		return err
 	}
 	return nil
 }
@@ -390,7 +427,7 @@ func (c *Disk) PutChecked(key string, b []byte) error {
 
 func (c *Disk) logger() *slog.Logger {
 	if c.Logger == nil {
-		return slog.New(slog.DiscardHandler)
+		return slog.Default()
 	}
 	return c.Logger
 }
@@ -687,7 +724,7 @@ func (c *Disk) Wipe() error {
 	c.mu.Lock()
 	if c.closed {
 		c.mu.Unlock()
-		return nil // Close removed the directory; there is nothing to wipe
+		return nil // Close dropped every entry and owns the directory's removal
 	}
 	trash, err := c.detachDir(true)
 	c.mu.Unlock()
@@ -777,13 +814,13 @@ func (c *Disk) Close() {
 		err = os.RemoveAll(trash)
 	}
 	if err == nil {
-		// Remove the home, lock file included, while still holding the lock.
-		err = os.RemoveAll(c.home)
+		err = removeHome(c.home, lock)
+	} else {
+		lock.Close() // the directory stays; the next NewDisk over root sweeps it
 	}
 	if err != nil {
 		logger.Error("cache: remove disk tier directory", "dir", c.home, "err", err)
 	}
-	lock.Close()
 }
 
 // DiskKey is the on-disk identity of a logical cache key at one generation
@@ -796,8 +833,9 @@ func DiskKey(key string, generation uint64) string {
 	return strconv.FormatUint(generation, 10) + ":" + key
 }
 
-// Dir is the disposable directory this cache owns. Tests remove it to model
-// a failed disk publication.
+// Dir is the directory holding the cached files, inside the locked
+// directory this Disk owns (which also holds the lock file and Wipe's
+// trash). Tests list it, and check that a swept Disk's is gone.
 func (c *Disk) Dir() string {
 	if c == nil {
 		return ""

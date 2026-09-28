@@ -16,14 +16,15 @@
 // Append returning nil means its records are in pages the store
 // acknowledged (or that a read-back proved were ours), in append order,
 // and onCommit has applied them: as durable as the store makes a completed
-// PUT. ErrLostRace, ErrOverloaded, ErrRecordTooLarge, ErrInvalidRecord and
-// ErrWriterClosed mean the records were not and will not be written.
-// ErrUnresolved means the outcome is unknown: the records may be durable,
-// so recover by replaying the log from the checkpoint rather than by
-// appending them again. An Append whose context ends first returns the
-// context's error, with the same unknown outcome. ErrLostRace, and
-// ErrUnresolved from a commit, finish the writer: every queued and later
-// Append gets the same error (Stats.Terminal), and recovery is a new Writer
+// PUT. ErrLostRace, ErrOverloaded, ErrRecordTooLarge, ErrInvalidRecord,
+// ErrWriterClosed and ErrWriterFailed mean the records were not and will
+// not be written. ErrUnresolved means the outcome is unknown: the records
+// may be durable, so recover by replaying the log from the checkpoint
+// rather than by appending them again. An Append whose context ends first
+// returns the context's error, with the same unknown outcome. ErrLostRace,
+// and ErrUnresolved from a commit, finish the writer: the batch that made
+// the claim gets that error, and every queued and later Append gets
+// ErrWriterFailed naming it (Stats.Terminal). Recovery is a new Writer
 // opened from the checkpoint.
 //
 // # One writer per prefix

@@ -86,7 +86,7 @@ Concurrent `Append`s share one entry, at most one per `WithCommitInterval` (defa
 
 1. Build the tiers: `disk, _ := cache.NewDisk(dir, 10<<30)`, then `c := cache.New(s, 1<<30, disk, cache.Keys{})`.
 2. Read through them: `b, err := c.FetchWith(ctx, key, func(ctx context.Context) ([]byte, error) { return s.Get(ctx, key) })`.
-3. For byte ranges: `cfg, _ := rangeread.Config{}.Normalized()`, `r := rangeread.New(s, c, cfg)`, then `scope, err := r.FetchRanges(ctx, loads)` and `cache.Scoped(scope, key)` per load.
+3. For byte ranges: `r, err := rangeread.New(s, c, rangeread.Config{})` (zero fields take defaults), then `scope, err := r.FetchRanges(ctx, loads)` and `cache.Scoped(scope, key)` per load.
 
 | piece | does |
 | --- | --- |
@@ -100,14 +100,14 @@ Concurrent `Append`s share one entry, at most one per `WithCommitInterval` (defa
 
 ## Leader election / single writer on S3
 
-1. Acquire: `l, err := lease.Acquire(ctx, s, "jobs/leader", lease.OwnerID(), lease.DefaultTTL)`. `ErrNotOwner` means someone else holds it; retry later.
+1. Acquire: `l, err := lease.Acquire(ctx, s, "jobs/leader", lease.OwnerID(), lease.DefaultTTL)`. `ErrNotOwner` means someone else holds it; retry later. A long-lived caller that retries keeps one handle (`l := lease.New(...)`, then `l.Acquire(ctx)` in its loop): a fresh handle cannot recognise its own lost first write and waits it out (1.5 TTL).
 2. Say what losing it costs: `l.Start(func() { cancelWork() })`. The lease renews itself every TTL/4 from `Acquire` on.
 3. Before every guarded action: `if err := l.Valid(); err != nil { stop }`.
-4. Hand it over when done: `l.Release()`. The next process takes it at once instead of waiting out the TTL.
+4. Hand it over when done: `l.Release(ctx)`. The next process takes it at once instead of waiting out the TTL.
 
 | event | what happens |
 | --- | --- |
-| renewal CAS loses to another owner | `ErrNotOwner`, the lease fences: your `Start` callback runs once, `Valid` refuses from then on |
+| renewal CAS loses to another owner | `ErrNotOwner`, the lease fences: your `Start` callback runs once on its own goroutine (`Done()` waits for it), `Valid` refuses from then on |
 | renewal fails without proof (timeout, 5xx) | one immediate retry; still a holder until the local deadline, fenced once it passes |
 | holder partitioned or crashed | nobody takes the key until its stored expiry plus TTL/2 (the clock-skew margin) |
 | PUT landed but the answer was lost | the object is read back: our own nonce there means held, not lost |

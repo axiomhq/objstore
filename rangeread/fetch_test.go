@@ -174,11 +174,11 @@ func TestConcurrentColdParentsShareOneGet(t *testing.T) {
 		}()
 	}
 	for range queries { // every query has joined the one paused GET
-		<-joined
+		await(t, joined, "join")
 	}
 	fault.Resume()
 	for range queries {
-		if err := <-errs; err != nil {
+		if err := await(t, errs, "query"); err != nil {
 			t.Fatal(err)
 		}
 	}
@@ -217,7 +217,7 @@ func TestSharedParentOutlivesItsLeader(t *testing.T) {
 	leaderCtx, cancel := context.WithCancel(t.Context())
 	leader, follower := make(chan error, 1), make(chan error, 1)
 	go func() { _, err := r.FetchRanges(leaderCtx, loads); leader <- err }()
-	<-joined
+	await(t, joined, "leader join")
 	// The flight is registered before its GET starts: wait for the hung GET
 	// itself, or a cancel landing first would let the one-shot Hang fire on
 	// the follower's retry instead.
@@ -235,12 +235,12 @@ func TestSharedParentOutlivesItsLeader(t *testing.T) {
 		}
 		follower <- err
 	}()
-	<-joined // the follower joined the hung GET
+	await(t, joined, "follower join") // the follower joined the hung GET
 	cancel()
-	if err := <-leader; !errors.Is(err, context.Canceled) {
+	if err := await(t, leader, "leader"); !errors.Is(err, context.Canceled) {
 		t.Fatalf("leader: %v, want context.Canceled", err)
 	}
-	if err := <-follower; err != nil {
+	if err := await(t, follower, "follower"); err != nil {
 		t.Fatalf("follower inherited the leader's cancellation: %v", err)
 	}
 }
@@ -270,8 +270,8 @@ func TestSharedParentFollowerRetriesTheLeadersError(t *testing.T) {
 		})
 		leader <- err
 	}()
-	<-started
-	<-joined
+	await(t, started, "leader read")
+	await(t, joined, "leader join")
 	follower := make(chan error, 1)
 	go func() {
 		data, _, _, err := r.sharedParent(t.Context(), x, func(context.Context) ([]byte, cache.Outcome, error) {
@@ -282,12 +282,12 @@ func TestSharedParentFollowerRetriesTheLeadersError(t *testing.T) {
 		}
 		follower <- err
 	}()
-	<-joined // the follower joined the leader's flight
+	await(t, joined, "follower join") // the follower joined the leader's flight
 	close(release)
-	if err := <-leader; !errors.Is(err, own) {
+	if err := await(t, leader, "leader"); !errors.Is(err, own) {
 		t.Fatalf("leader: %v, want its own error", err)
 	}
-	if err := <-follower; err != nil {
+	if err := await(t, follower, "follower"); err != nil {
 		t.Fatalf("follower inherited the leader's error: %v", err)
 	}
 }
@@ -474,6 +474,39 @@ func TestInvalidLoadIsErrInvalidExtent(t *testing.T) {
 	if _, err := r.FetchRanges(t.Context(), reused); !errors.Is(err, ErrInvalidExtent) {
 		t.Fatalf("Key reused with a different extent: %v, want ErrInvalidExtent", err)
 	}
+	// L8: same Key and extent, but a different retention or decoded size.
+	base := Load{Extent: Extent{Object: "o", Offset: 0, Length: 1}, Key: "k"}
+	transient, decoded := base, base
+	transient.Transient = true
+	decoded.DecodedBytes = 7
+	for name, other := range map[string]Load{"Transient": transient, "DecodedBytes": decoded} {
+		if _, err := r.FetchRanges(t.Context(), []Load{base, other}); !errors.Is(err, ErrInvalidExtent) {
+			t.Fatalf("Key reused with a different %s: %v, want ErrInvalidExtent", name, err)
+		}
+	}
+}
+
+// TestInvalidLoadAfterOverBudget: L1. An invalid load is an error even
+// after an earlier load already put the stage over budget.
+func TestInvalidLoadAfterOverBudget(t *testing.T) {
+	s := bucket.New(t)
+	objects := cache.New(s, 1<<20, nil, cache.Keys{})
+	t.Cleanup(objects.Close)
+	r := newReader(t, s, objects, Config{MaxRangeBytes: 1 << 10, MaxInFlightBytes: 1 << 10})
+	loads := []Load{
+		{Extent: Extent{Object: "o", Offset: 0, Length: 1 << 20}, Key: "big"},
+		{Extent: Extent{Object: "o", Offset: -1, Length: 1}, Key: "bad"},
+	}
+	if _, err := r.FetchRanges(t.Context(), loads); !errors.Is(err, ErrInvalidExtent) {
+		t.Fatalf("invalid load behind an over-budget one: %v, want ErrInvalidExtent", err)
+	}
+	dup := []Load{
+		{Extent: Extent{Object: "o", Offset: 0, Length: 1 << 20}, Key: "k"},
+		{Extent: Extent{Object: "o", Offset: 4, Length: 1}, Key: "k"},
+	}
+	if _, err := r.FetchRanges(t.Context(), dup); !errors.Is(err, ErrInvalidExtent) {
+		t.Fatalf("reused Key behind an over-budget load: %v, want ErrInvalidExtent", err)
+	}
 }
 
 // TestDedupSameKeySameExtent: a Key repeated with its own extent is one
@@ -503,6 +536,18 @@ func TestZeroReaderIsAnError(t *testing.T) {
 	load := Load{Extent: Extent{Object: "o", Offset: 0, Length: 1}, Key: "k"}
 	if _, err := r.FetchRanges(t.Context(), []Load{load}); err == nil {
 		t.Fatal("zero Reader ran FetchRanges")
+	}
+}
+
+// await receives from ch, failing the test after 10s.
+func await[T any](t *testing.T, ch <-chan T, what string) T {
+	t.Helper()
+	select {
+	case v := <-ch:
+		return v
+	case <-time.After(10 * time.Second):
+		t.Fatalf("%s: timed out", what)
+		panic("unreachable")
 	}
 }
 

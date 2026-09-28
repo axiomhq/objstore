@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"context"
 	"crypto/rand"
+	"encoding/binary"
 	"errors"
 	"fmt"
 	"slices"
@@ -612,10 +613,16 @@ func TestKeyLookupCancelDoesNotPoisonNamespace(t *testing.T) {
 	b.mu.Lock()
 	b.failNext = context.DeadlineExceeded
 	b.mu.Unlock()
-	if _, err := s.Get(ctx, "ns/test/obj"); !errors.Is(err, context.DeadlineExceeded) || !errors.Is(err, kms.ErrKeyUnavailable) || !strings.Contains(err.Error(), `namespace "test"`) {
+	// The caller's own ctx is fine: the lookup's timeout must not read as
+	// context.DeadlineExceeded to it.
+	timedOut := func(err error) bool {
+		return !errors.Is(err, context.DeadlineExceeded) && errors.Is(err, kms.ErrKeyUnavailable) &&
+			strings.Contains(err.Error(), "key lookup timed out after") && strings.Contains(err.Error(), `namespace "test"`)
+	}
+	if _, err := s.Get(ctx, "ns/test/obj"); !timedOut(err) {
 		t.Fatalf("record read timed out: %v", err)
 	}
-	if _, err := s.Get(ctx, "ns/test/obj"); !errors.Is(err, kms.ErrKeyUnavailable) || !errors.Is(err, context.DeadlineExceeded) || !strings.Contains(err.Error(), `namespace "test"`) {
+	if _, err := s.Get(ctx, "ns/test/obj"); !timedOut(err) || !strings.Contains(err.Error(), "backing off") {
 		t.Fatalf("inside the backoff after a store timeout: %v", err)
 	}
 	clk.advance(minKeyBackoff + time.Millisecond)
@@ -651,13 +658,17 @@ func TestRotateHonoursContextBehindHungUnwrap(t *testing.T) {
 	s.SetCMEKRefreshInterval(time.Second)
 	s.crypt().forget("test")
 	p.gate = make(chan struct{})
-	defer close(p.gate)
-	go s.Get(ctx, "ns/test/obj")
+	got := make(chan error, 1)
+	go func() { _, err := s.Get(ctx, "ns/test/obj"); got <- err }()
 	<-p.entered
 	short, cancel := context.WithTimeout(ctx, 50*time.Millisecond)
 	defer cancel()
 	if _, err := s.RotateNamespaceKey(short, "test"); !errors.Is(err, context.DeadlineExceeded) {
 		t.Fatalf("rotate behind a hung unwrap: %v", err)
+	}
+	close(p.gate)
+	if err := <-got; err != nil && !errors.Is(err, ErrNotFound) {
+		t.Fatalf("get behind the hung unwrap: %v", err)
 	}
 }
 
@@ -789,6 +800,25 @@ func TestKeyRefreshIntervalAndInstallErrors(t *testing.T) {
 	if got := s.crypt().refreshInterval(); got != time.Minute {
 		t.Fatalf("refresh interval after ConfigureCMEK: %v", got)
 	}
+	// Set without a provider, then configured.
+	noProvider := Open(newMemBackend(), Config{KeyRefreshInterval: time.Minute})
+	noProvider.ConfigureCMEK(p)
+	if got := noProvider.crypt().refreshInterval(); got != time.Minute {
+		t.Fatalf("Config.KeyRefreshInterval without a provider: %v", got)
+	}
+	// Set before ConfigureCMEK, on an Open store and on a zero Store.
+	for _, before := range []*Store{newMemStore(), {b: newMemBackend()}} {
+		before.SetCMEKRefreshInterval(2 * time.Minute)
+		before.ConfigureCMEK(p)
+		if got := before.crypt().refreshInterval(); got != 2*time.Minute {
+			t.Fatalf("SetCMEKRefreshInterval before ConfigureCMEK: %v", got)
+		}
+		// And after it.
+		before.SetCMEKRefreshInterval(3 * time.Minute)
+		if got := before.crypt().refreshInterval(); got != 3*time.Minute {
+			t.Fatalf("SetCMEKRefreshInterval after ConfigureCMEK: %v", got)
+		}
+	}
 	if err := s.InstallNamespaceKey(ctx, "test", Envelope{Mode: EncryptionCustomerManaged}); !errors.Is(err, ErrInvalidEnvelope) {
 		t.Fatalf("invalid envelope: %v", err)
 	}
@@ -802,5 +832,203 @@ func TestKeyRefreshIntervalAndInstallErrors(t *testing.T) {
 	env.DEKWrapped = []byte("wrapped-b")
 	if err := s.InstallNamespaceKey(ctx, "test", env); !errors.Is(err, ErrKeyRecordExists) {
 		t.Fatalf("different record: %v", err)
+	}
+}
+
+// TestStaleLookupAfterRemoteInstall: open's header-triggered re-lookup
+// never joins a lookup that read "no record" before another process
+// installed the key, so a whole-object read returns plaintext, not
+// ciphertext, and the stale answer is not cached.
+func TestStaleLookupAfterRemoteInstall(t *testing.T) {
+	ctx := context.Background()
+	b := &stallRecordGet{Backend: newMemBackend(), name: "late", read: make(chan struct{}), release: make(chan struct{})}
+	p := &testKeyProvider{}
+	s := Open(b, Config{KeyProvider: p})
+	fakeClock(s)
+	if _, err := s.Get(ctx, "ns/late/missing"); !errors.Is(err, ErrNotFound) {
+		t.Fatalf("priming: %v", err)
+	}
+	// A range read does not trust the cached "no record": its lookup reads
+	// the record (still absent) and stalls there.
+	b.armed.Store(true)
+	stale := make(chan error, 1)
+	go func() { _, err := s.GetRange(ctx, "ns/late/other", 0, 1); stale <- err }()
+	<-b.read
+
+	other := Open(b.Backend, Config{KeyProvider: p})
+	wrapped, version, _ := p.Wrap(ctx, "k", bytes.Repeat([]byte{5}, 32))
+	if err := other.InstallNamespaceKey(ctx, "late", Envelope{Mode: EncryptionCustomerManaged, KeyName: "k", KeyVersion: version, DEKWrapped: wrapped}); err != nil {
+		t.Fatal(err)
+	}
+	if err := other.Put(ctx, "ns/late/obj", []byte("secret")); err != nil {
+		t.Fatal(err)
+	}
+	// Were the re-lookup to join the stalled one, it would see "no record"
+	// once released.
+	timer := time.AfterFunc(50*time.Millisecond, func() { close(b.release) })
+	defer timer.Stop()
+	if got, err := s.Get(ctx, "ns/late/obj"); err != nil || string(got) != "secret" {
+		t.Fatalf("get under a stale in-flight lookup: %q %v", got, err)
+	}
+	if err := <-stale; err != nil && !errors.Is(err, ErrNotFound) {
+		t.Fatal(err)
+	}
+	if k, ok := s.crypt().cached("late"); !ok || k.key == nil {
+		t.Fatalf("after the stale lookup finished: cached=%v key=%v", ok, k.key != nil)
+	}
+}
+
+// TestEmptyObjectAuthenticated: an empty object carries a tag; a bare
+// header, v1 or v2, does not read as an empty object.
+func TestEmptyObjectAuthenticated(t *testing.T) {
+	ctx := context.Background()
+	s, b, _ := encryptedStore(t, &testKeyProvider{})
+	const key = "ns/test/empty"
+	if err := s.Put(ctx, key, nil); err != nil {
+		t.Fatal(err)
+	}
+	raw, _ := b.Get(ctx, key)
+	if len(raw) != encryptedHeaderSize+encryptedTagSize || raw[4] != encryptedV2 {
+		t.Fatalf("empty object: %d bytes, version %d", len(raw), raw[4])
+	}
+	if got, err := s.Get(ctx, key); err != nil || len(got) != 0 {
+		t.Fatalf("empty round trip: %q %v", got, err)
+	}
+
+	tampered := bytes.Clone(raw)
+	tampered[len(tampered)-1] ^= 1
+	b.Put(ctx, key, tampered)
+	if _, err := s.Get(ctx, key); err == nil {
+		t.Fatal("tampered empty-object tag accepted")
+	}
+
+	for _, version := range []byte{encryptedV1, encryptedV2} {
+		forged := make([]byte, encryptedHeaderSize)
+		copy(forged, encryptedMagic[:])
+		forged[4] = version
+		b.Put(ctx, key, forged)
+		if got, err := s.Get(ctx, key); err == nil {
+			t.Fatalf("forged v%d header read as %q", version, got)
+		} else if version == encryptedV1 && !errors.Is(err, errLegacyEmpty) {
+			t.Fatalf("forged v1 header: %v", err)
+		}
+	}
+}
+
+// TestLegacyV1ObjectDecrypts: a non-empty object written in format v1
+// still reads, whole and by range.
+func TestLegacyV1ObjectDecrypts(t *testing.T) {
+	ctx := context.Background()
+	s, b, _ := encryptedStore(t, &testKeyProvider{})
+	const key = "ns/test/legacy"
+	dek := bytes.Repeat([]byte{7}, 32) // encryptedStore's key
+	plain := bytes.Repeat([]byte("legacy-bytes"), 10_000)
+	if err := b.Put(ctx, key, encryptV1(t, key, plain, dek)); err != nil {
+		t.Fatal(err)
+	}
+	if got, err := s.Get(ctx, key); err != nil || !bytes.Equal(got, plain) {
+		t.Fatalf("v1 get: %v", err)
+	}
+	if got, err := s.GetRange(ctx, key, 65530, 20); err != nil || !bytes.Equal(got, plain[65530:65550]) {
+		t.Fatalf("v1 range: %v", err)
+	}
+}
+
+// encryptV1 seals plain the way format v1 did: version byte 1, and no
+// block at all for an empty object.
+func encryptV1(t *testing.T, object string, plain, key []byte) []byte {
+	t.Helper()
+	aead, err := aeadForKey(key)
+	if err != nil {
+		t.Fatal(err)
+	}
+	out := make([]byte, encryptedHeaderSize)
+	copy(out, encryptedMagic[:])
+	out[4] = encryptedV1
+	binary.BigEndian.PutUint64(out[5:13], uint64(len(plain)))
+	if _, err := rand.Read(out[13:25]); err != nil {
+		t.Fatal(err)
+	}
+	for i := 0; i*encryptedBlockSize < len(plain); i++ {
+		start := i * encryptedBlockSize
+		end := min(start+encryptedBlockSize, len(plain))
+		nonce := blockNonce(out[13:25], uint64(i))
+		out = aead.Seal(out, nonce[:], plain[start:end], blockAAD(object, out[:encryptedHeaderSize], uint64(i)))
+	}
+	return out
+}
+
+// TestKeyBackoffs: a failed record read backs off minKeyBackoff flat; a
+// failed unwrap doubles. A failure from a lookup that began before an
+// Install opens no backoff, and Install closes one already open. The key
+// error is wrapped once.
+func TestKeyBackoffs(t *testing.T) {
+	ctx := context.Background()
+	p := &gateProvider{}
+	s, b, clk := encryptedStore(t, p)
+	c := s.crypt()
+	for range 3 {
+		c.forget("test")
+		b.mu.Lock()
+		b.failNext = errors.New("503")
+		b.mu.Unlock()
+		if _, err := s.Get(ctx, "ns/test/x"); !errors.Is(err, kms.ErrKeyUnavailable) {
+			t.Fatalf("record read failure: %v", err)
+		}
+		if f := c.failures["test"]; f.next.Sub(clk.now()) != minKeyBackoff {
+			t.Fatalf("record read backoff: %v", f.next.Sub(clk.now()))
+		}
+	}
+
+	c.forget("test")
+	p.revoked = true
+	for i, want := range []time.Duration{minKeyBackoff, 2 * minKeyBackoff, 4 * minKeyBackoff} {
+		_, err := s.Get(ctx, "ns/test/x")
+		if !errors.Is(err, kms.ErrKeyUnavailable) || strings.Count(err.Error(), "customer-managed encryption key unavailable") != 1 {
+			t.Fatalf("unwrap failure %d: %v", i, err)
+		}
+		if got := c.failures["test"].next.Sub(clk.now()); got != want {
+			t.Fatalf("unwrap backoff %d: %v, want %v", i, got, want)
+		}
+		clk.advance(want)
+	}
+	s.Get(ctx, "ns/test/x")
+	if err := c.retryReady("test"); err == nil || strings.Count(err.Error(), "customer-managed encryption key unavailable") != 1 {
+		t.Fatalf("backoff error: %v", err)
+	}
+
+	// Install (same record) closes the backoff.
+	p.revoked = false
+	wrapped, version, _ := p.Wrap(ctx, "test", bytes.Repeat([]byte{7}, 32))
+	if err := s.InstallNamespaceKey(ctx, "test", Envelope{Mode: EncryptionCustomerManaged, KeyName: "test", KeyVersion: version, DEKWrapped: wrapped}); err != nil {
+		t.Fatal(err)
+	}
+	if err := c.retryReady("test"); err != nil {
+		t.Fatalf("backoff after install: %v", err)
+	}
+
+	// A failure from a lookup that began before an invalidation opens none.
+	epoch := c.currentEpoch()
+	c.forget("test")
+	c.fail(epoch, "test", errors.New("stale"), true)
+	if err := c.retryReady("test"); err != nil {
+		t.Fatalf("stale failure opened a backoff: %v", err)
+	}
+}
+
+// TestKeyCacheSweep: the key cache drops expired names once it passes
+// keySweepAt, instead of growing with every name ever looked up.
+func TestKeyCacheSweep(t *testing.T) {
+	s := newMemStore()
+	s.ConfigureCMEK(&testKeyProvider{})
+	clk := fakeClock(s)
+	c := s.crypt()
+	for i := range keySweepAt {
+		c.remember(fmt.Sprint("old", i), nil, "", time.Second)
+	}
+	clk.advance(2 * time.Second)
+	c.remember("fresh", nil, "", time.Second)
+	if n := len(c.keys); n != 1 {
+		t.Fatalf("after the sweep: %d names cached, want 1", n)
 	}
 }

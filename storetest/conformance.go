@@ -17,6 +17,10 @@ import (
 // -run one alone) against one bucket. s should start empty.
 func Conformance(t *testing.T, s *objstore.Store) {
 	ctx := t.Context()
+	// raw is the backend itself: the Store's write gate and ctx checks
+	// would answer a cancelled call before the backend ever saw it.
+	var raw objstore.Backend
+	s.WithBackend(func(b objstore.Backend) objstore.Backend { raw = b; return b })
 	t.Run("ConditionalRead", func(t *testing.T) {
 		key := "conditional-read/obj"
 		if err := s.Put(ctx, key, []byte("first")); err != nil {
@@ -51,11 +55,30 @@ func Conformance(t *testing.T, s *objstore.Store) {
 		if err != nil || unchanged || len(data) != 0 || current == "" {
 			t.Fatalf("empty object: %q %q %v %v", data, current, unchanged, err)
 		}
-		cancelled, cancel := context.WithCancel(ctx)
-		cancel()
-		_, _, unchanged, err = s.GetIfChanged(cancelled, key, current)
-		if !errors.Is(err, context.Canceled) || unchanged {
-			t.Fatalf("cancelled: %v %v", unchanged, err)
+	})
+	// GetWithETag and GetIfChanged speak one ETag: each accepts the other's.
+	t.Run("ETagInterchangeable", func(t *testing.T) {
+		key := "etag-interchange/obj"
+		if err := s.Put(ctx, key, []byte("v1")); err != nil {
+			t.Fatal(err)
+		}
+		_, tag, err := s.GetWithETag(ctx, key)
+		if err != nil {
+			t.Fatal(err)
+		}
+		data, current, unchanged, err := s.GetIfChanged(ctx, key, tag)
+		if err != nil || !unchanged || data != nil || current != tag {
+			t.Fatalf("GetIfChanged with GetWithETag's etag %q: %q %q %v %v", tag, data, current, unchanged, err)
+		}
+		_, current, _, err = s.GetIfChanged(ctx, key, "")
+		if err != nil {
+			t.Fatal(err)
+		}
+		if _, tag, err = s.GetWithETag(ctx, key); err != nil || tag != current {
+			t.Fatalf("GetWithETag etag %q, GetIfChanged etag %q: %v", tag, current, err)
+		}
+		if ok, err := s.PutIfMatch(ctx, key, []byte("v2"), current); err != nil || !ok {
+			t.Fatalf("PutIfMatch with GetIfChanged's etag: ok=%v err=%v", ok, err)
 		}
 	})
 	t.Run("Range", func(t *testing.T) {
@@ -74,11 +97,6 @@ func Conformance(t *testing.T, s *objstore.Store) {
 			}
 		}
 		if _, err := s.GetRange(ctx, "range/missing", 0, 1); !errors.Is(err, objstore.ErrNotFound) {
-			t.Fatal(err)
-		}
-		cancelled, cancel := context.WithCancel(ctx)
-		cancel()
-		if _, err := s.GetRange(cancelled, "range/obj", 0, 1); !errors.Is(err, context.Canceled) {
 			t.Fatal(err)
 		}
 	})
@@ -114,6 +132,35 @@ func Conformance(t *testing.T, s *objstore.Store) {
 			t.Fatalf("Delete of a missing key: %v", err)
 		}
 	})
+	// Keys a URL-based backend must escape: space, plus (a space in query
+	// encoding), non-ASCII, and a literal escape sequence.
+	t.Run("EscapedKeys", func(t *testing.T) {
+		keys := []string{"esc/%2F", "esc/a b", "esc/a+b", "esc/ü"} // sorted
+		for _, k := range keys {
+			if err := s.Put(ctx, k, []byte(k)); err != nil {
+				t.Fatalf("Put %q: %v", k, err)
+			}
+		}
+		for _, k := range keys {
+			if got, err := s.Get(ctx, k); err != nil || string(got) != k {
+				t.Fatalf("Get %q = %q, %v", k, got, err)
+			}
+		}
+		if got, err := s.List(ctx, "esc/"); err != nil || strings.Join(got, "|") != strings.Join(keys, "|") {
+			t.Fatalf("List = %q, %v; want %q", got, err, keys)
+		}
+		for _, k := range keys {
+			if err := s.Delete(ctx, k); err != nil {
+				t.Fatalf("Delete %q: %v", k, err)
+			}
+			if _, err := s.Get(ctx, k); !errors.Is(err, objstore.ErrNotFound) {
+				t.Fatalf("Get %q after Delete: %v", k, err)
+			}
+		}
+		if got, err := s.List(ctx, "esc/"); err != nil || len(got) != 0 {
+			t.Fatalf("List after Delete = %q, %v", got, err)
+		}
+	})
 	t.Run("EnsureBucketIdempotent", func(t *testing.T) {
 		for range 2 {
 			if err := s.EnsureBucket(ctx); err != nil {
@@ -121,15 +168,43 @@ func Conformance(t *testing.T, s *objstore.Store) {
 			}
 		}
 	})
-	// A write under a cancelled context reports the cancellation and does
-	// not land.
-	t.Run("CancelledWrites", func(t *testing.T) {
+	// The backend itself honours a cancelled context: a read returns no
+	// data, a write or delete reports the cancellation and does not land.
+	t.Run("CancelledBackend", func(t *testing.T) {
+		const obj = "cancelled/obj"
+		if err := s.Put(ctx, obj, []byte("v1")); err != nil {
+			t.Fatal(err)
+		}
+		_, etag, err := s.GetWithETag(ctx, obj)
+		if err != nil {
+			t.Fatal(err)
+		}
 		cancelled, cancel := context.WithCancel(ctx)
 		cancel()
+		reads := map[string]func() ([]byte, error){
+			"Get":      func() ([]byte, error) { return raw.Get(cancelled, obj) },
+			"GetRange": func() ([]byte, error) { return raw.GetRange(cancelled, obj, 0, 1) },
+			"GetIfChanged": func() ([]byte, error) {
+				data, _, _, err := raw.GetIfChanged(cancelled, obj, "")
+				return data, err
+			},
+			"ListPage": func() ([]byte, error) {
+				keys, _, err := raw.ListPage(cancelled, "cancelled/", "", 10)
+				if keys != nil {
+					return []byte(strings.Join(keys, ",")), err
+				}
+				return nil, err
+			},
+		}
+		for name, read := range reads {
+			if data, err := read(); !errors.Is(err, context.Canceled) || data != nil {
+				t.Errorf("%s under a cancelled ctx: %q %v, want no data and context.Canceled", name, data, err)
+			}
+		}
 		writes := map[string]func(key string) error{
-			"Put": func(key string) error { return s.Put(cancelled, key, []byte("x")) },
+			"Put": func(key string) error { return raw.Put(cancelled, key, []byte("x")) },
 			"PutIfAbsent": func(key string) error {
-				_, err := s.PutIfAbsent(cancelled, key, []byte("x"))
+				_, err := raw.PutIfAbsent(cancelled, key, []byte("x"))
 				return err
 			},
 			"PutIfMatch": func(key string) error {
@@ -140,18 +215,24 @@ func Conformance(t *testing.T, s *objstore.Store) {
 				if err != nil {
 					return err
 				}
-				_, err = s.PutIfMatch(cancelled, key, []byte("x"), etag)
+				_, err = raw.PutIfMatch(cancelled, key, []byte("x"), etag)
 				return err
 			},
 		}
 		for name, write := range writes {
-			key := "cancelled-write/" + name
+			key := "cancelled/" + name
 			if err := write(key); !errors.Is(err, context.Canceled) {
-				t.Fatalf("%s under a cancelled ctx: %v, want context.Canceled", name, err)
+				t.Errorf("%s under a cancelled ctx: %v, want context.Canceled", name, err)
 			}
 			if got, err := s.Get(ctx, key); err == nil && string(got) == "x" {
-				t.Fatalf("%s under a cancelled ctx landed", name)
+				t.Errorf("%s under a cancelled ctx landed", name)
 			}
+		}
+		if err := raw.Delete(cancelled, obj); !errors.Is(err, context.Canceled) {
+			t.Errorf("Delete under a cancelled ctx: %v, want context.Canceled", err)
+		}
+		if _, tag, err := s.GetWithETag(ctx, obj); err != nil || tag != etag {
+			t.Errorf("Delete under a cancelled ctx landed: %q %v", tag, err)
 		}
 	})
 	// The delimited listing discovery runs on: one entry per child prefix,
@@ -206,6 +287,19 @@ func Conformance(t *testing.T, s *objstore.Store) {
 		}
 		if got, want := strings.Join(keys, ","), "page/0,page/a/1,page/a/2,page/b/1,page/c/1,page/z"; got != want {
 			t.Fatalf("paged keys = %q, want %q", got, want)
+		}
+		// after need not be a key: the page starts at the first key past it.
+		for after, want := range map[string]string{
+			"page/":     "page/0,page/a/1,page/a/2,page/b/1,page/c/1,page/z",
+			"page/a/15": "page/a/2,page/b/1,page/c/1,page/z",
+			"page/b":    "page/b/1,page/c/1,page/z",
+			"page/y":    "page/z",
+			"page/zz":   "",
+		} {
+			page, next, err := s.ListPage(ctx, "page/", after, objstore.MaxListPage)
+			if got := strings.Join(page, ","); err != nil || got != want || next != "" {
+				t.Fatalf("ListPage after %q = %q next=%q err=%v, want %q", after, got, next, err, want)
+			}
 		}
 		// Limit 1 splits every page; limit 2 and the maximum let one page
 		// of the underlying listing mix objects (page/0, page/z) with
@@ -294,13 +388,24 @@ func Conformance(t *testing.T, s *objstore.Store) {
 		if string(data) != "v2" || tag2 == tag1 {
 			t.Fatalf("state after races: %q %q", data, tag2)
 		}
-		// CAS on a missing key: precondition cannot hold.
-		ok, err = s.PutIfMatch(ctx, "etag-cas/missing", []byte("x"), tag1)
-		if err != nil || ok {
-			t.Fatalf("cas on missing: ok=%v err=%v", ok, err)
+	})
+	// CAS on a missing key: the precondition cannot hold. MinIO creates the
+	// object on PutIfMatch for a missing key, while AWS S3 and R2 answer
+	// 404, so the MinIO CI job skips this subtest by name.
+	t.Run("ETagCASMissing", func(t *testing.T) {
+		if err := s.Put(ctx, "etag-cas-missing/m", []byte("v1")); err != nil {
+			t.Fatal(err)
 		}
-		if _, _, err := s.GetWithETag(ctx, "etag-cas/missing"); !errors.Is(err, objstore.ErrNotFound) {
-			t.Fatalf("want ErrNotFound, got %v", err)
+		_, tag, err := s.GetWithETag(ctx, "etag-cas-missing/m")
+		if err != nil {
+			t.Fatal(err)
+		}
+		ok, err := s.PutIfMatch(ctx, "etag-cas-missing/absent", []byte("x"), tag)
+		if ok || (err != nil && !errors.Is(err, objstore.ErrNotFound)) {
+			t.Fatalf("cas on missing: ok=%v err=%v, want false and nil or ErrNotFound", ok, err)
+		}
+		if _, _, err := s.GetWithETag(ctx, "etag-cas-missing/absent"); !errors.Is(err, objstore.ErrNotFound) {
+			t.Fatalf("cas on missing created the object: %v", err)
 		}
 	})
 	for _, conditional := range []string{"absent", "match"} {

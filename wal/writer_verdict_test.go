@@ -179,6 +179,8 @@ func TestMaxUnackedCountsIncomingRecords(t *testing.T) {
 
 // TestLostRaceLatches: once another writer is proven to own the log, the
 // writer refuses everything, queued or new, without touching the store.
+// Only the batch that lost gets (and counts) ErrLostRace; the rest were
+// never written and get ErrWriterFailed.
 func TestLostRaceLatches(t *testing.T) {
 	ctx := context.Background()
 	seedForeign := func(t *testing.T) (*Writer[Bytes], *storetest.Fault) {
@@ -196,8 +198,8 @@ func TestLostRaceLatches(t *testing.T) {
 			t.Fatalf("append: %v, want ErrLostRace", err)
 		}
 		f.ResetOps()
-		if err := w.Append(ctx, rows("again")); !errors.Is(err, ErrLostRace) {
-			t.Fatalf("append after losing: %v, want ErrLostRace", err)
+		if err := w.Append(ctx, rows("again")); !errors.Is(err, ErrWriterFailed) || errors.Is(err, ErrLostRace) {
+			t.Fatalf("append after losing: %v, want ErrWriterFailed", err)
 		}
 		if ops := f.Ops(); len(ops) != 0 {
 			t.Fatalf("a latched writer touched the store: %v", ops)
@@ -222,10 +224,10 @@ func TestLostRaceLatches(t *testing.T) {
 		if err := <-first; !errors.Is(err, ErrLostRace) {
 			t.Fatalf("losing batch: %v", err)
 		}
-		if err := <-queued; !errors.Is(err, ErrLostRace) {
-			t.Fatalf("queued behind the losing batch: %v, want ErrLostRace", err)
+		if err := <-queued; !errors.Is(err, ErrWriterFailed) || errors.Is(err, ErrLostRace) {
+			t.Fatalf("queued behind the losing batch: %v, want ErrWriterFailed", err)
 		}
-		if st := w.Stats(); !st.Lost || st.LostRace != 2 || st.Pending != 0 {
+		if st := w.Stats(); !st.Lost || st.LostRace != 1 || st.Pending != 0 {
 			t.Fatalf("stats: %+v", st)
 		}
 	})
@@ -279,11 +281,10 @@ func TestAdoptionDoesNotRearmPacing(t *testing.T) {
 	}
 }
 
-// TestPartialBatchAdvancesPastLandedPages: a batch that fails for good after
-// its first page landed leaves that page as an abandoned batch; the writer
-// moves past it rather than contending with its own page, and the walk
-// reports a marker, not corruption.
-func TestPartialBatchAdvancesPastLandedPages(t *testing.T) {
+// TestPartialBatchFinishesWriterAndWalksAsMarker: a batch that fails for
+// good after its first page landed finishes the writer, and leaves that
+// page as an abandoned batch the walk reports as a marker, not corruption.
+func TestPartialBatchFinishesWriterAndWalksAsMarker(t *testing.T) {
 	ctx := context.Background()
 	records := []Bytes{filled('a', 17<<20), filled('b', 17<<20)} // two pages
 	t.Run("lost-race", func(t *testing.T) {
@@ -296,14 +297,15 @@ func TestPartialBatchAdvancesPastLandedPages(t *testing.T) {
 		if err := w.Append(ctx, records); !errors.Is(err, ErrLostRace) {
 			t.Fatalf("append: %v, want ErrLostRace", err)
 		}
-		if w.nextSeq != 2 {
-			t.Fatalf("nextSeq %d, want 2: past the landed page", w.nextSeq)
+		if err := w.Append(ctx, rows("next")); !errors.Is(err, ErrWriterFailed) {
+			t.Fatalf("append after losing: %v, want ErrWriterFailed", err)
 		}
 		assertMarkerThen(t, s, "theirs")
 	})
 	// A covered floor is terminal: the writer cannot know the next sequence,
 	// and a later batch could land under the watermark (acknowledged, never
-	// replayed) or contend with its own landed page.
+	// replayed) or contend with its own landed page. The refused append
+	// was never written: ErrWriterFailed, not counted as unresolved.
 	t.Run("floor", func(t *testing.T) {
 		s, f := bucket.NewFaulty(t)
 		w := NewWriter[Bytes](s, testPrefix, 1, nil, WithCommitInterval(MinCommitInterval))
@@ -322,13 +324,13 @@ func TestPartialBatchAdvancesPastLandedPages(t *testing.T) {
 			t.Fatalf("append: %v, want ErrUnresolved", err)
 		}
 		f.ResetOps()
-		if err := w.Append(ctx, rows("next")); !errors.Is(err, ErrUnresolved) || !strings.Contains(err.Error(), "watermark") {
-			t.Fatalf("append after a covered floor: %v, want the latched ErrUnresolved", err)
+		if err := w.Append(ctx, rows("next")); !errors.Is(err, ErrWriterFailed) || errors.Is(err, ErrUnresolved) || !strings.Contains(err.Error(), "watermark") {
+			t.Fatalf("append after a covered floor: %v, want ErrWriterFailed naming the cause", err)
 		}
 		if ops := f.Ops(); len(ops) != 0 {
 			t.Fatalf("a terminal writer touched the store: %v", ops)
 		}
-		if st := w.Stats(); st.Lost || !errors.Is(st.Terminal, ErrUnresolved) {
+		if st := w.Stats(); st.Lost || !errors.Is(st.Terminal, ErrUnresolved) || st.Unresolved != 1 {
 			t.Fatalf("stats: %+v", st)
 		}
 		entries, err := replay(ctx, s, testPrefix, 0)
@@ -382,8 +384,9 @@ func TestWriteErrorIsAnError(t *testing.T) {
 
 // TestStatsDuringDroppedRecordCommit: dropping a bad record's call from a
 // batch updates the batch's records and bytes under the writer's lock, so
-// Stats (and Enqueue's admission) polled throughout never race with the
-// commit (run under -race), and the dropped records stop counting.
+// Stats and Enqueue's admission polled throughout never race with the
+// commit (run under -race), and the dropped records stop counting. The
+// record bound of 1 keeps every probe refused until the writer is idle.
 func TestStatsDuringDroppedRecordCommit(t *testing.T) {
 	s, f := bucket.NewFaulty(t)
 	w := NewWriter[testRecord](s, testPrefix, 1, nil, WithCommitInterval(MinCommitInterval))
@@ -398,6 +401,7 @@ func TestStatsDuringDroppedRecordCommit(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
+	w.SetMaxUnacked(1)
 	stop := make(chan struct{})
 	var wg sync.WaitGroup
 	wg.Go(func() {
@@ -411,13 +415,24 @@ func TestStatsDuringDroppedRecordCommit(t *testing.T) {
 				t.Errorf("stats: %+v", st)
 				return
 			}
-			// Enqueue reads the in-flight batch too; an empty one is a no-op.
-			if _, err := w.Enqueue(ctx, nil); err != nil {
+			// Admission reads the in-flight batch's records and bytes.
+			probe, err := w.Enqueue(ctx, []testRecord{{b: "probe"}})
+			switch {
+			case errors.Is(err, ErrOverloaded):
+			case err == nil: // admitted: nothing else is held any more
+				if err := <-probe; err != nil {
+					t.Error(err)
+				}
+				return
+			default:
 				t.Error(err)
 				return
 			}
 		}
 	})
+	for w.Stats().Rejected == 0 { // a probe was refused against the wedged batch
+		time.Sleep(time.Millisecond)
+	}
 	release()
 	errFirst, errGood, errBad := <-first, <-good, <-bad
 	close(stop)
@@ -545,5 +560,34 @@ func TestSplitBatchRefusesRecordLargerThanAnyPage(t *testing.T) {
 				t.Fatalf("%d pages, %v; want ErrRecordTooLarge and no pages", len(pages), err)
 			}
 		})
+	}
+}
+
+// TestCloseDrainPacesRetries: the final drain calls flush directly, not
+// through the loop's timer, so commit itself waits out the retry pacing: a
+// store refusing every PUT gets one attempt per commit interval from the
+// drain, not two back to back.
+func TestCloseDrainPacesRetries(t *testing.T) {
+	const interval = 200 * time.Millisecond
+	s, f := bucket.NewFaulty(t)
+	f.SetShape(storetest.Shape{ErrorRate: 1, Seed: 1})
+	w := NewWriter[Bytes](s, testPrefix, 1, nil, WithCommitInterval(interval))
+	receipt, err := w.Enqueue(context.Background(), rows("refused"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	for deadline := time.Now().Add(10 * time.Second); w.Stats().LastError.At.IsZero(); {
+		if time.Now().After(deadline) {
+			t.Fatal("the first attempt never failed")
+		}
+		time.Sleep(time.Millisecond)
+	}
+	start := time.Now()
+	w.Close()
+	if elapsed := time.Since(start); elapsed < 2*interval-50*time.Millisecond {
+		t.Fatalf("Close took %s: the drain retried without waiting an interval", elapsed)
+	}
+	if err := <-receipt; !errors.Is(err, ErrUnresolved) {
+		t.Fatalf("receipt: %v, want ErrUnresolved", err)
 	}
 }

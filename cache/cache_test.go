@@ -297,6 +297,12 @@ func TestRechargeIsIdentityChecked(t *testing.T) {
 	if c.Recharge("s", []int{1}, 200, g) {
 		t.Fatal("a non-comparable value re-charged")
 	}
+	// Nor can one whose type is comparable but whose value is not.
+	type boxed struct{ v any }
+	c.PutValue("b", boxed{[]int{1}}, 100, g)
+	if c.Recharge("b", boxed{[]int{1}}, 200, g) {
+		t.Fatal("a value holding a slice re-charged")
+	}
 }
 
 // TestGenerationOfRacesInvalidation: GenerationOf is lock-free and bumps

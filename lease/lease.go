@@ -9,6 +9,7 @@ import (
 	"log/slog"
 	"os"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/axiomhq/objstore"
@@ -91,7 +92,12 @@ type Lease struct {
 	stopOnce sync.Once
 	stop     chan struct{}
 	doneOnce sync.Once
-	done     chan struct{}
+	done     chan struct{} // the renewer exited (or never ran and the lease ended)
+	// live counts what Done waits for: 1 until done closes, plus 1 while a
+	// fence callback runs. ended (Done) closes when it reaches zero. A
+	// callback starts only while live > 0, so none starts after Done.
+	live  atomic.Int32
+	ended chan struct{}
 }
 
 // Acquire takes the lease at key and starts renewing it at once: renewal
@@ -99,6 +105,11 @@ type Lease struct {
 // (a replay, say), which may outlast a TTL. The fence callback arrives
 // later, via Start. Every failure path between the two owes the lease a
 // Release. A ttl <= 0 means DefaultTTL.
+//
+// Each call uses a fresh handle. After a first write whose outcome was
+// lost, a fresh handle cannot recognise that write as its own and waits
+// it out (1.5 TTL) like anyone else's; a long-lived caller that retries
+// should keep one handle from New and retry its Acquire method instead.
 func Acquire(ctx context.Context, s Store, key, owner string, ttl time.Duration) (*Lease, error) {
 	l := New(s, key, owner, ttl)
 	if err := l.Acquire(ctx); err != nil {
@@ -109,13 +120,26 @@ func Acquire(ctx context.Context, s Store, key, owner string, ttl time.Duration)
 
 // New returns an unacquired lease on key. Take drives it by hand (no
 // renewal goroutine); Acquire takes it and starts renewing. A ttl <= 0
-// means DefaultTTL. A handle carries one acquisition: to retry a failed
-// Acquire, call New(...).Acquire again.
+// means DefaultTTL. A handle carries one acquisition. Retry a failed
+// Acquire on the same handle, which remembers its unresolved writes and
+// adopts one that landed late:
+//
+//	l := lease.New(s, key, owner, ttl)
+//	for {
+//		if err := l.Acquire(ctx); err == nil {
+//			break
+//		}
+//		// back off, then retry on l
+//	}
+//
+// A fresh New forgets them and waits out its own record (1.5 TTL).
 func New(s Store, key, owner string, ttl time.Duration) *Lease {
 	if ttl <= 0 {
 		ttl = DefaultTTL
 	}
-	return &Lease{store: s, key: key, owner: owner, ttl: ttl, stop: make(chan struct{}), done: make(chan struct{})}
+	l := &Lease{store: s, key: key, owner: owner, ttl: ttl, stop: make(chan struct{}), done: make(chan struct{}), ended: make(chan struct{})}
+	l.live.Store(1)
+	return l
 }
 
 // Acquire takes l and starts its renewal goroutine. It returns an error,
@@ -172,13 +196,39 @@ func (l *Lease) stopped() bool {
 }
 
 // finish closes done, once, whichever path ends the lease.
-func (l *Lease) finish() { l.doneOnce.Do(func() { close(l.done) }) }
+func (l *Lease) finish() {
+	l.doneOnce.Do(func() {
+		close(l.done)
+		l.leave()
+	})
+}
+
+// join claims a place for a fence callback; false once Done has closed.
+func (l *Lease) join() bool {
+	for {
+		n := l.live.Load()
+		if n == 0 {
+			return false
+		}
+		if l.live.CompareAndSwap(n, n+1) {
+			return true
+		}
+	}
+}
+
+// leave drops a place taken by New or join; the last one closes Done.
+func (l *Lease) leave() {
+	if l.live.Add(-1) == 0 {
+		close(l.ended)
+	}
+}
 
 // Start installs the fence callback, running it immediately (on the
 // caller's goroutine) if the lease was already lost in the meantime. Call
-// it once, after Acquire. A later fence runs the callback on a goroutine of
-// its own, so the callback may call anything on the lease, Release and
-// Retire included. A Release or Retire never runs it.
+// it once, after Acquire. A later fence runs the callback on its own
+// goroutine, so the callback may call anything on the lease, Release and
+// Retire included; Retire and Release do not wait for it, and it must not
+// wait on Done(), which waits for it. A Release or Retire never runs it.
 func (l *Lease) Start(fence func()) {
 	l.mu.Lock()
 	l.fence = fence
@@ -353,7 +403,8 @@ func (l *Lease) hold(start time.Time, nonce string) error {
 	}
 	l.nonce = nonce
 	l.pending = nil // every earlier attempt is superseded by this one
-	if l.released || l.stopped() {
+	// Release retires too, so stopped covers released.
+	if l.stopped() {
 		return fmt.Errorf("%w: %s was released or retired while this write was in flight", ErrNotOwner, l.key)
 	}
 	l.deadline = start.Add(l.ttl)
@@ -465,7 +516,7 @@ func (l *Lease) renew() {
 
 // Fence retires the lease in this process for good: Valid refuses until a
 // fresh acquisition. The fence callback runs once, on the first Fence, on
-// a goroutine of its own.
+// a goroutine of its own; a Fence after Done has closed runs none.
 func (l *Lease) Fence() { l.fenceFor(errors.New("fenced by caller")) }
 
 // fenceFor is Fence with the reason logged at Warn. The callback runs on
@@ -482,14 +533,18 @@ func (l *Lease) fenceFor(reason error) {
 	if log != nil {
 		log.Warn("lease fenced", "key", l.key, "owner", l.owner, "reason", reason)
 	}
-	if fn != nil {
-		go fn()
+	if fn != nil && l.join() {
+		go func() {
+			defer l.leave()
+			fn()
+		}()
 	}
 }
 
 // Retire stops renewing without touching the object. The lease then simply
 // expires for whoever wants it next. It waits for a running renewal
-// goroutine to exit (at most about one TTL). A nil lease is a no-op.
+// goroutine to exit (at most about one TTL), not for a fence callback. A
+// nil lease is a no-op.
 func (l *Lease) Retire() {
 	if l == nil {
 		return
@@ -551,8 +606,8 @@ func (l *Lease) FloorProven() {
 // goroutine is still finishing an attempt, Release stops the lease locally
 // and skips the handover. The ETag CAS is what makes it safe to call on a
 // lease we may have already lost. A skipped or failed handover is logged
-// (SetLogger). Release never runs the fence callback. A nil lease is a
-// no-op.
+// (SetLogger). Release never runs the fence callback and does not wait
+// for one already running. A nil lease is a no-op.
 func (l *Lease) Release(ctx context.Context) {
 	if l == nil {
 		return
@@ -565,17 +620,21 @@ func (l *Lease) Release(ctx context.Context) {
 	l.retire(true)
 	log := l.logger()
 	select {
-	case <-l.done:
-	case <-ctx.Done():
-		if log != nil {
-			log.Warn("lease handover skipped: renewal still finishing", "key", l.key, "owner", l.owner, "err", ctx.Err())
+	case <-l.done: // prefer done: a finished renewer is never "still finishing"
+	default:
+		select {
+		case <-l.done:
+		case <-ctx.Done():
+			if log != nil {
+				log.Warn("lease handover skipped: renewal still finishing", "key", l.key, "owner", l.owner, "err", ctx.Err())
+			}
+			return
 		}
-		return
 	}
 	l.mu.Lock()
-	nonce := l.nonce
+	nonce, unresolved := l.nonce, len(l.pending)
 	l.mu.Unlock()
-	if nonce == "" {
+	if nonce == "" && unresolved == 0 {
 		return // never held: nothing to hand over
 	}
 	// Urgent like Take: the handover must not queue behind bulk writes, or
@@ -589,7 +648,10 @@ func (l *Lease) Release(ctx context.Context) {
 		}
 		return
 	}
-	if etag == "" || cur.Owner != l.owner || cur.Nonce != nonce {
+	// Ours: the last attributed write, or one whose answer was lost and
+	// which landed after all.
+	_, late := l.pendingStart(cur.Nonce)
+	if etag == "" || cur.Owner != l.owner || (cur.Nonce != nonce && !late) {
 		if log != nil {
 			log.Info("lease handover skipped: no longer ours", "key", l.key, "owner", l.owner, "holder", cur.Owner)
 		}
@@ -644,6 +706,9 @@ func Steal(ctx context.Context, s Store, key, owner string, ttl time.Duration) e
 // holder's next renewal fails. Retried while a concurrent CAS moves the
 // ETag. Test hook: it breaks the protocol on purpose.
 func (l *Lease) Steal(ctx context.Context) error {
+	if l.stopped() {
+		return fmt.Errorf("%w: %s was released or retired in this process", ErrNotOwner, l.key)
+	}
 	var err error
 	for range 20 {
 		var etag string
@@ -675,8 +740,8 @@ func (l *Lease) TTL() time.Duration { return l.ttl }
 
 // Done is closed when the lease has ended in this process: the renewal
 // goroutine exited, or, for a lease with no renewer (driven by Take), it
-// was retired or released.
-func (l *Lease) Done() <-chan struct{} { return l.done }
+// was retired or released; and a fence callback, if one ran, returned.
+func (l *Lease) Done() <-chan struct{} { return l.ended }
 
 // Expire moves the lease's local deadline into the past, so its next
 // validity check fails as if the TTL had elapsed. Test hook: for tests of

@@ -386,13 +386,15 @@ func (c *ByteCache) PutDecoded(key string, v any, size int, generation uint64) {
 }
 
 // Recharge sets the charge of key's decode to size when that decode is v
-// itself, and reports whether it did. v must be of a comparable type, in
-// practice a pointer (identity, not equality); any other v is refused. A
+// itself, and reports whether it did. v must be comparable, in practice a
+// pointer (identity, not equality); any other v is refused, including a
+// value of a comparable type that holds an uncomparable one (an interface
+// field holding a slice), which == would panic on. A
 // holder of a value that lost a publication race, was evicted or predates
 // the generation is refused, so it cannot re-charge another value's entry.
 // A charge that no longer fits the stripe drops the entry.
 func (c *ByteCache) Recharge(key string, v any, size int, generation uint64) bool {
-	if size <= 0 || v == nil || !reflect.TypeOf(v).Comparable() {
+	if size <= 0 || v == nil || !reflect.ValueOf(v).Comparable() {
 		return false
 	}
 	s := c.stripe(key)

@@ -22,9 +22,9 @@ type parallelPage[T any] struct {
 	err    error
 	eof    bool
 	bytes  int64
-	// gate closes when the page window places before this one holds its
+	// gate closes when the page workers places before this one holds its
 	// byte permit (or has none to take): only then may this page's GET
-	// start, so at most window fetched pages wait for a permit.
+	// start, so at most workers fetched pages wait for a permit.
 	gate <-chan struct{}
 	// turn closes when the previous page holds its byte permit (or has
 	// none to take): permits are taken in sequence order.
@@ -42,16 +42,17 @@ type parallelPage[T any] struct {
 // Memory is bounded in two parts. Each fetched page waits, in sequence
 // order, for a byte permit of four times its wire size (its decode's
 // budget) from a 64 MiB pool, and keeps it until visited; a page whose
-// permit would exceed the pool takes all of it and proceeds alone. A page's
-// GET starts only once the page window = workers places before it holds its
-// permit, so at most window fetched pages hold raw bytes outside the pool.
-// With pages at most maxPageBytes (65 MiB) on the wire, what a walk retains
-// is at most 64 MiB + workers × 65 MiB, and a slow consumer holds the walk
-// there. Up to workers GETs are in flight.
+// permit would exceed the pool takes all of it and proceeds alone, so the
+// pool holds at most max(64 MiB, 4× the largest page). A page's GET starts
+// only once the page workers places before it holds its permit, so at most
+// workers fetched pages hold raw bytes outside the pool. With pages at most
+// maxPageBytes (65 MiB) on the wire, what a walk retains is at most
+// max(64 MiB, 4× the largest page) + workers × 65 MiB, and a slow consumer
+// holds the walk there. Up to workers GETs are in flight.
 //
-// An unbounded walk issues at most window (= workers) not-found GETs past
-// the end of the log: a page whose window predecessor found the end skips
-// its GET.
+// An unbounded walk issues at most workers not-found GETs past the end of
+// the log: a page whose predecessor workers places back found the end
+// skips its GET.
 func WalkParallel[T any](ctx context.Context, s *objstore.Store, prefix string, after, through uint64, workers int,
 	decode func([]byte) (Header, T, error), prep func(h Header, key string, body *T) error, visit func(Entry[T]) error) error {
 	return WalkParallelWithGet(ctx, s.Get, prefix, after, through, workers, decode, prep, visit)
@@ -64,7 +65,6 @@ func WalkParallelWithGet[T any](ctx context.Context, get func(context.Context, s
 	decode func([]byte) (Header, T, error), prep func(h Header, key string, body *T) error, visit func(Entry[T]) error) error {
 	parentCtx := ctx
 	workers = min(max(workers, 1), 16)
-	window := workers
 	slots := 2 * workers
 	free := make(chan *parallelPage[T], slots)
 	for range slots {
@@ -75,7 +75,7 @@ func WalkParallelWithGet[T any](ctx context.Context, get func(context.Context, s
 	bytes := semaphore.NewWeighted(maxInFlightBytes)
 	// end is the lowest sequence known to end the walk (not found, or
 	// failed); pages past it skip their GET. Set before the page's permitted
-	// closes, so the page window places later, which waits on that, sees it.
+	// closes, so the page workers places later, which waits on that, sees it.
 	var end atomic.Uint64
 	end.Store(math.MaxUint64)
 	ctx, cancel := context.WithCancel(ctx)
@@ -91,7 +91,7 @@ func WalkParallelWithGet[T any](ctx context.Context, get func(context.Context, s
 		open := make(chan struct{})
 		close(open)
 		var turn <-chan struct{} = open
-		gates := make([]<-chan struct{}, window) // permitted of the last window pages, by seq % window
+		gates := make([]<-chan struct{}, workers) // permitted of the last workers pages, by seq % workers
 		for i := range gates {
 			gates[i] = open
 		}
@@ -102,7 +102,7 @@ func WalkParallelWithGet[T any](ctx context.Context, get func(context.Context, s
 			case <-ctx.Done():
 				return
 			}
-			slot := (seq - after - 1) % uint64(window)
+			slot := (seq - after - 1) % uint64(workers)
 			*p = parallelPage[T]{seq: seq, key: Key(prefix, seq), gate: gates[slot], turn: turn,
 				permitted: make(chan struct{}), ready: make(chan struct{})}
 			turn, gates[slot] = p.permitted, p.permitted

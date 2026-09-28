@@ -127,9 +127,9 @@ type Fault struct {
 	// held is every pause channel not yet closed, the armed one included:
 	// Resume releases them all.
 	held []chan struct{}
-	// blocked counts calls stopped by Pause or Hang right now, so cleanup
-	// can wait for resumed calls to finish.
-	blocked atomic.Int64
+	// inflight counts backend calls in progress, from entry to return, so
+	// cleanup can wait for a resumed call to reach the backend and finish.
+	inflight atomic.Int64
 	// ops counts every backend call by operation, armed or not — the
 	// measurement half of this layer: "how many store requests did this
 	// replay / refresh / compaction cycle cost". readBytes is the payload
@@ -420,9 +420,10 @@ func (f *Fault) Resume() {
 
 // Faulty returns s wrapped in a fault injector, for crash-point tests.
 // Disarmed until the caller sets a Plan. Cleanup resumes any call still
-// held by a Pause plan and waits (up to 5s) for every paused or hung call
-// to return, so a failed test neither leaks a blocked goroutine nor lets
-// one write into a removed TempDir. A Hang call ends only with its
+// held by a Pause plan and waits (up to 5s) for every call in flight,
+// paused, hung or running, to return, so a failed test neither leaks a
+// blocked goroutine nor lets one write into a removed TempDir; a call still
+// in flight after that fails the test. A Hang call ends only with its
 // context: use t.Context() (cancelled before cleanup), never
 // context.Background().
 func Faulty(t testing.TB, s *objstore.Store) (*objstore.Store, *Fault) {
@@ -431,16 +432,16 @@ func Faulty(t testing.TB, s *objstore.Store) (*objstore.Store, *Fault) {
 	t.Cleanup(func() {
 		f.Resume()
 		if !f.drain(5 * time.Second) {
-			t.Logf("storetest: %d paused or hung calls still blocked at cleanup", f.blocked.Load())
+			t.Errorf("storetest: %d calls still in flight 5s into cleanup (a Hang on a context that is never cancelled?)", f.inflight.Load())
 		}
 	})
 	return s, f
 }
 
-// drain waits up to timeout for every call stopped by Pause or Hang to
-// return, and reports whether they all did.
+// drain waits up to timeout for no call to be in flight, and reports
+// whether that happened.
 func (f *Fault) drain(timeout time.Duration) bool {
-	for deadline := time.Now().Add(timeout); f.blocked.Load() > 0; time.Sleep(time.Millisecond) {
+	for deadline := time.Now().Add(timeout); f.inflight.Load() > 0; time.Sleep(time.Millisecond) {
 		if time.Now().After(deadline) {
 			return false
 		}
@@ -481,8 +482,6 @@ func (f *Fault) hitAt(ctx context.Context, op Op, off int64, keys ...string) (Mo
 		return p.Mode, true
 	}
 	if paused != nil {
-		f.blocked.Add(1)
-		defer f.blocked.Add(-1)
 		select {
 		case <-paused:
 		case <-ctx.Done():
@@ -504,8 +503,6 @@ func anyContains(keys []string, sub string) bool {
 // pre is the injection for the modes that never reach storage.
 func (f *Fault) pre(ctx context.Context, m Mode) error {
 	if m == Hang {
-		f.blocked.Add(1)
-		defer f.blocked.Add(-1)
 		<-ctx.Done()
 		return ctx.Err()
 	}
@@ -514,6 +511,8 @@ func (f *Fault) pre(ctx context.Context, m Mode) error {
 
 // Put is the backend's Put, counted and planned as OpPut.
 func (f *Fault) Put(ctx context.Context, key string, data []byte) error {
+	f.inflight.Add(1)
+	defer f.inflight.Add(-1)
 	m, hit := f.hit(ctx, OpPut, key)
 	if hit && m != Ambiguous {
 		return f.pre(ctx, m)
@@ -533,6 +532,8 @@ func (f *Fault) Put(ctx context.Context, key string, data []byte) error {
 
 // PutIfAbsent is the backend's, counted and planned as OpPutIfAbsent.
 func (f *Fault) PutIfAbsent(ctx context.Context, key string, data []byte) (bool, error) {
+	f.inflight.Add(1)
+	defer f.inflight.Add(-1)
 	m, hit := f.hit(ctx, OpPutIfAbsent, key)
 	if hit && m != Ambiguous {
 		return false, f.pre(ctx, m)
@@ -552,6 +553,8 @@ func (f *Fault) PutIfAbsent(ctx context.Context, key string, data []byte) (bool,
 
 // PutIfMatch is the backend's, counted and planned as OpPutIfMatch.
 func (f *Fault) PutIfMatch(ctx context.Context, key string, data []byte, etag string) (bool, error) {
+	f.inflight.Add(1)
+	defer f.inflight.Add(-1)
 	m, hit := f.hit(ctx, OpPutIfMatch, key)
 	if hit && m != Ambiguous {
 		return false, f.pre(ctx, m)
@@ -571,6 +574,8 @@ func (f *Fault) PutIfMatch(ctx context.Context, key string, data []byte, etag st
 
 // Get is the backend's Get, counted and planned as OpGet.
 func (f *Fault) Get(ctx context.Context, key string) ([]byte, error) {
+	f.inflight.Add(1)
+	defer f.inflight.Add(-1)
 	f.noteRead(key)
 	// A read has no ambiguous outcome: nothing changed either way.
 	if m, hit := f.hit(ctx, OpGet, key); hit {
@@ -590,6 +595,8 @@ func (f *Fault) Get(ctx context.Context, key string) ([]byte, error) {
 // ListPage is the backend's, counted and planned as OpList (Plan.Key
 // matches the prefix).
 func (f *Fault) ListPage(ctx context.Context, prefix, after string, limit int) ([]string, string, error) {
+	f.inflight.Add(1)
+	defer f.inflight.Add(-1)
 	if m, hit := f.hit(ctx, OpList, prefix); hit {
 		return nil, "", f.pre(ctx, m)
 	}
@@ -601,6 +608,8 @@ func (f *Fault) ListPage(ctx context.Context, prefix, after string, limit int) (
 
 // Delete is the backend's, counted and planned as OpDelete.
 func (f *Fault) Delete(ctx context.Context, key string) error {
+	f.inflight.Add(1)
+	defer f.inflight.Add(-1)
 	m, hit := f.hit(ctx, OpDelete, key)
 	if hit && m != Ambiguous {
 		return f.pre(ctx, m)
@@ -621,6 +630,8 @@ func (f *Fault) Delete(ctx context.Context, key string) error {
 // DeleteMany is the backend's, counted and planned as OpDelete; a plan
 // fires when any of keys matches.
 func (f *Fault) DeleteMany(ctx context.Context, keys ...string) error {
+	f.inflight.Add(1)
+	defer f.inflight.Add(-1)
 	m, hit := f.hit(ctx, OpDelete, keys...)
 	if hit && m != Ambiguous {
 		return f.pre(ctx, m)
@@ -641,6 +652,8 @@ func (f *Fault) DeleteMany(ctx context.Context, keys ...string) error {
 // ListPrefixesPage is the backend's, counted and planned as
 // OpListPrefixes (Plan.Key matches the prefix).
 func (f *Fault) ListPrefixesPage(ctx context.Context, prefix, after string, limit int) ([]string, string, error) {
+	f.inflight.Add(1)
+	defer f.inflight.Add(-1)
 	if m, hit := f.hit(ctx, OpListPrefixes, prefix); hit {
 		return nil, "", f.pre(ctx, m)
 	}
@@ -652,6 +665,8 @@ func (f *Fault) ListPrefixesPage(ctx context.Context, prefix, after string, limi
 
 // GetWithETag is the backend's, counted and planned as OpGet.
 func (f *Fault) GetWithETag(ctx context.Context, key string) ([]byte, string, error) {
+	f.inflight.Add(1)
+	defer f.inflight.Add(-1)
 	f.noteRead(key)
 	if m, hit := f.hit(ctx, OpGet, key); hit {
 		return nil, "", f.pre(ctx, m)
@@ -669,6 +684,8 @@ func (f *Fault) GetWithETag(ctx context.Context, key string) ([]byte, string, er
 
 // GetIfChanged is the backend's, counted and planned as OpGet.
 func (f *Fault) GetIfChanged(ctx context.Context, key, etag string) ([]byte, string, bool, error) {
+	f.inflight.Add(1)
+	defer f.inflight.Add(-1)
 	f.noteRead(key)
 	if m, hit := f.hit(ctx, OpGet, key); hit {
 		return nil, "", false, f.pre(ctx, m)
@@ -686,6 +703,8 @@ func (f *Fault) GetIfChanged(ctx context.Context, key, etag string) ([]byte, str
 
 // EnsureBucket is the backend's, shaped but never planned or counted.
 func (f *Fault) EnsureBucket(ctx context.Context) error {
+	f.inflight.Add(1)
+	defer f.inflight.Add(-1)
 	if err := f.shapeCall(ctx, 0); err != nil {
 		return err
 	}
@@ -694,6 +713,8 @@ func (f *Fault) EnsureBucket(ctx context.Context) error {
 
 // DropBucket is the backend's, shaped but never planned or counted.
 func (f *Fault) DropBucket(ctx context.Context) error {
+	f.inflight.Add(1)
+	defer f.inflight.Add(-1)
 	if err := f.shapeCall(ctx, 0); err != nil {
 		return err
 	}
@@ -703,6 +724,8 @@ func (f *Fault) DropBucket(ctx context.Context) error {
 // GetRange is the backend's, counted and planned as OpGetRange
 // (Plan.From can narrow it to one offset).
 func (f *Fault) GetRange(ctx context.Context, key string, offset, length int64) ([]byte, error) {
+	f.inflight.Add(1)
+	defer f.inflight.Add(-1)
 	f.noteRead(key)
 	if m, hit := f.hitAt(ctx, OpGetRange, offset, key); hit {
 		return nil, f.pre(ctx, m)

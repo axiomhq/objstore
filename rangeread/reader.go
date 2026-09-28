@@ -13,12 +13,11 @@ import (
 // Reader reads immutable objects by byte range on top of the object cache:
 // it plans and coalesces the ranged GETs of one read stage (FetchRanges)
 // and counts the physical range work. The cache remembers what it reads and
-// does not know it exists. Build one per process, with New; the zero Reader
-// is not usable.
+// does not know it exists. Use New: the zero Reader is not usable.
 type Reader struct {
-	Store   *objstore.Store
-	Objects *cache.Cache
 	IO      Counters
+	store   *objstore.Store
+	objects *cache.Cache
 	config  Config              // normalized by New
 	memory  *semaphore.Weighted // config.MaxInFlightBytes across the process
 	// parents shares one GET among concurrent identical coalesced parent
@@ -34,7 +33,7 @@ func New(s *objstore.Store, objects *cache.Cache, cfg Config) (*Reader, error) {
 	if err != nil {
 		return nil, err
 	}
-	return &Reader{Store: s, Objects: objects, config: cfg, memory: semaphore.NewWeighted(cfg.MaxInFlightBytes)}, nil
+	return &Reader{store: s, objects: objects, config: cfg, memory: semaphore.NewWeighted(cfg.MaxInFlightBytes)}, nil
 }
 
 // Config is the normalized configuration the Reader was built with.
@@ -48,8 +47,8 @@ func (r *Reader) Config() Config { return r.config }
 // leader's GET ends. The shared call runs on and is forgotten when it
 // completes.
 func (r *Reader) Fetch(ctx context.Context, key string) ([]byte, error) {
-	return r.Objects.FetchWith(ctx, key, func(ctx context.Context) ([]byte, error) {
-		return r.Objects.Gated(ctx, func(ctx context.Context) ([]byte, error) { return r.Store.Get(ctx, key) })
+	return r.objects.FetchWith(ctx, key, func(ctx context.Context) ([]byte, error) {
+		return r.objects.Gated(ctx, func(ctx context.Context) ([]byte, error) { return r.store.Get(ctx, key) })
 	})
 }
 
@@ -64,7 +63,7 @@ func (r *Reader) Prefetch(ctx context.Context, keys ...string) {
 	var g errgroup.Group
 	g.SetLimit(cache.GateWidth)
 	for _, k := range keys {
-		if _, ok := r.Objects.ByteCacheFor(k).Peek(k); ok { // Peek: the consumer's fetch owns the hit/miss accounting
+		if _, ok := r.objects.ByteCacheFor(k).Peek(k); ok { // Peek: the consumer's fetch owns the hit/miss accounting
 			continue
 		}
 		if ctx.Err() != nil {

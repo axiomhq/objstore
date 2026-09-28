@@ -220,7 +220,8 @@ func TestWriterAmbiguousPutOwnNonce(t *testing.T) {
 // TestWriterCorruptReadbackIsUnknown: a corrupt page at the contested
 // sequence proves nothing, so the batch is ErrUnresolved, and the writer is
 // finished: it cannot tell which sequence is next, so every later Append
-// gets the same error without touching the store.
+// gets ErrWriterFailed (never written, so not ErrUnresolved) without
+// touching the store.
 func TestWriterCorruptReadbackIsUnknown(t *testing.T) {
 	s, f := bucket.NewFaulty(t)
 	ctx := context.Background()
@@ -233,8 +234,8 @@ func TestWriterCorruptReadbackIsUnknown(t *testing.T) {
 		t.Fatalf("unreadable nonce cannot prove another writer won: %v", err)
 	}
 	f.ResetOps()
-	if err := w.Append(ctx, rows("b")); !errors.Is(err, ErrUnresolved) || !strings.Contains(err.Error(), "corrupt entry") {
-		t.Fatalf("append after a corrupt read-back: %v, want the latched ErrUnresolved", err)
+	if err := w.Append(ctx, rows("b")); !errors.Is(err, ErrWriterFailed) || errors.Is(err, ErrUnresolved) || !strings.Contains(err.Error(), "corrupt entry") {
+		t.Fatalf("append after a corrupt read-back: %v, want ErrWriterFailed naming the cause", err)
 	}
 	if ops := f.Ops(); len(ops) != 0 {
 		t.Fatalf("a terminal writer touched the store: %v", ops)

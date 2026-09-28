@@ -325,9 +325,7 @@ func TestFaultPauseResume(t *testing.T) {
 		f.Set(storetest.Plan{Op: storetest.OpPut, N: 1, Mode: storetest.Pause, Key: "paused"})
 		done := make(chan error, 1)
 		go func() { done <- s.Put(ctx, "paused", []byte("x")) }()
-		for f.Fired() == 0 {
-			time.Sleep(time.Millisecond)
-		}
+		waitFor(t, func() bool { return f.Fired() != 0 })
 		select {
 		case err := <-done:
 			t.Fatalf("paused Put returned before Resume: %v", err)
@@ -337,7 +335,7 @@ func TestFaultPauseResume(t *testing.T) {
 			t.Fatalf("paused Put reached storage: %v", err)
 		}
 		f.Resume()
-		if err := <-done; err != nil {
+		if err := await(t, done, "resumed Put"); err != nil {
 			t.Fatalf("resumed Put: %v", err)
 		}
 		if _, err := s.Get(ctx, "paused"); err != nil {
@@ -486,15 +484,11 @@ func TestFaultPauseRearm(t *testing.T) {
 	f.Set(storetest.Plan{Op: storetest.OpPut, N: 1, Mode: storetest.Pause, Key: "first"})
 	first := make(chan error, 1)
 	go func() { first <- s.Put(ctx, "first", []byte("x")) }()
-	for f.Fired() == 0 {
-		time.Sleep(time.Millisecond)
-	}
+	waitFor(t, func() bool { return f.Fired() != 0 })
 	f.Set(storetest.Plan{Op: storetest.OpPut, N: 1, Mode: storetest.Pause, Key: "second"})
 	second := make(chan error, 1)
 	go func() { second <- s.Put(ctx, "second", []byte("x")) }()
-	for f.Fired() == 0 {
-		time.Sleep(time.Millisecond)
-	}
+	waitFor(t, func() bool { return f.Fired() != 0 })
 	select {
 	case err := <-first:
 		t.Fatalf("first Put returned before Resume: %v", err)
@@ -503,11 +497,55 @@ func TestFaultPauseRearm(t *testing.T) {
 	case <-time.After(20 * time.Millisecond):
 	}
 	f.Resume()
-	if err := <-first; err != nil {
+	if err := await(t, first, "first Put"); err != nil {
 		t.Fatal(err)
 	}
-	if err := <-second; err != nil {
+	if err := await(t, second, "second Put"); err != nil {
 		t.Fatal(err)
+	}
+}
+
+// TestFaultyDrainWaitsForResumedWrite: M3. Faulty's cleanup waits for a
+// resumed write to finish at the backend, not just to leave the pause.
+func TestFaultyDrainWaitsForResumedWrite(t *testing.T) {
+	inner, slow := storetest.NewFault(bucket.New(t))
+	slow.SetShape(storetest.Shape{Latency: 100 * time.Millisecond}) // after the pause, before storage
+	done := make(chan error, 1)
+	t.Run("paused", func(t *testing.T) {
+		s, f := storetest.Faulty(t, inner)
+		f.Set(storetest.Plan{Op: storetest.OpPut, N: 1, Mode: storetest.Pause})
+		go func() { done <- s.Put(context.Background(), "drain", []byte("x")) }()
+		waitFor(t, func() bool { return f.Fired() != 0 })
+	}) // cleanup: Resume, then drain
+	select {
+	case err := <-done:
+		if err != nil {
+			t.Fatal(err)
+		}
+	default:
+		t.Fatal("Faulty's cleanup returned while the resumed Put was still in flight")
+	}
+}
+
+// waitFor polls cond for up to 10s.
+func waitFor(t *testing.T, cond func() bool) {
+	t.Helper()
+	for deadline := time.Now().Add(10 * time.Second); !cond(); time.Sleep(time.Millisecond) {
+		if time.Now().After(deadline) {
+			t.Fatal("condition never held")
+		}
+	}
+}
+
+// await receives from ch, failing the test after 10s.
+func await[T any](t *testing.T, ch <-chan T, what string) T {
+	t.Helper()
+	select {
+	case v := <-ch:
+		return v
+	case <-time.After(10 * time.Second):
+		t.Fatalf("%s: timed out", what)
+		panic("unreachable")
 	}
 }
 

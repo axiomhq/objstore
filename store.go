@@ -72,6 +72,10 @@ type Store struct {
 	// or configured through one is seen through all. nil (a zero Store)
 	// means no encryption.
 	cmek *atomic.Pointer[cmekState]
+	// refresh is Config.KeyRefreshInterval, shared the same way and with
+	// the encryption state, so it holds whether set before or after a
+	// provider is configured.
+	refresh *atomic.Int64
 	// accept is Config.AcceptPlaintext, or DefaultAcceptPlaintext.
 	accept func(key string, data []byte) bool
 	// writes bounds non-urgent object writes and deletes in flight; see
@@ -86,7 +90,8 @@ func Open(b Backend, cfg Config) *Store {
 	if cfg.RequestsPerSecond > 0 {
 		b = &paced{Backend: b, pace: newPacer(cfg.RequestsPerSecond)}
 	}
-	s := &Store{b: b, cmek: new(atomic.Pointer[cmekState]), accept: cfg.AcceptPlaintext}
+	s := &Store{b: b, cmek: new(atomic.Pointer[cmekState]), refresh: new(atomic.Int64), accept: cfg.AcceptPlaintext}
+	s.refresh.Store(int64(cfg.KeyRefreshInterval))
 	if s.accept == nil {
 		s.accept = DefaultAcceptPlaintext
 	}
@@ -94,9 +99,7 @@ func Open(b Backend, cfg Config) *Store {
 		s.writes = semaphore.NewWeighted(int64(cmp.Or(cfg.MaxInflightWrites, defaultMaxInflightWrites)))
 	}
 	if cfg.KeyProvider != nil {
-		c := newCMEKState(cfg.KeyProvider)
-		c.interval.Store(int64(cfg.KeyRefreshInterval))
-		s.cmek.Store(c)
+		s.cmek.Store(newCMEKState(cfg.KeyProvider, s.refresh))
 	}
 	return s
 }

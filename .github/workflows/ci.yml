@@ -10,7 +10,8 @@ permissions:
 
 concurrency:
   group: ci-${{ github.ref }}
-  cancel-in-progress: true
+  # A newer push to a PR supersedes its run; every main commit keeps its own.
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
 
 jobs:
   test:
@@ -36,6 +37,12 @@ jobs:
         run: GOOS=windows go vet ./...
       - name: cross-compile darwin
         run: GOOS=darwin go vet ./...
+      # fs has flock on illumos but not on solaris or aix (a stub there).
+      - name: cross-compile illumos, solaris, aix
+        run: |
+          GOOS=illumos go vet ./...
+          GOOS=solaris go vet ./...
+          GOOS=aix GOARCH=ppc64 go vet ./...
 
   s3:
     runs-on: ubuntu-latest
@@ -59,10 +66,13 @@ jobs:
           done
           docker logs minio
           exit 1
+      # MinIO creates the object on a PutIfMatch of a missing key, where
+      # AWS S3 and R2 answer 404; the conformance suite isolates that check
+      # in its ETagCASMissing subtest.
       - name: go test (MinIO)
         env:
           OBJSTORE_TEST_S3: http://localhost:9000
-        run: go test -race -count=1 ./...
+        run: go test -race -count=1 -skip 'ETagCASMissing' ./...
 
   macos:
     runs-on: macos-latest
@@ -72,5 +82,5 @@ jobs:
       - uses: actions/setup-go@v6
         with:
           go-version-file: go.mod
-      - name: go test (darwin flock)
-        run: go test -race -count=1 ./fs/... ./
+      - name: go test (darwin)
+        run: go test -race -count=1 ./...

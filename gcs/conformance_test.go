@@ -1,3 +1,6 @@
+// fake-gcs-server builds only on these platforms.
+//go:build linux || windows || darwin || freebsd || netbsd || openbsd
+
 package gcs_test
 
 import (

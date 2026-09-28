@@ -19,8 +19,10 @@ type Load struct {
 	Extent
 	// Key is the logical cache key of the decoded child, never empty. It
 	// must identify the extent and its decoding: two loads with one Key
-	// must name the same Extent (else ErrInvalidExtent), only the first is
-	// read, and a cached entry under Key is served without reading at all.
+	// must agree on Extent, DecodedBytes and Transient (else
+	// ErrInvalidExtent), only the first is read and decoded (its Decode
+	// wins; functions cannot be compared), and a cached entry under Key is
+	// served without reading at all.
 	Key string
 	// Decode turns the stored bytes into the child; nil keeps them as
 	// stored. It must validate any stored checksum, since its result is
@@ -46,8 +48,8 @@ type Load struct {
 // A stage whose children would retain more than Config.MaxInFlightBytes is
 // skipped: FetchRanges returns ctx unchanged and nil, and the consumer
 // falls back to its own per-object reads. An invalid load, an empty Key, or
-// one Key given two different extents is ErrInvalidExtent; a range the
-// store returns at the wrong length is ErrCorrupt.
+// one Key given two different loads is ErrInvalidExtent, whatever the
+// budget; a range the store returns at the wrong length is ErrCorrupt.
 func (r *Reader) FetchRanges(ctx context.Context, loads []Load) (context.Context, error) {
 	if r.memory == nil {
 		return ctx, errors.New("rangeread: Reader not built with New")
@@ -63,9 +65,11 @@ func (r *Reader) FetchRanges(ctx context.Context, loads []Load) (context.Context
 	// Count stored assembly + decoded children + key/map overhead, including
 	// cache hits that the scope would keep alive after an LRU eviction. The
 	// consumer falls back to its normal bounded per-object reads.
-	var retained int64
-	seen := make(map[string]Extent, len(loads))
-	var unique []Load // loads, first of each Key
+	//
+	// Validate and dedupe every load before the budget pass, so an invalid
+	// stage is an error whatever its size or order.
+	seen := make(map[string]int, len(loads)) // Key -> index in unique
+	var unique []Load                        // loads, first of each Key
 	for _, load := range loads {
 		if err := load.valid(); err != nil {
 			return ctx, err
@@ -76,14 +80,17 @@ func (r *Reader) FetchRanges(ctx context.Context, loads []Load) (context.Context
 		if load.Key == "" {
 			return ctx, fmt.Errorf("%w: %s: empty Key", ErrInvalidExtent, load.Object)
 		}
-		if x, ok := seen[load.Key]; ok {
-			if x != load.Extent {
-				return ctx, fmt.Errorf("%w: Key %s names two extents", ErrInvalidExtent, load.Key)
+		if i, ok := seen[load.Key]; ok {
+			if u := unique[i]; u.Extent != load.Extent || u.DecodedBytes != load.DecodedBytes || u.Transient != load.Transient {
+				return ctx, fmt.Errorf("%w: Key %s names two different loads", ErrInvalidExtent, load.Key)
 			}
 			continue
 		}
-		seen[load.Key] = load.Extent
+		seen[load.Key] = len(unique)
 		unique = append(unique, load)
+	}
+	var retained int64
+	for _, load := range unique {
 		for _, n := range []int64{load.Length, load.DecodedBytes, int64(len(load.Key)+len(load.Object)) + 128} {
 			if n > r.config.MaxInFlightBytes-retained {
 				return ctx, nil
@@ -101,13 +108,13 @@ func (r *Reader) FetchRanges(ctx context.Context, loads []Load) (context.Context
 			results[load.Key] = b
 			continue
 		}
-		memory := r.Objects.ByteCacheFor(load.Key)
+		memory := r.objects.ByteCacheFor(load.Key)
 		if b, ok := memory.Peek(load.Key); ok {
-			r.Objects.Note(ctx, load.Key, cache.MemoryHit)
+			r.objects.Note(ctx, load.Key, cache.MemoryHit)
 			results[load.Key] = b
 			continue
 		}
-		if b, ok := r.Objects.FromDisk(ctx, load.Key); ok {
+		if b, ok := r.objects.FromDisk(ctx, load.Key); ok {
 			results[load.Key] = b
 			continue
 		}
@@ -199,20 +206,20 @@ func (r *Reader) FetchRanges(ctx context.Context, loads []Load) (context.Context
 			// read reports who answered: the store (Load), or the memory or
 			// disk tier holding the object its bytes were cut from.
 			read := func(ctx context.Context) ([]byte, cache.Outcome, error) {
-				if b, fromDisk, ok := r.Objects.CachedRange(plan.Object, plan.Offset, plan.Length); ok {
+				if b, fromDisk, ok := r.objects.CachedRange(plan.Object, plan.Offset, plan.Length); ok {
 					cache.MarkServedFromCache(ctx, plan.Object, fromDisk)
 					if fromDisk {
 						return bytes.Clone(b), cache.DiskHit, nil
 					}
 					return bytes.Clone(b), cache.MemoryHit, nil
 				}
-				data, err := r.Objects.Gated(ctx, func(ctx context.Context) ([]byte, error) {
+				data, err := r.objects.Gated(ctx, func(ctx context.Context) ([]byte, error) {
 					if started.CompareAndSwap(false, true) {
 						r.IO.Waves.Add(1)
 					}
 					r.IO.Gets.Add(1)
 					cache.NoteStoreLoad(ctx, plan.Object)
-					data, err := r.Store.GetRange(ctx, plan.Object, plan.Offset, plan.Length)
+					data, err := r.store.GetRange(ctx, plan.Object, plan.Offset, plan.Length)
 					r.IO.Bytes.Add(int64(len(data)))
 					if err == nil && int64(len(data)) != plan.Length {
 						err = fmt.Errorf("%w: %s: range at %d returned %d bytes, want %d", ErrCorrupt, plan.Object, plan.Offset, len(data), plan.Length)
@@ -229,7 +236,7 @@ func (r *Reader) FetchRanges(ctx context.Context, loads []Load) (context.Context
 			var err error
 			if child >= 0 {
 				load := pending[child]
-				data, src, err = r.Objects.FetchCachedRange(gctx, load.Key, int(plan.Length), func(ctx context.Context) ([]byte, error) {
+				data, src, err = r.objects.FetchCachedRange(gctx, load.Key, int(plan.Length), func(ctx context.Context) ([]byte, error) {
 					stored, _, err := read(ctx)
 					if err != nil || load.Decode == nil {
 						return stored, err
@@ -276,7 +283,7 @@ func (r *Reader) FetchRanges(ctx context.Context, loads []Load) (context.Context
 	// direct child was decoded by FetchCachedRange, which cached it.
 	for i, load := range pending {
 		data := assembled[i]
-		memory := r.Objects.ByteCacheFor(load.Key)
+		memory := r.objects.ByteCacheFor(load.Key)
 		if load.Decode != nil && !direct[i] {
 			data, err = load.Decode(data)
 			if err != nil {
@@ -285,11 +292,11 @@ func (r *Reader) FetchRanges(ctx context.Context, loads []Load) (context.Context
 		}
 		memory.Missed(load.Key)
 		if o := outcome[i].Load(); o >= 0 {
-			r.Objects.NoteAs(ctx, load.Key, cache.Outcome(o), owners[i])
+			r.objects.NoteAs(ctx, load.Key, cache.Outcome(o), owners[i])
 		}
 		if !direct[i] && !load.Transient {
 			if stored[i].Load() {
-				r.Objects.Disk.Put(cache.DiskKey(load.Key, gens[i]), data)
+				r.objects.Disk.Put(cache.DiskKey(load.Key, gens[i]), data)
 			}
 			memory.Put(load.Key, data, gens[i])
 		}

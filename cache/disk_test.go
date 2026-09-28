@@ -399,8 +399,13 @@ func TestExpireInactive(t *testing.T) {
 
 // TestNewDiskRemovesStaleDirectories: a process that crashed before Close
 // left its directory under root; the next NewDisk over the root removes it.
+// The root's name holds glob metacharacters, which the sweep must take
+// literally.
 func TestNewDiskRemovesStaleDirectories(t *testing.T) {
-	root := t.TempDir()
+	if !sweepable {
+		t.Skip("no file lock: nothing is swept")
+	}
+	root := filepath.Join(t.TempDir(), "root[1]")
 	crashed, err := NewDisk(root, 1<<20)
 	if err != nil {
 		t.Fatal(err)
@@ -437,7 +442,7 @@ func TestNewDiskRemovesStaleDirectories(t *testing.T) {
 // serving; Wipe after Close is a no-op.
 func TestTwoDisksShareARoot(t *testing.T) {
 	if !sweepable {
-		t.Skip("no flock: nothing is swept")
+		t.Skip("no file lock: nothing is swept")
 	}
 	root := t.TempDir()
 	a, err := NewDisk(root, 1<<20)
@@ -484,6 +489,9 @@ func TestTwoDisksShareARoot(t *testing.T) {
 // TestSweepRacesNewDisk: Disks created while others sweep the same root
 // all survive with their entries.
 func TestSweepRacesNewDisk(t *testing.T) {
+	if !sweepable {
+		t.Skip("no file lock: nothing is swept")
+	}
 	root := t.TempDir()
 	const n = 8
 	disks := make([]*Disk, n)

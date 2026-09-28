@@ -141,7 +141,11 @@ func errorText(err error) string {
 
 func TestWalkParallelStopsAtFirstError(t *testing.T) {
 	ctx := context.Background()
-	s := bucket.New(t)
+	// The filesystem store, not bucket.New: the goroutine count below is
+	// the walk's own, and a real S3 endpoint's SDK keeps idle HTTP
+	// goroutines alive. Stopping at the first error does not depend on the
+	// backend.
+	s := bucket.NewFS(t)
 	for seq := uint64(1); seq <= 12; seq++ {
 		if ok, err := put(ctx, s, testPrefix, Header{Seq: seq}, Bytes(fmt.Sprint(seq))); !ok || err != nil {
 			t.Fatal(err)

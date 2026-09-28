@@ -129,10 +129,11 @@ func (r *Ref) Release(ctx context.Context) {
 	// fresh acquisition would find this lease still live.
 	s.held, s.busy = nil, true
 	s.mu.Unlock()
-
+	// Deferred, as in Join, so a panicking Release does not leave s busy.
+	defer func() {
+		s.mu.Lock()
+		s.idle()
+		s.mu.Unlock()
+	}()
 	r.l.Release(ctx)
-
-	s.mu.Lock()
-	s.idle()
-	s.mu.Unlock()
 }
