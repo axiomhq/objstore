@@ -97,7 +97,7 @@ func TestShared(t *testing.T) {
 		}
 	})
 
-	// L4: a mint stuck on the store must not hold Shared's mutex. Held
+	// A mint stuck on the store must not hold Shared's mutex. Held
 	// answers at once; a concurrent Join waits for the mint and, when it
 	// fails, mints its own.
 	t.Run("HungMintDoesNotBlockShared", func(t *testing.T) {
@@ -191,7 +191,7 @@ func TestShared(t *testing.T) {
 	})
 }
 
-// TestSharedReleaseFromFence: M2. The last Ref.Release from inside the
+// TestSharedReleaseFromFence: The last Ref.Release from inside the
 // fence callback completes; Shared is usable afterwards.
 func TestSharedReleaseFromFence(t *testing.T) {
 	ctx := context.Background()
@@ -228,7 +228,7 @@ func TestSharedReleaseFromFence(t *testing.T) {
 	}
 }
 
-// TestSharedMintPanic: M3. A panicking mint does not leave Shared busy.
+// TestSharedMintPanic: A panicking mint does not leave Shared busy.
 func TestSharedMintPanic(t *testing.T) {
 	var sh Shared
 	func() {

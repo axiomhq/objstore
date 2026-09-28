@@ -18,7 +18,8 @@ var ErrCorrupt = errors.New("rangeread: corrupt")
 // ErrInvalidExtent marks caller input that cannot name a byte range: an
 // empty object name, one containing '#', a negative offset, a non-positive
 // length, an end past MaxInt64, a negative DecodedBytes, an empty Load.Key,
-// or one Load.Key given two different extents in one FetchRanges.
+// or one Load.Key given two different loads (Extent, DecodedBytes or
+// Transient) in one FetchRanges.
 var ErrInvalidExtent = errors.New("rangeread: invalid extent")
 
 // Config bounds physical range coalescing. Zero fields use the defaults

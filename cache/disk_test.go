@@ -548,3 +548,29 @@ func TestNilDiskIsSafe(t *testing.T) {
 	}
 	c.Close()
 }
+
+// TestRemoveHomeClosingLockFirst runs the Windows removal path where CI
+// runs (Unix): the whole directory goes, lock file included, and the lock
+// is released.
+func TestRemoveHomeClosingLockFirst(t *testing.T) {
+	root := t.TempDir()
+	home, lock, err := lockedHome(root)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := os.MkdirAll(filepath.Join(home, dataDir, "sub"), 0700); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(home, dataDir, "sub", "blob"), []byte("x"), 0600); err != nil {
+		t.Fatal(err)
+	}
+	if err := removeHomeClosingLockFirst(home, lock); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := os.Stat(home); !errors.Is(err, os.ErrNotExist) {
+		t.Fatalf("home after removal: %v", err)
+	}
+	if _, err := lock.Stat(); err == nil {
+		t.Fatal("lock still open after removal")
+	}
+}

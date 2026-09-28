@@ -69,8 +69,8 @@ type Backend interface {
 type Store struct {
 	b Backend
 	// cmek is shared with every Store WithBackend derives, so a key cached
-	// or configured through one is seen through all. nil (a zero Store)
-	// means no encryption.
+	// or configured through one is seen through all. It holds nil without
+	// encryption.
 	cmek *atomic.Pointer[cmekState]
 	// refresh is Config.KeyRefreshInterval, shared the same way and with
 	// the encryption state, so it holds whether set before or after a
@@ -79,7 +79,7 @@ type Store struct {
 	// accept is Config.AcceptPlaintext, or DefaultAcceptPlaintext.
 	accept func(key string, data []byte) bool
 	// writes bounds non-urgent object writes and deletes in flight; see
-	// Config.MaxInflightWrites. nil (a zero Store) means unbounded.
+	// Config.MaxInflightWrites. nil means unbounded.
 	writes *semaphore.Weighted
 }
 
@@ -142,14 +142,14 @@ func (s *Store) enterWrite(ctx context.Context) (func(), error) {
 // seal returns data as it is stored: encrypted when key lies in a
 // namespace with a key record.
 func (s *Store) seal(ctx context.Context, op, key string, data []byte) ([]byte, error) {
-	dek, err := s.objectKey(ctx, key, false)
+	aead, err := s.objectKey(ctx, key, false)
 	if err != nil {
 		return nil, OpErr(op, key, err)
 	}
-	if dek == nil {
+	if aead == nil {
 		return data, nil
 	}
-	sealed, err := encryptObject(key, data, dek)
+	sealed, err := encryptObject(key, data, aead)
 	return sealed, OpErr(op, key, err)
 }
 
@@ -185,7 +185,7 @@ func (s *Store) PutIfAbsent(ctx context.Context, key string, data []byte) (bool,
 
 // Get returns the whole object at key; a missing object wraps ErrNotFound.
 func (s *Store) Get(ctx context.Context, key string) ([]byte, error) {
-	dek, err := s.objectKey(ctx, key, true)
+	aead, err := s.objectKey(ctx, key, true)
 	if err != nil {
 		return nil, OpErr("get", key, err)
 	}
@@ -193,7 +193,7 @@ func (s *Store) Get(ctx context.Context, key string) ([]byte, error) {
 	if err != nil {
 		return nil, err
 	}
-	return s.open(ctx, "get", key, data, dek)
+	return s.open(ctx, "get", key, data, aead)
 }
 
 // GetRange reads exactly length bytes starting at offset. Short/out-of-bounds
@@ -207,19 +207,19 @@ func (s *Store) GetRange(ctx context.Context, key string, offset, length int64) 
 	if err := ctx.Err(); err != nil {
 		return nil, err
 	}
-	dek, err := s.objectKey(ctx, key, false)
+	aead, err := s.objectKey(ctx, key, false)
 	if err != nil {
 		return nil, OpErr("get-range", key, err)
 	}
-	if dek == nil {
+	if aead == nil {
 		return s.b.GetRange(ctx, key, offset, length)
 	}
-	return s.encryptedRange(ctx, key, offset, length, dek)
+	return s.encryptedRange(ctx, key, offset, length, aead)
 }
 
 // GetWithETag returns the object and its ETag for conditional replacement.
 func (s *Store) GetWithETag(ctx context.Context, key string) ([]byte, string, error) {
-	dek, err := s.objectKey(ctx, key, true)
+	aead, err := s.objectKey(ctx, key, true)
 	if err != nil {
 		return nil, "", OpErr("get-with-etag", key, err)
 	}
@@ -227,7 +227,7 @@ func (s *Store) GetWithETag(ctx context.Context, key string) ([]byte, string, er
 	if err != nil {
 		return nil, "", err
 	}
-	plain, err := s.open(ctx, "get-with-etag", key, data, dek)
+	plain, err := s.open(ctx, "get-with-etag", key, data, aead)
 	if err != nil {
 		return nil, "", err
 	}
@@ -242,7 +242,7 @@ func (s *Store) GetIfChanged(ctx context.Context, key, etag string) ([]byte, str
 	if err := ctx.Err(); err != nil {
 		return nil, "", false, err
 	}
-	dek, err := s.objectKey(ctx, key, true)
+	aead, err := s.objectKey(ctx, key, true)
 	if err != nil {
 		return nil, "", false, OpErr("get-if-changed", key, err)
 	}
@@ -250,7 +250,7 @@ func (s *Store) GetIfChanged(ctx context.Context, key, etag string) ([]byte, str
 	if err != nil || unchanged {
 		return data, tag, unchanged, err
 	}
-	plain, err := s.open(ctx, "get-if-changed", key, data, dek)
+	plain, err := s.open(ctx, "get-if-changed", key, data, aead)
 	if err != nil {
 		return nil, "", false, err
 	}

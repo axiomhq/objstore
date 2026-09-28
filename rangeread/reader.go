@@ -13,7 +13,8 @@ import (
 // Reader reads immutable objects by byte range on top of the object cache:
 // it plans and coalesces the ranged GETs of one read stage (FetchRanges)
 // and counts the physical range work. The cache remembers what it reads and
-// does not know it exists. Use New: the zero Reader is not usable.
+// does not know it exists. Use New: the zero Reader is not usable, and its
+// Fetch, Prefetch and FetchRanges methods panic.
 type Reader struct {
 	IO      Counters
 	store   *objstore.Store

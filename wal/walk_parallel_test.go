@@ -299,8 +299,8 @@ func decodeSynthetic(b []byte) (Header, int, error) {
 
 // TestWalkParallelBoundsRetainedBytes: with the visitor stalled on the
 // first page, a walk holds the pages whose permits fill the pool and at
-// most window = workers more fetched pages waiting for one; that is, what
-// it retains is at most the pool plus window × maxPageBytes.
+// most `workers` more fetched pages waiting for one; that is, what it
+// retains is at most the pool plus workers × maxPageBytes.
 func TestWalkParallelBoundsRetainedBytes(t *testing.T) {
 	const workers = 8
 	const size = 4 << 20                                   // wire bytes; a permit is 4x
@@ -332,7 +332,7 @@ func TestWalkParallelBoundsRetainedBytes(t *testing.T) {
 		last = n
 	}
 	if got, bound := pages.gets.Load(), permitted+workers; got > bound {
-		t.Fatalf("%d pages fetched with the visitor stalled on the first; want at most %d (pool %d + window %d)", got, bound, permitted, workers)
+		t.Fatalf("%d pages fetched with the visitor stalled on the first; want at most %d (pool %d + workers %d)", got, bound, permitted, workers)
 	}
 	close(resume)
 	cancel()
@@ -341,8 +341,8 @@ func TestWalkParallelBoundsRetainedBytes(t *testing.T) {
 	}
 }
 
-// TestWalkParallelTailCost: an unbounded walk spends at most window (=
-// workers) not-found GETs past the end of the log, even when those GETs
+// TestWalkParallelTailCost: an unbounded walk spends at most `workers`
+// not-found GETs past the end of the log, even when those GETs
 // are slow enough for every worker to start one.
 func TestWalkParallelTailCost(t *testing.T) {
 	const workers = 8

@@ -505,7 +505,7 @@ func TestFaultPauseRearm(t *testing.T) {
 	}
 }
 
-// TestFaultyDrainWaitsForResumedWrite: M3. Faulty's cleanup waits for a
+// TestFaultyDrainWaitsForResumedWrite: Faulty's cleanup waits for a
 // resumed write to finish at the backend, not just to leave the pause.
 func TestFaultyDrainWaitsForResumedWrite(t *testing.T) {
 	inner, slow := storetest.NewFault(bucket.New(t))
@@ -517,13 +517,11 @@ func TestFaultyDrainWaitsForResumedWrite(t *testing.T) {
 		go func() { done <- s.Put(context.Background(), "drain", []byte("x")) }()
 		waitFor(t, func() bool { return f.Fired() != 0 })
 	}) // cleanup: Resume, then drain
-	select {
-	case err := <-done:
-		if err != nil {
-			t.Fatal(err)
-		}
-	default:
+	if slow.WriteKeys()["drain"] != 1 {
 		t.Fatal("Faulty's cleanup returned while the resumed Put was still in flight")
+	}
+	if err := await(t, done, "resumed Put"); err != nil {
+		t.Fatal(err)
 	}
 }
 

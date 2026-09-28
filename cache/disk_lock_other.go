@@ -8,9 +8,10 @@ import "os"
 // from a stale one, so NewDisk removes nothing.
 const sweepable = false
 
-// deleteOpenFiles: nothing observes the lock, so holding it while removing
-// the directory costs nothing.
-const deleteOpenFiles = true
+// deleteOpenFiles is false: whether an open file can be removed is not
+// known here, and closing the lock first is safe, since nothing sweeps
+// (sweepable is false) and so nothing can take the lock in between.
+const deleteOpenFiles = false
 
 // lockFile creates path and reports it held; nothing else can observe it.
 func lockFile(path string) (*os.File, bool, error) {

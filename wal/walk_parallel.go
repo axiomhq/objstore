@@ -22,7 +22,7 @@ type parallelPage[T any] struct {
 	err    error
 	eof    bool
 	bytes  int64
-	// gate closes when the page workers places before this one holds its
+	// gate closes when the page `workers` positions earlier holds its
 	// byte permit (or has none to take): only then may this page's GET
 	// start, so at most workers fetched pages wait for a permit.
 	gate <-chan struct{}
@@ -44,15 +44,15 @@ type parallelPage[T any] struct {
 // budget) from a 64 MiB pool, and keeps it until visited; a page whose
 // permit would exceed the pool takes all of it and proceeds alone, so the
 // pool holds at most max(64 MiB, 4× the largest page). A page's GET starts
-// only once the page workers places before it holds its permit, so at most
-// workers fetched pages hold raw bytes outside the pool. With pages at most
-// maxPageBytes (65 MiB) on the wire, what a walk retains is at most
+// only once the page `workers` positions earlier holds its permit, so at
+// most `workers` fetched pages hold raw bytes outside the pool. With pages
+// at most maxPageBytes (65 MiB) on the wire, what a walk retains is at most
 // max(64 MiB, 4× the largest page) + workers × 65 MiB, and a slow consumer
 // holds the walk there. Up to workers GETs are in flight.
 //
 // An unbounded walk issues at most workers not-found GETs past the end of
-// the log: a page whose predecessor workers places back found the end
-// skips its GET.
+// the log: a page skips its GET when the page `workers` positions earlier
+// found the end.
 func WalkParallel[T any](ctx context.Context, s *objstore.Store, prefix string, after, through uint64, workers int,
 	decode func([]byte) (Header, T, error), prep func(h Header, key string, body *T) error, visit func(Entry[T]) error) error {
 	return WalkParallelWithGet(ctx, s.Get, prefix, after, through, workers, decode, prep, visit)
@@ -75,7 +75,7 @@ func WalkParallelWithGet[T any](ctx context.Context, get func(context.Context, s
 	bytes := semaphore.NewWeighted(maxInFlightBytes)
 	// end is the lowest sequence known to end the walk (not found, or
 	// failed); pages past it skip their GET. Set before the page's permitted
-	// closes, so the page workers places later, which waits on that, sees it.
+	// closes, so the page `workers` positions later, which waits on that, sees it.
 	var end atomic.Uint64
 	end.Store(math.MaxUint64)
 	ctx, cancel := context.WithCancel(ctx)

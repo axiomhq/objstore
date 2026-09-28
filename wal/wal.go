@@ -117,9 +117,9 @@ type coalescer[T any] struct {
 
 func (c *coalescer[T]) add(h Header, key string, body T) error {
 	if len(c.batch) != 0 && h.BatchIndex == 0 {
-		// A new entry after a batch that never finished: the writer
-		// abandoned it (a terminal failure after some pages landed, or a
-		// crash) and moved on.
+		// A new entry after a batch that never finished: a terminal failure
+		// after some pages landed finished that writer (or it crashed), and
+		// a replacement writer moved on past the partial batch.
 		if err := c.visit(marker(c.batch[len(c.batch)-1], false)); err != nil {
 			return err
 		}

@@ -474,7 +474,7 @@ func TestInvalidLoadIsErrInvalidExtent(t *testing.T) {
 	if _, err := r.FetchRanges(t.Context(), reused); !errors.Is(err, ErrInvalidExtent) {
 		t.Fatalf("Key reused with a different extent: %v, want ErrInvalidExtent", err)
 	}
-	// L8: same Key and extent, but a different retention or decoded size.
+	// Same Key and extent, but a different retention or decoded size.
 	base := Load{Extent: Extent{Object: "o", Offset: 0, Length: 1}, Key: "k"}
 	transient, decoded := base, base
 	transient.Transient = true
@@ -486,7 +486,7 @@ func TestInvalidLoadIsErrInvalidExtent(t *testing.T) {
 	}
 }
 
-// TestInvalidLoadAfterOverBudget: L1. An invalid load is an error even
+// TestInvalidLoadAfterOverBudget: An invalid load is an error even
 // after an earlier load already put the stage over budget.
 func TestInvalidLoadAfterOverBudget(t *testing.T) {
 	s := bucket.New(t)
@@ -528,14 +528,6 @@ func TestDedupSameKeySameExtent(t *testing.T) {
 	}
 	if n := fault.Ops()[storetest.OpGetRange]; n != 1 {
 		t.Fatalf("duplicate load made %d range GETs, want 1", n)
-	}
-}
-
-func TestZeroReaderIsAnError(t *testing.T) {
-	var r Reader
-	load := Load{Extent: Extent{Object: "o", Offset: 0, Length: 1}, Key: "k"}
-	if _, err := r.FetchRanges(t.Context(), []Load{load}); err == nil {
-		t.Fatal("zero Reader ran FetchRanges")
 	}
 }
 

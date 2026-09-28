@@ -179,18 +179,29 @@ func sweepStale(root string) error {
 }
 
 // removeHome removes a Disk directory whose lock the caller holds, and
-// releases the lock. Where open files can be unlinked the directory goes
-// first, lock file included, so no one can lock a half-removed directory.
-// Where they cannot (Windows), everything but the lock file goes under the
-// lock; then the lock is released and the lock file and directory are
-// removed. A Disk that took the lock in between keeps both: its lock file
-// is open, so neither can go.
+// releases the lock. Where open files can be unlinked, the directory goes
+// first, lock file included, and the lock is released after. A creator can
+// still open the lock file before it is unlinked and lock it once released;
+// what keeps it from living in a removed directory is lockedHome's
+// SameFile check, which rejects a lock on a file no longer at the lock
+// path. Where open files cannot be unlinked, see removeHomeClosingLockFirst.
 func removeHome(home string, lock *os.File) error {
-	if deleteOpenFiles {
-		err := os.RemoveAll(home)
-		lock.Close()
-		return err
+	if !deleteOpenFiles {
+		return removeHomeClosingLockFirst(home, lock)
 	}
+	err := os.RemoveAll(home)
+	lock.Close()
+	return err
+}
+
+// removeHomeClosingLockFirst is removeHome where an open file cannot be
+// removed (Windows): everything but the lock file goes under the lock; then
+// the lock is released and the lock file and directory are removed. A Disk
+// that took the lock in between (and passed lockedHome's SameFile check,
+// the lock file still being there) keeps both: its lock file is open, so
+// neither can go. Unsafe where open files can be unlinked, since that Disk
+// would lose its lock file and, with it, its directory.
+func removeHomeClosingLockFirst(home string, lock *os.File) error {
 	entries, err := os.ReadDir(home)
 	for _, e := range entries {
 		if e.Name() != lockName {

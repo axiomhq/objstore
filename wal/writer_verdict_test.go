@@ -198,8 +198,8 @@ func TestLostRaceLatches(t *testing.T) {
 			t.Fatalf("append: %v, want ErrLostRace", err)
 		}
 		f.ResetOps()
-		if err := w.Append(ctx, rows("again")); !errors.Is(err, ErrWriterFailed) || errors.Is(err, ErrLostRace) {
-			t.Fatalf("append after losing: %v, want ErrWriterFailed", err)
+		if err := w.Append(ctx, rows("again")); !errors.Is(err, ErrWriterFailed) || errors.Is(err, ErrLostRace) || !strings.Contains(err.Error(), "split brain") {
+			t.Fatalf("append after losing: %v, want ErrWriterFailed naming the split brain", err)
 		}
 		if ops := f.Ops(); len(ops) != 0 {
 			t.Fatalf("a latched writer touched the store: %v", ops)
@@ -224,10 +224,10 @@ func TestLostRaceLatches(t *testing.T) {
 		if err := <-first; !errors.Is(err, ErrLostRace) {
 			t.Fatalf("losing batch: %v", err)
 		}
-		if err := <-queued; !errors.Is(err, ErrWriterFailed) || errors.Is(err, ErrLostRace) {
-			t.Fatalf("queued behind the losing batch: %v, want ErrWriterFailed", err)
+		if err := <-queued; !errors.Is(err, ErrWriterFailed) || errors.Is(err, ErrLostRace) || !strings.Contains(err.Error(), "split brain") {
+			t.Fatalf("queued behind the losing batch: %v, want ErrWriterFailed naming the split brain", err)
 		}
-		if st := w.Stats(); !st.Lost || st.LostRace != 1 || st.Pending != 0 {
+		if st := w.Stats(); !st.Lost || st.LostRace != 1 || st.Pending != 0 || st.Unresolved != 0 {
 			t.Fatalf("stats: %+v", st)
 		}
 	})
@@ -434,8 +434,14 @@ func TestStatsDuringDroppedRecordCommit(t *testing.T) {
 			}
 		}
 	})
-	for w.Stats().Rejected == 0 { // a probe was refused against the wedged batch
-		time.Sleep(time.Millisecond)
+	// A probe is refused against the wedged batch.
+	for deadline := time.Now().Add(10 * time.Second); w.Stats().Rejected == 0; time.Sleep(time.Millisecond) {
+		if time.Now().After(deadline) {
+			close(stop)
+			wg.Wait()
+			release()
+			t.Fatal("no probe was refused against the wedged batch")
+		}
 	}
 	release()
 	errFirst, errGood, errBad := <-first, <-good, <-bad

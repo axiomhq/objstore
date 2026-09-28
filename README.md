@@ -99,7 +99,7 @@ file store fills every Call; S3 and GCS fill only the write gate.
 | `ErrInvalidRecord` | negative `Size`, or `AppendTo` failed or disagreed with `Size`; only that Append fails |
 | `ErrLostRace` | another writer took the sequence (split brain). Finishes the writer |
 | `ErrUnresolved` | the outcome is unknown; the records may be durable. Reopen from your checkpoint and the log. From a commit (covered floor, corrupt page) it finishes the writer |
-| `ErrWriterFailed` | the writer had already finished; these records were not written. Open a new writer from the checkpoint |
+| `ErrWriterFailed` | the writer already finished (`Stats().Terminal` says why); nothing written; reopen from your checkpoint |
 | `ErrCorrupt` | a page failed its checksum or framing, or a page is missing inside a bounded walk |
 
 A finished writer never writes again: `w.Stats().Terminal` says why, and
@@ -151,6 +151,7 @@ directory and removes stale ones a crashed process left under `dir`.
 Every write carries a fresh nonce, so the read-back tells "my write landed" from "someone else's did" without guessing. The holder's deadline runs on its local monotonic clock from before the PUT, so it stops acting no later than a taker may start. Same TTL across the fleet, clock error below TTL/2.
 
 - The fence callback may call `Release` or `Retire`; neither runs it or waits for it. It must not wait on `Done()`.
+- A fence before `Start` is owed to it: `Start` runs the callback on the caller's goroutine, and `Done()` stays open until it returns (or until `Release`/`Retire` gives it up). A fence after `Release` or `Retire` runs no callback.
 - `lease.Shared` shares one lease among several holders in a process by reference count; the last `Ref.Release(ctx)` hands it back.
 - `l.CheckHeadOnRenewal(fn)` runs `fn` after each renewal. It fences only when `fn`'s error wraps `ErrNotOwner`; any other error is logged and retried, never a fence, since the renewal already extended the lease.
 - A lease check cannot fence a write already in flight. Guard durable writes with their own CAS (the ETag, or a sequence), not a post-check.
@@ -169,7 +170,7 @@ Every write carries a fresh nonce, so the read-back tells "my write landed" from
 2. Turn it on: `objstore.Config{KeyProvider: p}` at open (or `s.ConfigureCMEK(p)` before first use). Every object under `ns/<name>/` of a name with a key record is now encrypted with that name's data key.
 3. Before the first write for a name, wrap a fresh `kms.DEKSize`-byte key and install it: `wrapped, ver, err := p.Wrap(ctx, keyName, dek)`, then `s.InstallNamespaceKey(ctx, name, objstore.Envelope{Mode: objstore.EncryptionCustomerManaged, KeyName: keyName, KeyVersion: ver, DEKWrapped: wrapped})`.
 4. Rotate with `s.RotateNamespaceKey(ctx, name)`. It re-wraps the data key, so no object is rewritten.
-5. Check access with `s.CheckNamespaceKey(ctx, name)`. A revoked key returns `kms.ErrKeyUnavailable`. `Delete` and `DeleteMany` never need the key, so crypto-shredding works after revocation.
+5. Check access with `s.CheckNamespaceKey(ctx, name)`. A revoked key returns `kms.ErrKeyUnavailable`; a failed read of the key record returns the storage error. `Delete` and `DeleteMany` never need the key, so crypto-shredding works after revocation.
 
 Reserved key space: `ns/<name>/` is encrypted per name and `cmek/<name>` holds
 its key record; store nothing else there. `Config.AcceptPlaintext` decides

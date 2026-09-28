@@ -24,8 +24,9 @@ import (
 
 // Backend is the file:// backend: write-once objects as files, O_EXCL-style
 // links for PutIfAbsent, temp+rename for atomic Put, striped flocks plus a
-// content hash for PutIfMatch. Dev and hermetic-CI backend; unix-only
-// (flock). Same single-writer-per-bucket contract as S3.
+// content hash for PutIfMatch. Dev and hermetic-CI backend; Unix with
+// flock only (see the package doc). Same single-writer-per-bucket
+// contract as S3.
 type Backend struct {
 	// IsolatedKeys, when set, gives the keys it reports true for a set of
 	// lock stripes of their own. A write holds its key's stripe through the

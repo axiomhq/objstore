@@ -167,7 +167,7 @@ func TestLease(t *testing.T) {
 		l.Release(ctx)
 	})
 
-	// L3: the first acquisition landed but both its answer and the
+	// The first acquisition landed but both its answer and the
 	// read-back were lost. A retried Take must adopt our own record, not
 	// wait 1.5 TTL for it as if somebody else held it.
 	t.Run("RetriedTakeAfterUnresolvedAcquire", func(t *testing.T) {
@@ -222,7 +222,7 @@ func TestLease(t *testing.T) {
 		}
 	})
 
-	// L1: a lease driven by Take has no renewer; Retire and Release must
+	// A lease driven by Take has no renewer; Retire and Release must
 	// still end it instead of waiting forever on done.
 	t.Run("NewTakeRelease", func(t *testing.T) {
 		s := bucket.New(t)
@@ -399,12 +399,15 @@ func TestSetLoggerRace(t *testing.T) {
 		l.SetLogger(slog.New(slog.NewTextHandler(&logs, nil)))
 		time.Sleep(ttl / 20)
 	}
-	await(t, l.Done(), "Done after failing renewals")
+	// No Start: the fence owes Start its callback, so only the renewer's
+	// exit is awaited here, and Done after the Release gives it up.
+	await(t, l.done, "renewer exit after failing renewals")
 	f.SetShape(storetest.Shape{})
 	if !strings.Contains(logs.String(), "lease renewal failed") {
 		t.Fatalf("no renewal failure logged:\n%s", logs.String())
 	}
 	l.Release(ctx)
+	await(t, l.Done(), "Done after Release")
 }
 
 // plant CASes body in at key over whatever is there.
@@ -479,7 +482,7 @@ func (b *lockedBuffer) String() string {
 	return b.buf.String()
 }
 
-// TestReleaseDuringRenewal: H1. A Release while a renewal PUT is in flight
+// TestReleaseDuringRenewal: A Release while a renewal PUT is in flight
 // is a deliberate stop: no fence callback, no "lease fenced" log, and the
 // handover still lands on the renewal's nonce, so the next holder takes
 // over at once.
@@ -502,7 +505,7 @@ func TestReleaseDuringRenewal(t *testing.T) {
 	waitFor(t, l.stopped)
 	f.Resume()
 	await(t, released, "Release")
-	time.Sleep(10 * time.Millisecond) // a callback goroutine would have run by now
+	await(t, l.Done(), "Done after Release") // a callback would have returned by now
 	if fenced.Load() || strings.Contains(logs.String(), "lease fenced") {
 		t.Fatalf("Release fenced the lease: callback=%v logs:\n%s", fenced.Load(), logs.String())
 	}
@@ -519,7 +522,7 @@ func TestReleaseDuringRenewal(t *testing.T) {
 	b.Release(ctx)
 }
 
-// TestReleaseDuringFirstAcquire: M1. A Release racing the first
+// TestReleaseDuringFirstAcquire: A Release racing the first
 // acquisition makes Acquire fail, not succeed on a retired handle, and
 // still hands the landed write back.
 func TestReleaseDuringFirstAcquire(t *testing.T) {
@@ -566,7 +569,7 @@ func await[T any](t *testing.T, ch <-chan T, what string) T {
 	}
 }
 
-// TestFenceCallbackDone: M1. Done waits for a running fence callback;
+// TestFenceCallbackDone: Done waits for a running fence callback;
 // Release does not.
 func TestFenceCallbackDone(t *testing.T) {
 	ctx := context.Background()
@@ -595,7 +598,78 @@ func TestFenceCallbackDone(t *testing.T) {
 	l.Fence() // after Done: no callback, no panic
 }
 
-// TestReleaseAfterUnresolvedAcquire: L4. The first write landed but its
+// TestDoneCoversStartCallback: the renewer fences and exits before Start;
+// Start runs the callback itself, and Done waits for it to return.
+func TestDoneCoversStartCallback(t *testing.T) {
+	ctx := context.Background()
+	const ttl = 200 * time.Millisecond
+	s := bucket.New(t)
+	l, err := Acquire(ctx, s, "fence/early", "owner-a", ttl)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := Steal(ctx, s, "fence/early", "owner-b", ttl); err != nil {
+		t.Fatal(err)
+	}
+	await(t, l.done, "renewer exit after the steal")
+	select {
+	case <-l.Done():
+		t.Fatal("Done closed with the fence callback still owed to Start")
+	case <-time.After(20 * time.Millisecond):
+	}
+	entered, unblock, returned := make(chan struct{}), make(chan struct{}), make(chan struct{})
+	go func() {
+		l.Start(func() { close(entered); <-unblock })
+		close(returned)
+	}()
+	await(t, entered, "Start's own callback")
+	select {
+	case <-l.Done():
+		t.Fatal("Done closed while Start's callback was still running")
+	case <-time.After(20 * time.Millisecond):
+	}
+	close(unblock)
+	await(t, returned, "Start")
+	await(t, l.Done(), "Done after Start's callback returned")
+}
+
+// TestReleaseGivesUpOwedCallback: fenced before Start, then released:
+// Done closes, and a late Start runs nothing.
+func TestReleaseGivesUpOwedCallback(t *testing.T) {
+	ctx := context.Background()
+	l := New(bucket.New(t), "fence/owed", "owner-a", time.Minute)
+	if err := l.Take(ctx); err != nil {
+		t.Fatal(err)
+	}
+	l.Fence()
+	select {
+	case <-l.Done():
+		t.Fatal("Done closed with the fence callback still owed to Start")
+	default:
+	}
+	l.Release(ctx)
+	await(t, l.Done(), "Done after Release")
+	l.Start(func() { t.Error("Start ran a callback Release gave up") })
+}
+
+// TestFenceAfterRelease: a Fence on a released lease runs no callback.
+func TestFenceAfterRelease(t *testing.T) {
+	ctx := context.Background()
+	l := New(bucket.New(t), "fence/released", "owner-a", time.Minute)
+	if err := l.Take(ctx); err != nil {
+		t.Fatal(err)
+	}
+	l.Start(func() { t.Error("a Fence after Release ran the callback") })
+	if !l.join() { // stands in for a running callback: keeps Done open
+		t.Fatal("join on a live lease")
+	}
+	l.Release(ctx)
+	l.Fence()
+	l.leave()
+	await(t, l.Done(), "Done after Release") // a callback would have returned by now
+}
+
+// TestReleaseAfterUnresolvedAcquire: The first write landed but its
 // answer and read-back were lost; Release still hands it back.
 func TestReleaseAfterUnresolvedAcquire(t *testing.T) {
 	ctx := context.Background()
@@ -611,7 +685,7 @@ func TestReleaseAfterUnresolvedAcquire(t *testing.T) {
 	}
 }
 
-// TestReleasePrefersDone: L2. With the renewer already gone, a dead ctx
+// TestReleasePrefersDone: With the renewer already gone, a dead ctx
 // is a failed handover, not "renewal still finishing".
 func TestReleasePrefersDone(t *testing.T) {
 	ctx := context.Background()

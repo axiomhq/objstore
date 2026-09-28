@@ -3,6 +3,5 @@
 // and large objects are written back in chunks so a small urgent write
 // never waits behind a big one. Unix with flock only (not Solaris or AIX;
 // illumos has it): elsewhere the package builds but every operation fails
-// with errors.ErrUnsupported. One writer
-// process per bucket, as on S3.
+// with errors.ErrUnsupported. One writer process per bucket, as on S3.
 package fs

@@ -3,6 +3,7 @@ package objstore
 import (
 	"bytes"
 	"context"
+	"crypto/cipher"
 	"crypto/rand"
 	"encoding/binary"
 	"errors"
@@ -189,7 +190,7 @@ func TestEncryptedObjectRoundTrip(t *testing.T) {
 	if bytes.Contains(raw, []byte("plaintext-data!")) {
 		t.Fatal("raw object contains plaintext")
 	}
-	if _, err := decryptObject("ns/other/seg/pack.bin", raw, dek); err == nil {
+	if _, err := decryptObject("ns/other/seg/pack.bin", raw, mustAEAD(t, dek)); err == nil {
 		t.Fatal("wrong object key accepted")
 	}
 	got, err := s.Get(ctx, key)
@@ -225,8 +226,18 @@ func TestEncryptedObjectRoundTrip(t *testing.T) {
 	}
 }
 
+// mustAEAD returns key's AES-GCM cipher.
+func mustAEAD(t testing.TB, key []byte) cipher.AEAD {
+	t.Helper()
+	aead, err := aeadForKey(key)
+	if err != nil {
+		t.Fatal(err)
+	}
+	return aead
+}
+
 func BenchmarkEncryptedObjectRoundTrip(b *testing.B) {
-	key := bytes.Repeat([]byte{0x42}, 32)
+	key := mustAEAD(b, bytes.Repeat([]byte{0x42}, 32))
 	plain := bytes.Repeat([]byte{0x55}, 1<<20)
 	const name = "ns/bench/seg/pack.bin"
 	sealed, err := encryptObject(name, plain, key)
@@ -234,6 +245,7 @@ func BenchmarkEncryptedObjectRoundTrip(b *testing.B) {
 		b.Fatal(err)
 	}
 	b.Run("encrypt", func(b *testing.B) {
+		b.ReportAllocs()
 		b.SetBytes(int64(len(plain)))
 		for b.Loop() {
 			if _, err := encryptObject(name, plain, key); err != nil {
@@ -242,6 +254,7 @@ func BenchmarkEncryptedObjectRoundTrip(b *testing.B) {
 		}
 	})
 	b.Run("decrypt", func(b *testing.B) {
+		b.ReportAllocs()
 		b.SetBytes(int64(len(plain)))
 		for b.Loop() {
 			if _, err := decryptObject(name, sealed, key); err != nil {
@@ -250,6 +263,7 @@ func BenchmarkEncryptedObjectRoundTrip(b *testing.B) {
 		}
 	})
 	b.Run("roundtrip", func(b *testing.B) {
+		b.ReportAllocs()
 		b.SetBytes(int64(len(plain)))
 		for b.Loop() {
 			sealed, err := encryptObject(name, plain, key)
@@ -502,7 +516,7 @@ func TestPlaintextNamespaceNegativeCache(t *testing.T) {
 			return err
 		},
 	} {
-		s.crypt().remember("put", nil, "", time.Hour) // a stale "no record"
+		s.crypt().remember("put", cachedKey{}, time.Hour) // a stale "no record"
 		key := fmt.Sprintf("ns/put/%d", i)
 		if err := put(key); err != nil {
 			t.Fatal(err)
@@ -614,9 +628,10 @@ func TestKeyLookupCancelDoesNotPoisonNamespace(t *testing.T) {
 	b.failNext = context.DeadlineExceeded
 	b.mu.Unlock()
 	// The caller's own ctx is fine: the lookup's timeout must not read as
-	// context.DeadlineExceeded to it.
+	// context.DeadlineExceeded to it. A record read is the store's failure,
+	// not the key's.
 	timedOut := func(err error) bool {
-		return !errors.Is(err, context.DeadlineExceeded) && errors.Is(err, kms.ErrKeyUnavailable) &&
+		return !errors.Is(err, context.DeadlineExceeded) && !errors.Is(err, kms.ErrKeyUnavailable) &&
 			strings.Contains(err.Error(), "key lookup timed out after") && strings.Contains(err.Error(), `namespace "test"`)
 	}
 	if _, err := s.Get(ctx, "ns/test/obj"); !timedOut(err) {
@@ -806,18 +821,17 @@ func TestKeyRefreshIntervalAndInstallErrors(t *testing.T) {
 	if got := noProvider.crypt().refreshInterval(); got != time.Minute {
 		t.Fatalf("Config.KeyRefreshInterval without a provider: %v", got)
 	}
-	// Set before ConfigureCMEK, on an Open store and on a zero Store.
-	for _, before := range []*Store{newMemStore(), {b: newMemBackend()}} {
-		before.SetCMEKRefreshInterval(2 * time.Minute)
-		before.ConfigureCMEK(p)
-		if got := before.crypt().refreshInterval(); got != 2*time.Minute {
-			t.Fatalf("SetCMEKRefreshInterval before ConfigureCMEK: %v", got)
-		}
-		// And after it.
-		before.SetCMEKRefreshInterval(3 * time.Minute)
-		if got := before.crypt().refreshInterval(); got != 3*time.Minute {
-			t.Fatalf("SetCMEKRefreshInterval after ConfigureCMEK: %v", got)
-		}
+	// Set before ConfigureCMEK.
+	before := newMemStore()
+	before.SetCMEKRefreshInterval(2 * time.Minute)
+	before.ConfigureCMEK(p)
+	if got := before.crypt().refreshInterval(); got != 2*time.Minute {
+		t.Fatalf("SetCMEKRefreshInterval before ConfigureCMEK: %v", got)
+	}
+	// And after it.
+	before.SetCMEKRefreshInterval(3 * time.Minute)
+	if got := before.crypt().refreshInterval(); got != 3*time.Minute {
+		t.Fatalf("SetCMEKRefreshInterval after ConfigureCMEK: %v", got)
 	}
 	if err := s.InstallNamespaceKey(ctx, "test", Envelope{Mode: EncryptionCustomerManaged}); !errors.Is(err, ErrInvalidEnvelope) {
 		t.Fatalf("invalid envelope: %v", err)
@@ -838,7 +852,8 @@ func TestKeyRefreshIntervalAndInstallErrors(t *testing.T) {
 // TestStaleLookupAfterRemoteInstall: open's header-triggered re-lookup
 // never joins a lookup that read "no record" before another process
 // installed the key, so a whole-object read returns plaintext, not
-// ciphertext, and the stale answer is not cached.
+// ciphertext. The stale answer may be cached (open does not move the
+// epoch); reads still re-check it and writes do not trust it.
 func TestStaleLookupAfterRemoteInstall(t *testing.T) {
 	ctx := context.Background()
 	b := &stallRecordGet{Backend: newMemBackend(), name: "late", read: make(chan struct{}), release: make(chan struct{})}
@@ -873,8 +888,46 @@ func TestStaleLookupAfterRemoteInstall(t *testing.T) {
 	if err := <-stale; err != nil && !errors.Is(err, ErrNotFound) {
 		t.Fatal(err)
 	}
+	if got, err := s.Get(ctx, "ns/late/obj"); err != nil || string(got) != "secret" {
+		t.Fatalf("get after the stale lookup finished: %q %v", got, err)
+	}
+	if err := s.Put(ctx, "ns/late/mine", []byte("secret")); err != nil {
+		t.Fatal(err)
+	}
+	if raw, _ := b.Backend.Get(ctx, "ns/late/mine"); !looksEncrypted(raw) {
+		t.Fatalf("write after the stale lookup finished stored plaintext: %q", raw)
+	}
+}
+
+// TestOpenRecheckKeepsEpoch: a whole-object read that finds ciphertext
+// under a cached "no record" re-reads the key without moving the
+// store-wide epoch, so lookups of other names keep caching.
+func TestOpenRecheckKeepsEpoch(t *testing.T) {
+	ctx := context.Background()
+	b := newMemBackend()
+	p := &testKeyProvider{}
+	s := Open(b, Config{KeyProvider: p})
+	fakeClock(s)
+	if _, err := s.Get(ctx, "ns/late/missing"); !errors.Is(err, ErrNotFound) {
+		t.Fatalf("priming: %v", err)
+	}
+	other := Open(b, Config{KeyProvider: p})
+	wrapped, version, _ := p.Wrap(ctx, "k", bytes.Repeat([]byte{6}, 32))
+	if err := other.InstallNamespaceKey(ctx, "late", Envelope{Mode: EncryptionCustomerManaged, KeyName: "k", KeyVersion: version, DEKWrapped: wrapped}); err != nil {
+		t.Fatal(err)
+	}
+	if err := other.Put(ctx, "ns/late/obj", []byte("secret")); err != nil {
+		t.Fatal(err)
+	}
+	epoch := s.crypt().currentEpoch()
+	if got, err := s.Get(ctx, "ns/late/obj"); err != nil || string(got) != "secret" {
+		t.Fatalf("get under a stale negative cache: %q %v", got, err)
+	}
+	if got := s.crypt().currentEpoch(); got != epoch {
+		t.Fatalf("epoch moved from %d to %d", epoch, got)
+	}
 	if k, ok := s.crypt().cached("late"); !ok || k.key == nil {
-		t.Fatalf("after the stale lookup finished: cached=%v key=%v", ok, k.key != nil)
+		t.Fatal("re-read key not cached")
 	}
 }
 
@@ -894,6 +947,9 @@ func TestEmptyObjectAuthenticated(t *testing.T) {
 	if got, err := s.Get(ctx, key); err != nil || len(got) != 0 {
 		t.Fatalf("empty round trip: %q %v", got, err)
 	}
+	if _, err := s.GetRange(ctx, key, 0, 1); !errors.Is(err, ErrRange) {
+		t.Fatalf("range of an empty object: %v", err)
+	}
 
 	tampered := bytes.Clone(raw)
 	tampered[len(tampered)-1] ^= 1
@@ -909,7 +965,7 @@ func TestEmptyObjectAuthenticated(t *testing.T) {
 		b.Put(ctx, key, forged)
 		if got, err := s.Get(ctx, key); err == nil {
 			t.Fatalf("forged v%d header read as %q", version, got)
-		} else if version == encryptedV1 && !errors.Is(err, errLegacyEmpty) {
+		} else if version == encryptedV1 && !errors.Is(err, ErrLegacyEmptyObject) {
 			t.Fatalf("forged v1 header: %v", err)
 		}
 	}
@@ -932,6 +988,15 @@ func TestLegacyV1ObjectDecrypts(t *testing.T) {
 	if got, err := s.GetRange(ctx, key, 65530, 20); err != nil || !bytes.Equal(got, plain[65530:65550]) {
 		t.Fatalf("v1 range: %v", err)
 	}
+	// The version byte is authenticated: a v1 body relabelled v2 fails.
+	relabelled := encryptV1(t, key, plain, dek)
+	relabelled[4] = encryptedV2
+	if err := b.Put(ctx, key, relabelled); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := s.Get(ctx, key); err == nil || !strings.Contains(err.Error(), "authentication failed") {
+		t.Fatalf("v1 body under a v2 header: %v", err)
+	}
 }
 
 // encryptV1 seals plain the way format v1 did: version byte 1, and no
@@ -949,11 +1014,12 @@ func encryptV1(t *testing.T, object string, plain, key []byte) []byte {
 	if _, err := rand.Read(out[13:25]); err != nil {
 		t.Fatal(err)
 	}
+	aad := blockAAD(object, out[:encryptedHeaderSize])
+	nonce := make([]byte, 12)
 	for i := 0; i*encryptedBlockSize < len(plain); i++ {
 		start := i * encryptedBlockSize
 		end := min(start+encryptedBlockSize, len(plain))
-		nonce := blockNonce(out[13:25], uint64(i))
-		out = aead.Seal(out, nonce[:], plain[start:end], blockAAD(object, out[:encryptedHeaderSize], uint64(i)))
+		out = aead.Seal(out, blockNonce(nonce, out[13:25], uint64(i)), plain[start:end], setBlock(aad, uint64(i)))
 	}
 	return out
 }
@@ -967,17 +1033,18 @@ func TestKeyBackoffs(t *testing.T) {
 	p := &gateProvider{}
 	s, b, clk := encryptedStore(t, p)
 	c := s.crypt()
-	for range 3 {
-		c.forget("test")
+	c.forget("test")
+	for i := range 3 {
 		b.mu.Lock()
 		b.failNext = errors.New("503")
 		b.mu.Unlock()
-		if _, err := s.Get(ctx, "ns/test/x"); !errors.Is(err, kms.ErrKeyUnavailable) {
-			t.Fatalf("record read failure: %v", err)
+		if _, err := s.Get(ctx, "ns/test/x"); err == nil || errors.Is(err, kms.ErrKeyUnavailable) {
+			t.Fatalf("record read failure %d: %v", i, err)
 		}
-		if f := c.failures["test"]; f.next.Sub(clk.now()) != minKeyBackoff {
-			t.Fatalf("record read backoff: %v", f.next.Sub(clk.now()))
+		if got := c.failures["test"].next.Sub(clk.now()); got != minKeyBackoff {
+			t.Fatalf("record read backoff %d: %v, want %v", i, got, minKeyBackoff)
 		}
+		clk.advance(minKeyBackoff)
 	}
 
 	c.forget("test")
@@ -1024,11 +1091,91 @@ func TestKeyCacheSweep(t *testing.T) {
 	clk := fakeClock(s)
 	c := s.crypt()
 	for i := range keySweepAt {
-		c.remember(fmt.Sprint("old", i), nil, "", time.Second)
+		c.remember(fmt.Sprint("old", i), cachedKey{}, time.Second)
 	}
 	clk.advance(2 * time.Second)
-	c.remember("fresh", nil, "", time.Second)
+	c.remember("fresh", cachedKey{}, time.Second)
 	if n := len(c.keys); n != 1 {
 		t.Fatalf("after the sweep: %d names cached, want 1", n)
+	}
+}
+
+// TestUrgentLookupSkipsPacedFlight: an Urgent caller does not join a key
+// lookup a bulk caller started, whose requests wait for the pacer.
+func TestUrgentLookupSkipsPacedFlight(t *testing.T) {
+	ctx := context.Background()
+	b := &stallRecordGet{Backend: newMemBackend(), name: "test", read: make(chan struct{}), release: make(chan struct{})}
+	p := &testKeyProvider{}
+	s := Open(b, Config{KeyProvider: p, RequestsPerSecond: 0.5})
+	wrapped, version, _ := p.Wrap(ctx, "k", bytes.Repeat([]byte{8}, 32))
+	if err := s.InstallNamespaceKey(Urgent(ctx), "test", Envelope{Mode: EncryptionCustomerManaged, KeyName: "k", KeyVersion: version, DEKWrapped: wrapped}); err != nil {
+		t.Fatal(err)
+	}
+	// A bulk read starts the lookup: its record GET takes the pacer's only
+	// slot and stalls.
+	b.armed.Store(true)
+	bctx, cancel := context.WithCancel(ctx)
+	defer cancel()
+	bulk := make(chan error, 1)
+	go func() { _, err := s.Get(bctx, "ns/test/obj"); bulk <- err }()
+	<-b.read
+	var once sync.Once
+	release := func() { once.Do(func() { close(b.release) }) }
+	t.Cleanup(release)
+
+	uctx, ucancel := context.WithTimeout(Urgent(ctx), 2*time.Second)
+	defer ucancel()
+	if err := s.Put(uctx, "ns/test/obj", []byte("v")); err != nil {
+		t.Fatalf("urgent put behind a paced lookup: %v", err)
+	}
+	if raw, _ := b.Backend.Get(ctx, "ns/test/obj"); !looksEncrypted(raw) {
+		t.Fatalf("urgent put stored plaintext: %q", raw)
+	}
+	cancel()
+	release()
+	if err := <-bulk; !errors.Is(err, context.Canceled) {
+		t.Fatalf("bulk get: %v", err)
+	}
+}
+
+// TestStorageFailureKeepsKey: a failed or unparseable key-record read is
+// the store's failure: it backs off, names the namespace, is not
+// kms.ErrKeyUnavailable, and leaves a still-valid cached key in use.
+func TestStorageFailureKeepsKey(t *testing.T) {
+	ctx := context.Background()
+	s, b, _ := encryptedStore(t, &testKeyProvider{})
+	if err := s.Put(ctx, "ns/test/obj", []byte("v")); err != nil {
+		t.Fatal(err)
+	}
+	cause := errors.New("503")
+	b.mu.Lock()
+	b.failNext = cause
+	b.mu.Unlock()
+	storage := func(err error) bool {
+		return errors.Is(err, cause) && !errors.Is(err, kms.ErrKeyUnavailable) && strings.Contains(err.Error(), `namespace "test"`)
+	}
+	if err := s.CheckNamespaceKey(ctx, "test"); !storage(err) {
+		t.Fatalf("record read failure: %v", err)
+	}
+	if err := s.CheckNamespaceKey(ctx, "test"); !storage(err) || !strings.Contains(err.Error(), "backing off") {
+		t.Fatalf("inside the backoff: %v", err)
+	}
+	if k, ok := s.crypt().cached("test"); !ok || k.key == nil {
+		t.Fatal("record read failure dropped the cached key")
+	}
+	if got, err := s.Get(ctx, "ns/test/obj"); err != nil || string(got) != "v" {
+		t.Fatalf("get with the cached key: %q %v", got, err)
+	}
+
+	s.crypt().forget("test")
+	if err := b.Backend.Put(ctx, keyRecordPrefix+"test", []byte("{")); err != nil {
+		t.Fatal(err)
+	}
+	_, err := s.Get(ctx, "ns/test/obj")
+	if err == nil || errors.Is(err, kms.ErrKeyUnavailable) || !strings.Contains(err.Error(), `namespace "test": invalid key record`) {
+		t.Fatalf("bad record: %v", err)
+	}
+	if err := s.crypt().retryReady("test"); err == nil {
+		t.Fatal("bad record opened no backoff")
 	}
 }

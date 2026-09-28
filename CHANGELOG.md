@@ -7,8 +7,8 @@
 **Encrypted object format**
 
 - Every encrypted object is now written with header version 2. A non-empty v2 object has the v1 layout except the version byte; an empty v2 object carries a GCM tag (41 bytes, was 25).
-- Readers older than v0.5.0 cannot read v2 objects: they fail with `invalid encrypted object header`. Roll out v0.5.0 readers everywhere before any v0.5.0 writer; do not run a mixed fleet.
-- v0.5.0 reads v1 non-empty objects unchanged, but rejects a v1 empty object (`legacy (format v1) empty encrypted object has no authentication tag; rewrite it`). Rewrite (Put the empty value again) or delete every v1 empty object. Only a v0.5.0 writer produces the v2 form.
+- Readers older than v0.5.0 cannot read v2 objects: they fail with `invalid encrypted object header`. Worse, an old reader holding a stale cached "no key record" for a namespace treats v2 ciphertext as plaintext and returns it. Roll out v0.5.0 readers everywhere before any v0.5.0 writer; do not run a mixed fleet.
+- v0.5.0 reads v1 non-empty objects unchanged, but rejects a v1 empty object with an error wrapping `objstore.ErrLegacyEmptyObject`. Such objects are 25 bytes, starting `DWEK` and version byte 1. Rewrite (Put the empty value again) or delete every one. Only a v0.5.0 writer produces the v2 form.
 
 **objstore**
 
@@ -81,7 +81,8 @@
 ### Fixed
 
 - objstore: a cancelled caller no longer opens a namespace's KMS backoff or reports `kms.ErrKeyUnavailable`.
-- objstore: concurrent cold key lookups of one namespace share one record GET and one Unwrap.
+- objstore: concurrent cold key lookups of one namespace share one record GET and one Unwrap. `Urgent` callers share a lookup of their own, so they never wait behind the pacer.
+- objstore: a failed or unparseable key-record read is a storage error, not `kms.ErrKeyUnavailable`, and keeps a still-valid cached key.
 - objstore: `Delete` and `DeleteMany` no longer need the namespace key; crypto-shredding works after revocation.
 - objstore: a cached "no key record" is trusted only by whole-object reads, so another process installing a key cannot make this one write plaintext or return ciphertext.
 - objstore: a lookup that began before an Install or Retire cannot cache its stale answer.
@@ -127,7 +128,7 @@
 ### Added
 
 - Packages `fs`, `s3`, `gcs` (Google Cloud Storage), `kms/awskms`, `kms/gcpkms`, `storetest/bucket`.
-- objstore: `Open`, `OpErr`, `IsUrgent`, `TimingsOf`, `Timings.Since`, `Call.String`, `ErrConflict`, `ErrInvalidKey`, `ErrInvalidEnvelope`, `ErrKeyRecordExists`.
+- objstore: `Open`, `OpErr`, `IsUrgent`, `TimingsOf`, `Timings.Since`, `Call.String`, `ErrConflict`, `ErrInvalidKey`, `ErrInvalidEnvelope`, `ErrKeyRecordExists`, `ErrLegacyEmptyObject`.
 - objstore: `Config.KeyProvider`, `Config.KeyRefreshInterval`, `Config.AcceptPlaintext`, `DefaultAcceptPlaintext`.
 - kms: `DEKSize`, `CheckDEK`, `LeaseCadencer`; `awskms.Scheme` (`aws:`), `gcpkms.Scheme` (`gcp:`).
 - wal: `ErrRecordTooLarge`, `ErrInvalidRecord`, `ErrWriterFailed`, `Stats.Lost`, `Stats.Terminal`, `WalkParallelWithGet`. `WriteError` implements `error` and `Unwrap`.

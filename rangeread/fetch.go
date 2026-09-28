@@ -3,7 +3,6 @@ package rangeread
 import (
 	"bytes"
 	"context"
-	"errors"
 	"fmt"
 	"runtime/debug"
 	"slices"
@@ -51,9 +50,6 @@ type Load struct {
 // one Key given two different loads is ErrInvalidExtent, whatever the
 // budget; a range the store returns at the wrong length is ErrCorrupt.
 func (r *Reader) FetchRanges(ctx context.Context, loads []Load) (context.Context, error) {
-	if r.memory == nil {
-		return ctx, errors.New("rangeread: Reader not built with New")
-	}
 	if err := ctx.Err(); err != nil {
 		return ctx, err
 	}

@@ -184,6 +184,10 @@ func Conformance(t *testing.T, s *objstore.Store) {
 		reads := map[string]func() ([]byte, error){
 			"Get":      func() ([]byte, error) { return raw.Get(cancelled, obj) },
 			"GetRange": func() ([]byte, error) { return raw.GetRange(cancelled, obj, 0, 1) },
+			"GetWithETag": func() ([]byte, error) {
+				data, _, err := raw.GetWithETag(cancelled, obj)
+				return data, err
+			},
 			"GetIfChanged": func() ([]byte, error) {
 				data, _, _, err := raw.GetIfChanged(cancelled, obj, "")
 				return data, err
@@ -192,6 +196,13 @@ func Conformance(t *testing.T, s *objstore.Store) {
 				keys, _, err := raw.ListPage(cancelled, "cancelled/", "", 10)
 				if keys != nil {
 					return []byte(strings.Join(keys, ",")), err
+				}
+				return nil, err
+			},
+			"ListPrefixesPage": func() ([]byte, error) {
+				prefixes, _, err := raw.ListPrefixesPage(cancelled, "cancelled/", "", 10)
+				if prefixes != nil {
+					return []byte(strings.Join(prefixes, ",")), err
 				}
 				return nil, err
 			},
@@ -228,11 +239,17 @@ func Conformance(t *testing.T, s *objstore.Store) {
 				t.Errorf("%s under a cancelled ctx landed", name)
 			}
 		}
-		if err := raw.Delete(cancelled, obj); !errors.Is(err, context.Canceled) {
-			t.Errorf("Delete under a cancelled ctx: %v, want context.Canceled", err)
+		deletes := map[string]func() error{
+			"Delete":     func() error { return raw.Delete(cancelled, obj) },
+			"DeleteMany": func() error { return raw.DeleteMany(cancelled, obj) },
 		}
-		if _, tag, err := s.GetWithETag(ctx, obj); err != nil || tag != etag {
-			t.Errorf("Delete under a cancelled ctx landed: %q %v", tag, err)
+		for name, del := range deletes {
+			if err := del(); !errors.Is(err, context.Canceled) {
+				t.Errorf("%s under a cancelled ctx: %v, want context.Canceled", name, err)
+			}
+			if _, tag, err := s.GetWithETag(ctx, obj); err != nil || tag != etag {
+				t.Errorf("%s under a cancelled ctx landed: %q %v", name, tag, err)
+			}
 		}
 	})
 	// The delimited listing discovery runs on: one entry per child prefix,
