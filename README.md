@@ -79,6 +79,7 @@ them. See [CHANGELOG.md](CHANGELOG.md) for the rest.
 | `Delete(ctx, key)` | delete one key; never needs the namespace key |
 | `DeleteMany(ctx, keys...)` | batch delete |
 | `EnsureBucket(ctx)`, `DropBucket(ctx)` | create or remove the bucket |
+| `ID()` | the bucket's identity (`file://dir`, `endpoint/bucket`, `gs://bucket`): equal for every Store over one bucket, so a process can key caches by bucket |
 | `CheckConditionalWrites(ctx)` | prove the store honours If-None-Match (3 requests under `_probe/`); call once before writing |
 
 `ctx = objstore.WithTimings(ctx, &t)` has the store add the wall time and

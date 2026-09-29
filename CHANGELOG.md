@@ -1,5 +1,9 @@
 # Changelog
 
+## v0.6.0
+
+- `Store.ID()` names the bucket: `file://<dir>` (fs), `<endpoint>/<bucket>` or `s3://<bucket>` (S3), `gs://<bucket>` (GCS). Stores opened apart over one bucket, and Stores from `WithBackend` or pacing, share it. A `Backend` passed to `objstore.Open` may implement `ID() string`; one that does not gets a random ID per `Open`.
+
 ## v0.5.0
 
 ### Breaking changes

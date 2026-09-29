@@ -77,21 +77,31 @@ type Store struct {
 	// writes bounds non-urgent object writes and deletes in flight; see
 	// Config.MaxInflightWrites. nil means unbounded.
 	writes *semaphore.Weighted
+	// id names the bucket; see ID.
+	id string
 }
 
 // Open returns a Store over b with cfg's pacing, write bound and
 // KMS keys. The provider packages (fs, s3, gcs) each have an Open that
 // builds the backend and calls this.
 func Open(b Backend, cfg Config) *Store {
-	if cfg.RequestsPerSecond > 0 {
-		b = &paced{Backend: b, pace: newPacer(cfg.RequestsPerSecond)}
+	s := &Store{b: b, id: rand.Text()}
+	if n, ok := b.(interface{ ID() string }); ok {
+		s.id = n.ID()
 	}
-	s := &Store{b: b}
+	if cfg.RequestsPerSecond > 0 {
+		s.b = &paced{Backend: b, pace: newPacer(cfg.RequestsPerSecond)}
+	}
 	if cfg.MaxInflightWrites >= 0 {
 		s.writes = semaphore.NewWeighted(int64(cmp.Or(cfg.MaxInflightWrites, defaultMaxInflightWrites)))
 	}
 	return s
 }
+
+// ID names the bucket: Stores over the same bucket, opened apart or seen
+// through WithBackend, share it. A backend without an ID method gets a
+// random one per Open.
+func (s *Store) ID() string { return s.id }
 
 // WithBackend returns a Store over wrap(s's backend) with s's KMS keys
 // and write bound: the same bucket seen through a wrapper.

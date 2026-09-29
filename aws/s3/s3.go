@@ -5,6 +5,7 @@ package s3
 
 import (
 	"bytes"
+	"cmp"
 	"context"
 	"errors"
 	"fmt"
@@ -29,6 +30,7 @@ import (
 type Backend struct {
 	client   *awss3.Client
 	bucket   string
+	endpoint string
 	sse      string
 	kmsKeyID string
 }
@@ -126,8 +128,11 @@ func New(ctx context.Context, cfg Config) (*Backend, error) {
 		// otherwise log a warning on every GET.
 		o.ResponseChecksumValidation = aws.ResponseChecksumValidationWhenRequired
 	})
-	return &Backend{client: client, bucket: bucket, sse: sse, kmsKeyID: kmsKeyID}, nil
+	return &Backend{client: client, bucket: bucket, endpoint: endpoint, sse: sse, kmsKeyID: kmsKeyID}, nil
 }
+
+// ID is the endpoint and bucket, or s3://bucket on AWS's default endpoint.
+func (s *Backend) ID() string { return cmp.Or(s.endpoint, "s3:/") + "/" + s.bucket }
 
 // SSE reports the bucket's configured server-side encryption: the S3 mode
 // ("", "AES256" or "aws:kms") and the KMS key id when one is set. The caller

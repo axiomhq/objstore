@@ -59,6 +59,9 @@ func New(ctx context.Context, cfg Config) (*Backend, error) {
 	return &Backend{bucket: client.Bucket(cfg.Bucket), name: cfg.Bucket, project: cfg.ProjectID}, nil
 }
 
+// ID is gs://bucket.
+func (b *Backend) ID() string { return "gs://" + b.name }
+
 // Open returns a Store over New(ctx, cfg) with ocfg's pacing and write bound.
 func Open(ctx context.Context, cfg Config, ocfg objstore.Config) (*objstore.Store, error) {
 	b, err := New(ctx, cfg)

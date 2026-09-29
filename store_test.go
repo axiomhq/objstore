@@ -7,6 +7,7 @@ import (
 	"time"
 
 	"github.com/axiomhq/objstore"
+	"github.com/axiomhq/objstore/fs"
 	"github.com/axiomhq/objstore/storetest"
 	"github.com/axiomhq/objstore/storetest/bucket"
 )
@@ -84,5 +85,24 @@ func TestKMSKeysDecide(t *testing.T) {
 	}
 	if k.KeyOf("plain") != "" || k.KeyOf("keyed") != "from-ctx" {
 		t.Fatalf("plain=%q keyed=%q", k.KeyOf("plain"), k.KeyOf("keyed"))
+	}
+}
+
+// TestIDNamesTheBucket: a wrapped or paced Store keeps its bucket's ID; a
+// backend without an ID method gets a fresh one per Open.
+func TestIDNamesTheBucket(t *testing.T) {
+	root := t.TempDir()
+	s := fs.Open(root, "a", objstore.Config{})
+	if w := s.WithBackend(func(b objstore.Backend) objstore.Backend { return ignoresIfNoneMatch{b} }); w.ID() != s.ID() {
+		t.Fatalf("WithBackend changed the ID: %q, want %q", w.ID(), s.ID())
+	}
+	if p := fs.Open(root, "a", objstore.Config{RequestsPerSecond: 10}); p.ID() != s.ID() {
+		t.Fatalf("paced store ID = %q, want %q", p.ID(), s.ID())
+	}
+	anon := func() *objstore.Store {
+		return objstore.Open(struct{ objstore.Backend }{fs.New(root, "a")}, objstore.Config{})
+	}
+	if a := anon().ID(); a == "" || a == s.ID() || a == anon().ID() {
+		t.Fatalf("backend without ID: %q, want a fresh ID per Open", a)
 	}
 }

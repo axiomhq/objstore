@@ -675,3 +675,13 @@ func BenchmarkFSListPage(b *testing.B) {
 		}
 	}
 }
+
+// TestFSIDIsTheBucketDirectory: two Opens of one bucket share an ID; another
+// bucket under the same root does not.
+func TestFSIDIsTheBucketDirectory(t *testing.T) {
+	root := t.TempDir()
+	a, again, other := Open(root, "a", objstore.Config{}), Open(root, "a", objstore.Config{}), Open(root, "b", objstore.Config{})
+	if a.ID() != again.ID() || a.ID() == other.ID() || !strings.HasPrefix(a.ID(), "file://") {
+		t.Fatalf("IDs %q %q %q", a.ID(), again.ID(), other.ID())
+	}
+}

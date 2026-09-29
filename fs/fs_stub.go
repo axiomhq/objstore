@@ -31,6 +31,9 @@ func New(root, bucket string) *Backend {
 	return &Backend{root: filepath.Join(filepath.FromSlash(root), bucket)}
 }
 
+// ID is the bucket directory as a file:// URL.
+func (b *Backend) ID() string { return "file://" + filepath.ToSlash(b.root) }
+
 // Open returns a Store over New(root, bucket) with cfg's pacing, write
 // bound.
 func Open(root, bucket string, cfg objstore.Config) *objstore.Store {
