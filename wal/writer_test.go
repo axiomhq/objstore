@@ -269,10 +269,13 @@ func TestWriterSplitsAtomicBatchAndResolvesAmbiguousPages(t *testing.T) {
 }
 
 // pageRecords re-types a decoded page's records for Encode.
-func pageRecords(records [][]byte) []Bytes {
-	out := make([]Bytes, len(records))
+// pageRecords are a decoded page's records, each weighing its length as
+// the split tests' records do, so re-encoding a page also checks the
+// weight its header carries.
+func pageRecords(records [][]byte) []weighed {
+	out := make([]weighed, len(records))
 	for i, r := range records {
-		out[i] = r
+		out[i] = weighed{r, uint64(len(r))}
 	}
 	return out
 }
@@ -281,11 +284,11 @@ func pageRecords(records [][]byte) []Bytes {
 // what Encode would write for each page, consecutively sequenced, with the
 // batch's records in order, whether one record or several land on a page.
 func TestSplitBatchPagesAreCanonical(t *testing.T) {
-	var records []Bytes
+	var records []weighed
 	for i, size := range []int{20 << 20, 20 << 20, 30 << 20, 1 << 10, 40 << 20} {
-		records = append(records, filled(byte('a'+i), size))
+		records = append(records, weighed{filled(byte('a'+i), size), uint64(size)})
 	}
-	b := &batch[Bytes]{records: records, nonce: "nonce", at: time.UnixMilli(1234).UTC()}
+	b := &batch[weighed]{records: records, nonce: "nonce", at: time.UnixMilli(1234).UTC()}
 	pages, _, err := splitBatch(7, b)
 	if err != nil {
 		t.Fatal(err)
@@ -293,7 +296,7 @@ func TestSplitBatchPagesAreCanonical(t *testing.T) {
 	if len(pages) != 3 {
 		t.Fatalf("%d pages, want 3", len(pages))
 	}
-	var got []Bytes
+	var got []weighed
 	for i, page := range pages {
 		if len(page) > maxPageBytes {
 			t.Fatalf("page %d is %d bytes", i, len(page))

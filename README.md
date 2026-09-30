@@ -92,7 +92,7 @@ file store fills every Call; S3 and GCS fill only the write gate.
 1. Make your row a `wal.Record`: `Size() int` and `AppendTo(b []byte) ([]byte, error)`. `wal.Bytes` is one already.
 2. Start a writer: `w := wal.NewWriter(s, "log/", 1, onCommit)`. `onCommit(seq, at, records)` runs for each durable entry, before callers are acked.
 3. Write: `err := w.Append(ctx, records)`. It returns once the entry holding them is durable. If `ctx` ends first the outcome is unknown; `w.Enqueue` returns a receipt that always gets the verdict.
-4. Read back: `wal.Walk(ctx, s, "log/", after, 0, wal.Decode, visit)`. `visit` gets one `wal.Entry` per entry; a batch cut into several pages arrives whole. `wal.WalkParallel` fetches on `workers` goroutines; `wal.WalkWithGet` and `wal.WalkParallelWithGet` read through your own fetch (a cache, say).
+4. Read back: `wal.Walk(ctx, s, "log/", after, 0, wal.Decode, visit)`. `visit` gets one `wal.Entry` per entry; a batch cut into several pages arrives whole. `wal.WalkParallel` fetches on `workers` goroutines; `wal.WalkWithGet` and `wal.WalkParallelWithGet` read through your own fetch (a cache, say). `wal.WalkHeaders` reads only each page's header — its record count and the summed `Weight` of records that implement `wal.Weigher` — with one small ranged GET per page.
 5. Stop: `w.Close()` drains, then returns.
 
 | error | means |

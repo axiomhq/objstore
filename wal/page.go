@@ -28,6 +28,24 @@ type Record interface {
 	AppendTo(b []byte) ([]byte, error)
 }
 
+// Weigher is a Record with a weight of the caller's choosing, a logical
+// size say. A page's header carries the sum over its records (Header.Weight),
+// so a reader can account a page from its header alone (WalkHeaders).
+// Records that are not Weighers weigh zero.
+type Weigher interface {
+	Weight() uint64
+}
+
+func weightOf[R Record](records []R) uint64 {
+	var w uint64
+	for _, r := range records {
+		if x, ok := any(r).(Weigher); ok {
+			w += x.Weight()
+		}
+	}
+	return w
+}
+
 // Bytes is a Record that is already encoded.
 type Bytes []byte
 
@@ -46,10 +64,16 @@ type Header struct {
 	// position in it. A single-page entry has BatchPages 0 (Encode's
 	// default) or 1 (what a Writer writes): walks treat the two alike.
 	BatchPages, BatchIndex uint64
+	// Records is the page's record count and Weight the sum of their
+	// weights (Weigher). A read fills them; Encode and the Writer compute
+	// them from the records and ignore what the caller set.
+	Records int
+	Weight  uint64
 }
 
 // Encode writes one page: magic, sequence, nonce, commit time (unix
-// milliseconds), batch page count and index, record count, each record
+// milliseconds), batch page count and index, record count, record weight
+// (Weigher), each record
 // length-prefixed, CRC32C. Encoding is deterministic, so retries of the
 // same batch write identical bytes: fix At once per batch.
 func Encode[R Record](h Header, records []R) ([]byte, error) {
@@ -63,7 +87,7 @@ func Encode[R Record](h Header, records []R) ([]byte, error) {
 			return nil, fmt.Errorf("wal: page exceeds size limit")
 		}
 	}
-	b, err := appendHeader(make([]byte, 0, size), h, len(records))
+	b, err := appendHeader(make([]byte, 0, size), h, len(records), weightOf(records))
 	if err != nil {
 		return nil, err
 	}
@@ -78,7 +102,7 @@ func Encode[R Record](h Header, records []R) ([]byte, error) {
 	return seal(b), nil
 }
 
-func appendHeader(b []byte, h Header, records int) ([]byte, error) {
+func appendHeader(b []byte, h Header, records int, weight uint64) ([]byte, error) {
 	b = append(b, pageMagic...)
 	b = binary.AppendUvarint(b, h.Seq)
 	b = binary.AppendUvarint(b, uint64(len(h.Nonce)))
@@ -94,12 +118,13 @@ func appendHeader(b []byte, h Header, records int) ([]byte, error) {
 	b = binary.AppendUvarint(b, h.BatchPages)
 	b = binary.AppendUvarint(b, h.BatchIndex)
 	b = binary.AppendUvarint(b, uint64(records))
+	b = binary.AppendUvarint(b, weight)
 	return b, nil
 }
 
 // headerReserve bounds a page header's size for a nonce of n bytes, CRC
 // included.
-func headerReserve(n int) int { return len(pageMagic) + 6*binary.MaxVarintLen64 + n + 4 }
+func headerReserve(n int) int { return len(pageMagic) + 7*binary.MaxVarintLen64 + n + 4 }
 
 func appendRecord[R Record](b []byte, r R) ([]byte, error) {
 	n := r.Size()
@@ -155,35 +180,23 @@ func Scan(data []byte, visit func(record []byte) error) (Header, error) {
 }
 
 func scan(data []byte, count func(int), visit func([]byte) error) (Header, error) {
-	var h Header
 	bad := func() (Header, error) { return Header{}, fmt.Errorf("%w: invalid WAL page", ErrCorrupt) }
-	if len(data) > maxPageBytes || len(data) < len(pageMagic)+4 || string(data[:len(pageMagic)]) != pageMagic {
+	if len(data) > maxPageBytes || len(data) < len(pageMagic)+4 {
 		return bad()
 	}
 	end := len(data) - 4
 	if crc32.Checksum(data[:end], castagnoli) != binary.LittleEndian.Uint32(data[end:]) {
 		return bad()
 	}
-	r := pageReader{data: data[len(pageMagic):end]}
-	h.Seq = r.number()
-	h.Nonce = string(r.blob())
-	if at := r.number(); at > math.MaxInt64 {
-		return bad()
-	} else if at != 0 {
-		h.At = time.UnixMilli(int64(at)).UTC()
-	}
-	h.BatchPages, h.BatchIndex = r.number(), r.number()
-	if (h.BatchPages == 0 && h.BatchIndex != 0) || (h.BatchPages != 0 && h.BatchIndex >= h.BatchPages) {
-		return bad()
-	}
-	n := r.count(1) // every record has at least its length prefix
-	if r.err {
+	r := pageReader{data: data[:end]}
+	h, ok := r.header()
+	if !ok || h.Records > len(r.data) { // every record has at least its length prefix
 		return bad()
 	}
 	if count != nil {
-		count(n)
+		count(h.Records)
 	}
-	for range n {
+	for range h.Records {
 		rec := r.blob()
 		if r.err {
 			return bad()
@@ -198,6 +211,47 @@ func scan(data []byte, count func(int), visit func([]byte) error) (Header, error
 		return bad()
 	}
 	return h, nil
+}
+
+// DecodeHeader reads the header at the start of a page, or of a prefix of
+// one long enough to hold it. Nothing checks it against the page's CRC,
+// which covers the whole page: a reader that trusts a header alone trusts
+// the store to return what the writer's acknowledged PUT stored.
+func DecodeHeader(prefix []byte) (Header, error) {
+	r := pageReader{data: prefix}
+	h, ok := r.header()
+	if !ok {
+		return Header{}, fmt.Errorf("%w: invalid WAL page header", ErrCorrupt)
+	}
+	return h, nil
+}
+
+// header reads the magic and header fields; false if they are malformed
+// or run past r's data.
+func (r *pageReader) header() (Header, bool) {
+	var h Header
+	if len(r.data) < len(pageMagic) || string(r.data[:len(pageMagic)]) != pageMagic {
+		return Header{}, false
+	}
+	r.data = r.data[len(pageMagic):]
+	h.Seq = r.number()
+	h.Nonce = string(r.blob())
+	if at := r.number(); at > math.MaxInt64 {
+		return Header{}, false
+	} else if at != 0 {
+		h.At = time.UnixMilli(int64(at)).UTC()
+	}
+	h.BatchPages, h.BatchIndex = r.number(), r.number()
+	if (h.BatchPages == 0 && h.BatchIndex != 0) || (h.BatchPages != 0 && h.BatchIndex >= h.BatchPages) {
+		return Header{}, false
+	}
+	n := r.number()
+	h.Weight = r.number()
+	if r.err || n > maxPageBytes {
+		return Header{}, false
+	}
+	h.Records = int(n)
+	return h, true
 }
 
 type pageReader struct {

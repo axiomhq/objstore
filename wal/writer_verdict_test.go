@@ -26,6 +26,9 @@ type testRecord struct {
 	fail bool
 }
 
+// Weight is the record's length, what pageRecords gives a decoded record.
+func (r testRecord) Weight() uint64 { return uint64(len(r.b)) }
+
 func (r testRecord) Size() int {
 	if r.size != 0 {
 		return r.size

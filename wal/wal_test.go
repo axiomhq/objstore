@@ -306,7 +306,17 @@ func FuzzDecode(f *testing.F) {
 			}
 			return
 		}
-		again, err := Encode(h, pageRecords(records))
+		// Re-encode with the header's weight on the first record.
+		recs := pageRecords(records)
+		for i := range recs {
+			recs[i].w = 0
+		}
+		if len(recs) > 0 {
+			recs[0].w = h.Weight
+		} else {
+			h.Weight = 0 // no record to carry it
+		}
+		again, err := Encode(h, recs)
 		if err != nil {
 			t.Fatalf("re-encode: %v", err)
 		}
@@ -344,23 +354,38 @@ func TestEncodeDecodeRoundTrip(t *testing.T) {
 		if n := rng.Uint64N(4); n > 0 {
 			h.BatchPages, h.BatchIndex = n, rng.Uint64N(n)
 		}
-		records := make([]Bytes, rng.IntN(20))
+		records := make([]weighed, rng.IntN(20))
 		for i := range records {
-			records[i] = randomBytes(rng, rng.IntN(300))
+			records[i] = weighed{randomBytes(rng, rng.IntN(300)), rng.Uint64N(1 << 40)}
+			h.Weight += records[i].w
 		}
-		data, err := Encode(h, records)
+		h.Records = len(records)
+		data, err := Encode(Header{Seq: h.Seq, Nonce: h.Nonce, At: h.At, BatchPages: h.BatchPages, BatchIndex: h.BatchIndex, Records: 99, Weight: 99}, records)
 		if err != nil {
 			t.Fatal(err)
 		}
 		got, decoded, err := Decode(data)
-		if err != nil || !reflect.DeepEqual(got, h) || !slices.EqualFunc(decoded, records, func(a []byte, b Bytes) bool { return bytes.Equal(a, b) }) {
+		if err != nil || !reflect.DeepEqual(got, h) || !slices.EqualFunc(decoded, records, func(a []byte, b weighed) bool { return bytes.Equal(a, b.Bytes) }) {
 			t.Fatalf("round trip of %+v: %+v, %v", h, got, err)
 		}
 		if sh, err := Scan(data, nil); err != nil || !reflect.DeepEqual(sh, h) {
 			t.Fatalf("scan of %+v: %+v, %v", h, sh, err)
 		}
+		if len(h.Nonce) <= 32 {
+			if hh, err := DecodeHeader(data[:min(len(data), headerReadBytes)]); err != nil || !reflect.DeepEqual(hh, h) {
+				t.Fatalf("header of %+v: %+v, %v", h, hh, err)
+			}
+		}
 	}
 }
+
+// weighed is a record with a weight (Weigher).
+type weighed struct {
+	Bytes
+	w uint64
+}
+
+func (r weighed) Weight() uint64 { return r.w }
 
 func randomBytes(rng *rand.Rand, n int) Bytes {
 	b := make(Bytes, n)

@@ -15,6 +15,7 @@ import (
 	"time"
 
 	"github.com/axiomhq/objstore"
+	"github.com/axiomhq/objstore/storetest"
 	"github.com/axiomhq/objstore/storetest/bucket"
 )
 
@@ -357,5 +358,92 @@ func TestWalkParallelTailCost(t *testing.T) {
 	}
 	if n := pages.missing.Load(); n < 1 || n > workers {
 		t.Fatalf("%d not-found GETs past the end, want 1..%d", n, workers)
+	}
+}
+
+// TestWalkHeadersMatchesWalk: a header walk visits the entries a full walk
+// does — markers, coalesced batches, the incomplete tail — each page's
+// header carrying its record count and weight, with one ranged GET per page
+// except a page shorter than the read or with a header longer than it.
+func TestWalkHeadersMatchesWalk(t *testing.T) {
+	ctx := context.Background()
+	s, f := storetest.NewFault(bucket.New(t))
+	var seq uint64
+	add := func(h Header, records ...weighed) {
+		t.Helper()
+		seq++
+		h.Seq = seq
+		data, err := Encode(h, records)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if ok, err := s.PutIfAbsent(ctx, Key(testPrefix, seq), data); !ok || err != nil {
+			t.Fatalf("put %d: %v", seq, err)
+		}
+	}
+	rec := func(n int, w uint64) weighed { return weighed{filled('r', n), w} }
+	add(Header{}, rec(200, 7), rec(300, 11))
+	add(Header{})                                             // tiny: shorter than one header read
+	add(Header{Nonce: string(filled('n', 200))}, rec(100, 5)) // header longer than the read
+	for i := range 3 {
+		add(Header{Nonce: "batch", BatchPages: 3, BatchIndex: uint64(i)}, rec(150, uint64(i+1)))
+	}
+	add(Header{Nonce: "abandoned", BatchPages: 2}, rec(150, 3))
+	for range 20 {
+		add(Header{}, rec(150, 2), rec(150, 4))
+	}
+	add(Header{Nonce: "tail", BatchPages: 2}, rec(150, 9))
+
+	type seen struct {
+		seq             uint64
+		incomplete      bool
+		records, weight []uint64 // per page
+	}
+	var want, got []seen
+	if err := Walk(ctx, s, testPrefix, 0, 0, Decode, func(e entry) error {
+		v := seen{seq: e.Seq, incomplete: e.Incomplete}
+		for _, recs := range e.Pages {
+			v.records = append(v.records, uint64(len(recs)))
+		}
+		want = append(want, v)
+		return nil
+	}); err != nil {
+		t.Fatal(err)
+	}
+	f.ResetOps()
+	if err := WalkHeaders(ctx, s, testPrefix, 0, 0, 4, func(e Entry[Header]) error {
+		v := seen{seq: e.Seq, incomplete: e.Incomplete}
+		for _, h := range e.Pages {
+			v.records = append(v.records, uint64(h.Records))
+			v.weight = append(v.weight, h.Weight)
+		}
+		got = append(got, v)
+		return nil
+	}); err != nil {
+		t.Fatal(err)
+	}
+	if len(got) != len(want) {
+		t.Fatalf("header walk visited %d entries, full walk %d", len(got), len(want))
+	}
+	for i := range want {
+		if got[i].seq != want[i].seq || got[i].incomplete != want[i].incomplete || !slices.Equal(got[i].records, want[i].records) {
+			t.Fatalf("entry %d: header walk %+v, full walk %+v", i, got[i], want[i])
+		}
+	}
+	if w := got[0].weight; !slices.Equal(w, []uint64{18}) {
+		t.Fatalf("first page weight %v, want 18", w)
+	}
+	if w := got[3].weight; !slices.Equal(w, []uint64{1, 2, 3}) {
+		t.Fatalf("batch weights %v, want [1 2 3]", w)
+	}
+	if w := got[5].weight; !slices.Equal(w, []uint64{6}) {
+		t.Fatalf("single page weight %v, want 6", w)
+	}
+	// One ranged read per page and per probe past the end (at most workers);
+	// whole GETs only for the tiny page (after its ranged read fails) and the
+	// long header.
+	ops := f.Ops()
+	if ops[storetest.OpGetRange] < int(seq) || ops[storetest.OpGetRange] > int(seq)+4 || ops[storetest.OpGet] != 2 {
+		t.Fatalf("header walk of %d pages: %v", seq, ops)
 	}
 }

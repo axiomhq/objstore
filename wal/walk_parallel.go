@@ -231,3 +231,33 @@ func lowerTo(v *atomic.Uint64, seq uint64) {
 		}
 	}
 }
+
+// headerReadBytes is one ranged read that holds a page header whose nonce
+// is at most 32 bytes, what a Writer mints: magic, seven varints, nonce.
+const headerReadBytes = 128
+
+// WalkHeaders is WalkParallel over page headers only: each page costs one
+// ranged GET of its first headerReadBytes (a whole GET when the page is
+// shorter, or its header longer), so a walk's cost is its page count, not
+// its bytes. Each visited Entry's Pages hold its pages' headers, Records
+// and Weight included, for a caller that accounts a log without reading its
+// records. A header is not checked against its page's CRC (DecodeHeader).
+func WalkHeaders(ctx context.Context, s *objstore.Store, prefix string, after, through uint64, workers int, visit func(Entry[Header]) error) error {
+	get := func(ctx context.Context, key string) ([]byte, error) {
+		b, err := s.GetRange(ctx, key, 0, headerReadBytes)
+		if errors.Is(err, objstore.ErrRange) {
+			return s.Get(ctx, key)
+		}
+		if err == nil {
+			if _, herr := DecodeHeader(b); herr != nil {
+				return s.Get(ctx, key)
+			}
+		}
+		return b, err
+	}
+	decode := func(b []byte) (Header, Header, error) {
+		h, err := DecodeHeader(b)
+		return h, h, err
+	}
+	return WalkParallelWithGet(ctx, get, prefix, after, through, workers, decode, nil, visit)
+}

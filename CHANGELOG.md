@@ -1,5 +1,17 @@
 # Changelog
 
+## v0.7.0
+
+### Breaking changes
+
+- **wal page format**: the header carries a record weight after the record count. Pages written by v0.6 do not decode; rewrite or drop them before upgrading.
+
+### Added
+
+- `wal.Weigher`: a `Record` with a `Weight() uint64`. A page's header carries the sum over its records, split pages each their own.
+- `wal.Header.Records` and `wal.Header.Weight`, filled on read; `Encode` and the `Writer` compute them.
+- `wal.DecodeHeader` reads a header from a page prefix, and `wal.WalkHeaders` walks a log by headers alone: one ranged GET of 128 bytes per page, on bounded workers, so accounting a log costs its page count, not its bytes.
+
 ## v0.6.1
 
 - Tests only: `rangeread` pins that a cancelled follower of a shared fetch leaves while the leader's GET runs on, and that a panicking loader reaches every waiter as an error.

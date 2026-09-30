@@ -821,7 +821,7 @@ func (w *Writer[R]) retry(op, key string, cause error) error {
 // record fails the batch.
 func splitBatch[R Record](seq uint64, b *batch[R]) (pages [][]byte, kept []R, err error) {
 	head := Header{Seq: seq, Nonce: b.nonce, At: b.at, BatchPages: 1}
-	header, err := appendHeader(nil, head, len(b.records))
+	header, err := appendHeader(nil, head, len(b.records), weightOf(b.records))
 	if err != nil {
 		return nil, nil, err
 	}
@@ -873,11 +873,12 @@ func splitBatch[R Record](seq uint64, b *batch[R]) (pages [][]byte, kept []R, er
 			return nil, kept, nil
 		}
 		records = kept
-		// The record count is in the header, and its varint may shrink. It
-		// never grows, so the new header is written to end where the old
-		// one did and buf starts where it does: no record byte moves. Only
-		// a single page uses this header; a multi-page cut writes its own.
-		if header, err = appendHeader(header[:0], head, len(kept)); err != nil {
+		// The record count and weight are in the header, and their varints
+		// may shrink. They never grow, so the new header is written to end
+		// where the old one did and buf starts where it does: no record
+		// byte moves. Only a single page uses this header; a multi-page cut
+		// writes its own.
+		if header, err = appendHeader(header[:0], head, len(kept), weightOf(kept)); err != nil {
 			return nil, nil, err
 		}
 		shift := hdr - len(header)
@@ -938,7 +939,7 @@ func splitBatch[R Record](seq uint64, b *batch[R]) (pages [][]byte, kept []R, er
 			from = ends[lo-1]
 		}
 		head.Seq, head.BatchIndex = seq+uint64(i), uint64(i)
-		page, err := appendHeader(make([]byte, 0, reserve+to-from), head, hi-lo)
+		page, err := appendHeader(make([]byte, 0, reserve+to-from), head, hi-lo, weightOf(records[lo:hi]))
 		if err != nil {
 			return nil, nil, err
 		}
