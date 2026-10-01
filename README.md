@@ -1,47 +1,318 @@
 # objstore
 
+[![go.dev reference](https://img.shields.io/badge/go.dev-reference-007d9c?logo=go&logoColor=white&style=flat-square)](https://pkg.go.dev/github.com/axiomhq/objstore)
+[![CI](https://github.com/axiomhq/objstore/actions/workflows/ci.yml/badge.svg?branch=main)](https://github.com/axiomhq/objstore/actions/workflows/ci.yml)
+
+objstore is object storage with compare-and-swap, for Go.
+
+S3 and Google Cloud Storage can write an object only if it doesn't exist yet,
+or only if it hasn't changed since you read it. That's compare-and-swap, and
+it's enough to build a write-ahead log, a leader lease, or a manifest that many
+processes update, with nothing but a bucket. objstore gives you a Store with
+those conditional writes, and builds the log, the lease and a read cache on top
+of it.
+
+Objects are meant to be written once and never changed, except by deletion.
+The conditional writes cover the few that must change.
+
+## Install
+
 ```sh
 go get github.com/axiomhq/objstore
 ```
 
-Object storage with compare-and-swap, for Go. One `Store` over an S3 bucket
-(`objstore/aws/s3`), Google Cloud Storage (`objstore/gcp/gcs`), or a durable
-local directory (`objstore/fs`). Packages are laid out by provider: `aws/`
-holds `s3`, `gcp/` holds `gcs`. Cloudflare R2 (at
-`https://<account-id>.r2.cloudflarestorage.com` with `AWS_REGION=auto`),
-MinIO, Ceph and Hetzner use `aws/s3` because they speak the S3 API. With:
+Each provider is its own package, so a binary links only the SDKs it uses.
 
-- conditional PUT and GET, and the ETag with the body
-- paginated list, delimited list, batch delete
-- one package per provider, so a binary links only the SDKs it uses
-- a file store (`objstore/fs`) that fsyncs every object and writes large ones back in chunks, so a small urgent write never waits behind a big one
-- a KMS key per object, applied by the store (S3 SSE-KMS, GCS `kmsKeyName`), picked by a function of the key
-- a startup probe that the store honours conditional writes
-- a conformance suite, fault injection and metering for tests (`objstore/storetest`)
-- a write-ahead log: one entry per second, conditional PUT, nonce read-back (`objstore/wal`)
-- a memory and disk object cache with singleflight and per-request stats (`objstore/cache`)
-- a ranged reader that coalesces nearby reads into one GET (`objstore/rangeread`)
-- a lease for leader election or a single writer: acquire, renew, fence (`objstore/lease`)
+- [aws/s3][s3] is AWS S3, and anything that speaks the S3 API: Cloudflare R2, MinIO, Ceph, Hetzner.
+- [gcp/gcs][gcs] is Google Cloud Storage.
+- [fs][fs] is a local directory. Every object is fsynced before it's acknowledged. Unix only, and not Solaris or AIX.
 
-## Use
+[s3]: https://pkg.go.dev/github.com/axiomhq/objstore/aws/s3
+[gcs]: https://pkg.go.dev/github.com/axiomhq/objstore/gcp/gcs
+[fs]: https://pkg.go.dev/github.com/axiomhq/objstore/fs
 
-Imports: `github.com/axiomhq/objstore/aws/s3`, `github.com/axiomhq/objstore/gcp/gcs`, `github.com/axiomhq/objstore/fs`.
+## Usage
 
-1. Open a store: `s, err := s3.Open(ctx, s3.Config{Endpoint: "https://s3.us-east-1.amazonaws.com", Bucket: "my-bucket"}, objstore.Config{})`.
-   GCS: `s, err := gcs.Open(ctx, gcs.Config{Bucket: "my-bucket"}, objstore.Config{})`. Local: `s := fs.Open("/var/lib/data", "bucket", objstore.Config{})` (Unix only).
-   Any other `objstore.Backend`: `s := objstore.Open(b, objstore.Config{})`.
-   `s3.Config` adds SSE, an endpoint allow-list and a request timeout; `objstore.Config` adds pacing (`RequestsPerSecond`), and a write bound (`MaxInflightWrites`).
-2. Create the bucket if you need to: `s.EnsureBucket(ctx)`.
-3. Write once: `created, err := s.PutIfAbsent(ctx, key, data)`. `created` is false when the key existed.
-4. Swap: `body, etag, err := s.GetWithETag(ctx, key)`, then `ok, err := s.PutIfMatch(ctx, key, next, etag)`. `ok` false means someone else won: re-read and retry. `objstore.ErrConflict` (S3's 409) means the store never decided: retry.
-5. Poll: `body, etag, unchanged, err := s.GetIfChanged(ctx, key, etag)`. One conditional request on S3 and GCS; the file store reads the whole file either way, so it is not cheaper than `Get` there.
+### Open a store
 
-A missing key returns an error wrapping `objstore.ErrNotFound`. Mark a
-context with `objstore.Urgent(ctx)` for heartbeats and log commits: its calls
-skip pacing and the write bound, and on the file store are written whole
-instead of in chunks.
+```go
+s, err := s3.Open(ctx, s3.Config{
+	Endpoint: "https://s3.us-east-1.amazonaws.com",
+	Bucket:   "my-bucket",
+}, objstore.Config{})
+if err != nil {
+	return err
+}
+```
 
-### Migrating from v0.4
+The other providers look the same.
+
+```go
+s, err := gcs.Open(ctx, gcs.Config{Bucket: "my-bucket"}, objstore.Config{})
+```
+
+```go
+s := fs.Open("/var/lib/data", "my-bucket", objstore.Config{})
+```
+
+For R2, set Endpoint to `https://<account-id>.r2.cloudflarestorage.com` and
+`AWS_REGION=auto`. Anything else that implements objstore.Backend becomes a
+Store with objstore.Open.
+
+objstore.Config paces requests (RequestsPerSecond) and bounds the writes in
+flight (MaxInflightWrites). Both exist because a burst past what a provider
+serves doesn't fail, it stalls, and takes your heartbeats down with it.
+
+Call s.EnsureBucket(ctx) if the bucket might not exist yet. Then, before the
+first write, call s.CheckConditionalWrites(ctx). It spends three requests
+proving the store actually honours If-None-Match. A store that ignores the
+header would let two log writers both win the same sequence, and you'd rather
+find that out at startup.
+
+### Compare-and-swap
+
+```go
+for {
+	body, etag, err := s.GetWithETag(ctx, "manifest")
+	if err != nil {
+		return err
+	}
+	ok, err := s.PutIfMatch(ctx, "manifest", update(body), etag)
+	switch {
+	case errors.Is(err, objstore.ErrConflict):
+		continue // the store never decided; retry
+	case err != nil:
+		return err
+	case !ok:
+		continue // someone else won; read again
+	}
+	return nil
+}
+```
+
+PutIfMatch returns false when someone else got there first. ErrConflict is
+different: S3 answered 409 because another conditional write on the same key
+was in flight, and never decided yours. Retry both.
+
+PutIfAbsent is the write-once version: it returns false if the key already
+existed. GetIfChanged polls a key against the ETag you last saw. On S3 and GCS
+that's one conditional request; the file store reads the whole file either way.
+A missing key returns an error wrapping objstore.ErrNotFound.
+
+Heartbeats and log commits shouldn't wait behind bulk uploads. Mark their
+context with objstore.Urgent(ctx), and their calls skip pacing and the write
+bound. On the file store they're also written whole, instead of in chunks.
+
+To see where a request spent its time, attach a Timings to its context.
+
+```go
+var t objstore.Timings
+ctx = objstore.WithTimings(ctx, &t)
+// ... calls on s ...
+logger.LogAttrs(ctx, slog.LevelInfo, "job", t.Attrs()...)
+```
+
+The file store fills in every call; S3 and GCS fill in only the time spent
+waiting on the write bound.
+
+Ranged reads, paginated and delimited listing, and batch delete are on
+[pkg.go.dev](https://pkg.go.dev/github.com/axiomhq/objstore#Store).
+
+### Write-ahead log
+
+[Package wal][wal] is a write-ahead log on a Store. Concurrent appends are
+batched into one entry per commit interval, one second by default, and each
+entry claims the next sequence number with a conditional PUT.
+
+[wal]: https://pkg.go.dev/github.com/axiomhq/objstore/wal
+
+```go
+w := wal.NewWriter(s, "log/", 1, func(seq uint64, at time.Time, records []wal.Bytes) {
+	// Runs for every durable entry, before its callers are acked.
+})
+defer w.Close()
+
+if err := w.Append(ctx, []wal.Bytes{wal.Bytes("hello")}); err != nil {
+	return err
+}
+```
+
+A record is anything with Size and AppendTo; wal.Bytes is one that's already
+encoded. Read the log back with Walk.
+
+```go
+err := wal.Walk(ctx, s, "log/", 0, 0, wal.Decode, func(e wal.Entry[[][]byte]) error {
+	for _, page := range e.Pages {
+		for _, record := range page {
+			fmt.Printf("%d: %s\n", e.Seq, record)
+		}
+	}
+	return nil
+})
+```
+
+Nothing is listed. The sequence numbers are the catalog: a walk GETs after+1,
+after+2, and so on, and stops at the first missing key. That works because a
+writer advances only on a proven outcome, so a crashed writer leaves the log
+short, never holey.
+
+Append returning nil means the records are durable and onCommit has run. Most
+errors mean they weren't written and won't be. Two don't: ErrUnresolved, and
+the context's own error when ctx ends first. Then the records may be durable,
+so recover by replaying the log from your checkpoint, not by appending them
+again. When the store can't keep up, Append fails fast with ErrOverloaded
+instead of queueing without bound.
+
+A prefix has one live writer, and keeping it that way is your job (a lease,
+say). Conditional PUT detects a second writer, as ErrLostRace; it doesn't
+prevent one. The package docs cover every error, and when each one finishes
+the writer.
+
+### Leases
+
+[Package lease][lease] is a single-holder lease on one key, for leader election
+or a single writer.
+
+[lease]: https://pkg.go.dev/github.com/axiomhq/objstore/lease
+
+```go
+l, err := lease.Acquire(ctx, s, "jobs/leader", lease.OwnerID(), lease.DefaultTTL)
+if errors.Is(err, lease.ErrNotOwner) {
+	return nil // someone else holds it; try again later
+}
+if err != nil {
+	return err
+}
+defer l.Release(context.WithoutCancel(ctx))
+
+ctx, cancel := context.WithCancel(ctx)
+defer cancel()
+l.Start(cancel) // runs once, if we lose the lease
+
+for {
+	if err := l.Valid(); err != nil {
+		return err
+	}
+	if err := doGuardedWork(ctx); err != nil {
+		return err
+	}
+}
+```
+
+The lease renews itself every TTL/4. Release hands it over at once, so the next
+process doesn't wait out the TTL.
+
+Every write carries a fresh nonce. When a PUT lands but its answer is lost, the
+lease reads the object back, and its own nonce there means it still holds the
+lease. Nothing is guessed. A holder that's partitioned or crashed blocks
+takeover until its stored expiry plus TTL/2, and the holder's own deadline runs
+on its monotonic clock from before the PUT. So it stops acting no later than a
+taker may start, as long as the fleet shares one TTL and clocks disagree by
+less than TTL/2.
+
+A lease check can't fence a write that's already in flight. Guard durable
+writes with their own compare-and-swap, on an ETag or a sequence number, not
+with a check of the lease.
+
+A long-lived caller that retries should keep one handle, from lease.New, and
+call its Acquire method in a loop. lease.Shared shares one lease among holders
+in a process by reference count.
+
+### Cache and ranged reads
+
+[Package cache][cache] puts memory and an optional disk tier in front of a
+Store. Concurrent misses of one key share one GET.
+
+[cache]: https://pkg.go.dev/github.com/axiomhq/objstore/cache
+
+```go
+disk, err := cache.NewDisk(dir, 10<<30) // 10 GiB on disk
+if err != nil {
+	return err
+}
+c := cache.New(s, 1<<30, disk, cache.Keys{}) // 1 GiB in memory
+
+b, err := c.FetchWith(ctx, key, func(ctx context.Context) ([]byte, error) {
+	return s.Get(ctx, key)
+})
+```
+
+Objects are immutable, so the cache never revalidates a key. Cache.Put writes
+through both tiers, so a process reads back what it wrote from cache. Keys
+under `ns/<name>/` belong to namespace `<name>`, and InvalidateNamespace drops
+one namespace from every tier without touching the others.
+
+[Package rangeread][rangeread] reads many byte ranges through the cache,
+coalescing nearby ones into one GET.
+
+[rangeread]: https://pkg.go.dev/github.com/axiomhq/objstore/rangeread
+
+```go
+r, err := rangeread.New(s, c, rangeread.Config{})
+if err != nil {
+	return err
+}
+scope, err := r.FetchRanges(ctx, loads)
+if err != nil {
+	return err
+}
+b, ok := cache.Scoped(scope, loads[0].Key)
+```
+
+### Encryption
+
+Tell the store which KMS key each object gets.
+
+```go
+s = s.WithKMSKeys(func(ctx context.Context, key string) (string, error) {
+	tenant, _, _ := strings.Cut(key, "/")
+	return keyFor(tenant), nil // "" means the bucket's own policy
+})
+```
+
+Then write and read as usual. S3 stores each keyed object with SSE-KMS under
+that key, GCS with that kmsKeyName. Reads need no key. Rotating a key in KMS
+needs nothing from you; disabling or deleting one makes its objects fail with
+an error wrapping objstore.ErrAccessDenied.
+
+The file store ignores keys and encrypts nothing; s.KMS() reports false there.
+s3.Config's SSE and KMSKeyID still set one policy for the whole bucket.
+
+### Testing your code
+
+[Package storetest][storetest] injects faults, and
+[storetest/bucket][bucket] opens a fresh bucket per test, dropped at cleanup.
+That's a temp directory by default, or S3 when `OBJSTORE_TEST_S3` is set.
+
+[storetest]: https://pkg.go.dev/github.com/axiomhq/objstore/storetest
+[bucket]: https://pkg.go.dev/github.com/axiomhq/objstore/storetest/bucket
+
+```go
+func TestManifestSurvivesLostAnswer(t *testing.T) {
+	s, f := bucket.NewFaulty(t)
+
+	// The first PutIfMatch on the manifest lands, then reports an error.
+	f.Set(storetest.Plan{Op: storetest.OpPutIfMatch, N: 1, Key: "manifest", Mode: storetest.Ambiguous})
+
+	// ... run the code under test against s ...
+
+	if f.Fired() != 1 {
+		t.Fatal("fault never fired")
+	}
+}
+```
+
+Fail errors before the write, Ambiguous writes and then errors, Hang blocks
+until the call's context ends, and Pause blocks until f.Resume(). f.SetShape
+adds seeded latency, bandwidth limits and errors to every call, and
+f.WatchRewrites flags any key rewritten with different bytes.
+storetest.NewKMS records which key encrypted each object, and can revoke one.
+
+Writing your own Backend? Wrap it with objstore.Open and run
+storetest.Conformance(t, s) on it. It's the suite every provider here passes.
+storetest imports no provider, so it links neither the AWS nor the GCS SDK.
+
+## Migrating from v0.4
 
 | v0.4 | v0.5 |
 | --- | --- |
@@ -58,159 +329,33 @@ instead of in chunks.
 | `r := rangeread.New(...)`; `r.Cfg` | `r, err := rangeread.New(...)`; `r.Config()` |
 | `storetest.New(t)`, `storetest.NewFaulty(t)` | `bucket.New(t)`, `bucket.NewFaulty(t)` (`objstore/storetest/bucket`) |
 
-Objects v0.4 sealed client-side stay ciphertext: v0.5 does not decrypt
+Objects that v0.4 sealed client-side stay ciphertext: v0.5 doesn't decrypt
 them. See [CHANGELOG.md](CHANGELOG.md) for the rest.
 
-## Methods
-
-| method | does |
-| --- | --- |
-| `Put(ctx, key, data)` | write, overwriting |
-| `PutIfAbsent(ctx, key, data) (bool, error)` | write only if the key is absent |
-| `PutIfMatch(ctx, key, data, etag) (bool, error)` | write only if the ETag still matches |
-| `Get(ctx, key)` | read the object |
-| `GetRange(ctx, key, off, n)` | read exactly `n` bytes from `off` |
-| `GetWithETag(ctx, key)` | read the object and its ETag |
-| `GetIfChanged(ctx, key, etag)` | read only if the ETag moved |
-| `List(ctx, prefix)` | every key under a prefix |
-| `ListPage(ctx, prefix, after, limit)` | one page of keys (`limit` 1 to `MaxListPage`, 1,000) |
-| `ListPrefixes(ctx, prefix)` | child prefixes under a prefix (S3 delimiter `/`) |
-| `ListPrefixesPage(ctx, prefix, after, limit)` | one page of child prefixes |
-| `Delete(ctx, key)` | delete one key; never needs the namespace key |
-| `DeleteMany(ctx, keys...)` | batch delete |
-| `EnsureBucket(ctx)`, `DropBucket(ctx)` | create or remove the bucket |
-| `ID()` | the bucket's identity (`file://dir`, `endpoint/bucket`, `gs://bucket`): equal for every Store over one bucket, so a process can key caches by bucket |
-| `CheckConditionalWrites(ctx)` | prove the store honours If-None-Match (3 requests under `_probe/`); call once before writing |
-
-`ctx = objstore.WithTimings(ctx, &t)` has the store add the wall time and
-count of every call made under `ctx` to `t`, per `objstore.Call`;
-`logger.LogAttrs(ctx, slog.LevelInfo, "job", t.Attrs()...)` logs them. The
-file store fills every Call; S3 and GCS fill only the write gate.
-
-## Write-ahead log
-
-1. Make your row a `wal.Record`: `Size() int` and `AppendTo(b []byte) ([]byte, error)`. `wal.Bytes` is one already.
-2. Start a writer: `w := wal.NewWriter(s, "log/", 1, onCommit)`. `onCommit(seq, at, records)` runs for each durable entry, before callers are acked.
-3. Write: `err := w.Append(ctx, records)`. It returns once the entry holding them is durable. If `ctx` ends first the outcome is unknown; `w.Enqueue` returns a receipt that always gets the verdict.
-4. Read back: `wal.Walk(ctx, s, "log/", after, 0, wal.Decode, visit)`. `visit` gets one `wal.Entry` per entry; a batch cut into several pages arrives whole. `wal.WalkParallel` fetches on `workers` goroutines; `wal.WalkWithGet` and `wal.WalkParallelWithGet` read through your own fetch (a cache, say). `wal.WalkHeaders` reads only each page's header — its record count and the summed `Weight` of records that implement `wal.Weigher` — with one small ranged GET per page.
-5. Stop: `w.Close()` drains, then returns.
-
-| error | means |
-| --- | --- |
-| `ErrOverloaded` | 128 MiB is already waiting for the store; retry later |
-| `ErrRecordTooLarge` | a record no page can hold, or an append bigger than the queue; refused at once |
-| `ErrInvalidRecord` | negative `Size`, or `AppendTo` failed or disagreed with `Size`; only that Append fails |
-| `ErrLostRace` | another writer took the sequence (split brain). Finishes the writer |
-| `ErrUnresolved` | the outcome is unknown; the records may be durable. Reopen from your checkpoint and the log. From a commit (covered floor, corrupt page) it finishes the writer |
-| `ErrWriterFailed` | the writer already finished (`Stats().Terminal` says why); nothing written; reopen from your checkpoint |
-| `ErrCorrupt` | a page failed its checksum or framing, or a page is missing inside a bounded walk |
-
-A finished writer never writes again: `w.Stats().Terminal` says why, and
-every later Append gets `ErrWriterFailed`. Concurrent `Append`s share one
-entry, at most one per `WithCommitInterval` (default 1 s, clamped to 1 ms to
-5 s). An idle writer commits at once. Entries over 32 MiB are cut into pages.
-Nothing is listed: the walk GETs `after+1`, `after+2`, ... and stops at the
-first missing key. One live writer per prefix, enforced by the caller (a
-lease); `SetFloor` refuses claims at or below a truncated watermark.
-
-## Cache and ranged reads
-
-1. Build the tiers: `disk, _ := cache.NewDisk(dir, 10<<30)`, then `c := cache.New(s, 1<<30, disk, cache.Keys{})`.
-2. Read through them: `b, err := c.FetchWith(ctx, key, func(ctx context.Context) ([]byte, error) { return s.Get(ctx, key) })`.
-3. For byte ranges: `r, err := rangeread.New(s, c, rangeread.Config{})` (zero fields take defaults, invalid ones are an error; `r.Config()` shows the result), then `scope, err := r.FetchRanges(ctx, loads)` and `cache.Scoped(scope, key)` per load.
-
-| piece | does |
-| --- | --- |
-| `cache.ByteCache` | striped LRU under one byte budget, each entry charged `len(key) + cache.EntryOverhead` extra; decoded values ride on their bytes (`PutDecoded`, charged via `cache.Sizer`; `Recharge` re-sizes one you still hold) |
-| `ByteCache.GenerationOf(key)` | the key's namespace generation: read it before loading and pass it to `Put`, so an invalidation in between drops the fill |
-| `cache.Disk` | disposable disk tier, 4 KiB block checksums, pins, inactivity expiry; `Disk.Logger` (nil = `slog.Default()`) |
-| `cache.Keys` | tells the cache which keys are log pages (own share), low priority, or ranged |
-| `cache.WithRequestStats` | per-request lookups through every tier as memory hits, disk hits and loads (`ClassCounts`, `HitRatio`); `Cache.ClassCounts` is the process's |
-| `rangeread.Plan` | unions and coalesces extents under gap, extra-byte and range limits |
-
-`Cache.Put` writes through to the memory and disk tiers, so ranged reads of an
-object this process wrote are cache hits. Objects are immutable: the cache
-never re-validates a key. A key under `ns/<name>/` belongs to namespace
-`<name>` for `InvalidateNamespace`, pins and expiry; after
-`InvalidateNamespace`, Unpin or re-Pin that namespace's disk pins. A loader
-panic comes back as an error, its stack to `Cache.Logger`. `NewDisk` locks its
-directory and removes stale ones a crashed process left under `dir`.
-
-## Leader election / single writer on S3
-
-1. Acquire: `l, err := lease.Acquire(ctx, s, "jobs/leader", lease.OwnerID(), lease.DefaultTTL)`. `ErrNotOwner` means someone else holds it; retry later. A long-lived caller that retries keeps one handle (`l := lease.New(...)`, then `err := l.Acquire(ctx)` in its loop): the handle remembers its unresolved writes and adopts one that landed late, where a fresh handle waits it out (1.5 TTL).
-2. Say what losing it costs: `l.Start(func() { cancelWork() })`. The lease renews itself every TTL/4 from `Acquire` on. `l.SetLogger(logger)` logs renewal failures and fences.
-3. Before every guarded action: `if err := l.Valid(); err != nil { stop }`.
-4. Hand it over when done: `l.Release(ctx)`. The next process takes it at once instead of waiting out the TTL. If `ctx` ends first, the lease stops locally and the handover is skipped.
-
-| event | what happens |
-| --- | --- |
-| renewal CAS loses to another owner | `ErrNotOwner`, the lease fences: your `Start` callback runs once on its own goroutine (`Done()` waits for it), `Valid` refuses from then on |
-| renewal fails without proof (timeout, 5xx) | one immediate retry; still a holder until the local deadline, fenced once it passes |
-| holder partitioned or crashed | nobody takes the key until its stored expiry plus TTL/2 (the clock-skew margin) |
-| PUT landed but the answer was lost | the object is read back: our own nonce there means held, not lost |
-| an earlier lost PUT lands late | its nonce was recorded as pending, so the renewal adopts it instead of fencing itself |
-
-Every write carries a fresh nonce, so the read-back tells "my write landed" from "someone else's did" without guessing. The holder's deadline runs on its local monotonic clock from before the PUT, so it stops acting no later than a taker may start. Same TTL across the fleet, clock error below TTL/2.
-
-- The fence callback may call `Release` or `Retire`; neither runs it or waits for it. It must not wait on `Done()`.
-- A fence before `Start` is owed to it: `Start` runs the callback on the caller's goroutine, and `Done()` stays open until it returns (or until `Release`/`Retire` gives it up). A fence after `Release` or `Retire` runs no callback.
-- `lease.Shared` shares one lease among several holders in a process by reference count; the last `Ref.Release(ctx)` hands it back.
-- `l.CheckHeadOnRenewal(fn)` runs `fn` after each renewal. It fences only when `fn`'s error wraps `ErrNotOwner`; any other error is logged and retried, never a fence, since the renewal already extended the lease.
-- A lease check cannot fence a write already in flight. Guard durable writes with their own CAS (the ETag, or a sequence), not a post-check.
-
-## Encryption
-
-1. Say which key each object gets: `s = s.WithKMSKeys(func(ctx context.Context, key string) (string, error) { ... })`. Return `""` for the bucket's own policy.
-2. Write as usual. S3 stores each keyed object with `x-amz-server-side-encryption: aws:kms` and that key id; GCS with that `kmsKeyName`.
-3. Read as usual. The store decrypts with the key the object was written under; nothing to pass.
-4. For one write only: `ctx = objstore.WithKMSKey(ctx, id)`. On a store with a `WithKMSKeys` function, the function decides; it reads `objstore.KMSKey(ctx)` to honour it.
-
-| case | what happens |
-| --- | --- |
-| key disabled, deleted or grant removed | reads and writes of its objects fail with an error wrapping `objstore.ErrAccessDenied` |
-| key rotated in KMS | nothing to do; the store uses the key's current version |
-| `s.KMS()` | `true` on S3 and GCS; `false` on `fs`, which ignores keys and encrypts nothing |
-| tests | `s, k := storetest.NewKMS(s)` records each object's key (`k.KeyOf`) and revokes one (`k.Revoke`, `k.Restore`) |
-
-`s3.Config.SSE` and `KMSKeyID` still set one policy for the whole bucket.
-
-## Tests with faults
-
-1. `s := bucket.New(t)` (`objstore/storetest/bucket`) gives a fresh bucket per test, dropped at cleanup.
-2. `s, f := bucket.NewFaulty(t)` wraps it in a `*storetest.Fault`; `storetest.Faulty(t, s)` wraps a Store you opened yourself.
-3. Arm one crash point: `f.Set(storetest.Plan{Op: storetest.OpPut, N: 2, Key: "manifest", Mode: storetest.Ambiguous})`.
-   `Fail` errors before the write, `Ambiguous` writes and then errors, `Hang` blocks until the call's context ends (use `t.Context()`), `Pause` blocks until `f.Resume()`.
-4. Read what happened: `f.Fired()`, `f.Ops()`, `f.ReadKeys()`, `f.WriteKeys()`, `f.ReadBytes()`, `f.WriteBytes()`.
-
-`f.SetShape(storetest.Shape{Latency, BytesPerSecond, ErrorRate, Seed})` adds
-seeded latency, bandwidth and errors to every call. `f.WatchRewrites()` flags
-any key rewritten with different bytes.
-
-## Test
+## Development
 
 ```sh
 go test -race ./...
-OBJSTORE_TEST_S3=http://localhost:9000 go test -race -skip '/ETagCASMissing' ./...   # the same suite against MinIO
 ```
 
-Without `OBJSTORE_TEST_S3` every suite runs on a file bucket in a temp
-directory; the S3 client's error and paging mapping runs against a fake
-server either way. `storetest.Conformance(t, s)` is the suite every backend
-passes; run it on your own `objstore.Backend` via `objstore.Open`.
-`storetest` imports no provider, so that links neither the AWS nor the GCS
-SDK; the per-test buckets live in `storetest/bucket`. MinIO creates the
-object on a `PutIfMatch` of a missing key, hence the skip.
+Without any configuration, every suite runs on a file bucket in a temp
+directory, and the S3 and GCS clients run against fake servers. Set these to
+run against real stores; each test is skipped when its variable is unset.
+
+- `OBJSTORE_TEST_S3` is an S3 endpoint, e.g. MinIO at `http://localhost:9000`. `AWS_ACCESS_KEY_ID`, `AWS_SECRET_ACCESS_KEY` and `AWS_REGION` default to MinIO's `minioadmin`, `minioadmin` and `us-east-1` when unset.
+- `OBJSTORE_TEST_R2_ENDPOINT` is `https://<account-id>.r2.cloudflarestorage.com`, with an R2 API token in `AWS_ACCESS_KEY_ID` and `AWS_SECRET_ACCESS_KEY`, and `AWS_REGION=auto`. It runs `TestR2` in `./aws/s3`.
+- `OBJSTORE_TEST_GCS_PROJECT` is a GCP project where Application Default Credentials can create buckets. It runs `TestConformanceReal` in `./gcp/gcs` against a fresh `objstore-test-<nanos>` bucket, dropped afterwards.
+
+MinIO creates the object on a PutIfMatch of a missing key, where AWS S3 and R2
+answer 404, so skip that subtest there.
+
+```sh
+OBJSTORE_TEST_S3=http://localhost:9000 go test -race -skip '/ETagCASMissing' ./...
+```
 
 CI runs gofmt, `go mod tidy -diff`, vet, staticcheck and the race tests on
-Linux; the same tests against MinIO; the tests on macOS; and `go vet` cross-compiles
+Linux, the same tests against MinIO, and the tests on macOS. It also cross-vets
 for windows, darwin, illumos, solaris and aix/ppc64.
-
-Real providers, each skipped when its variable is unset:
-
-- `OBJSTORE_TEST_S3`: S3 endpoint, e.g. MinIO at `http://localhost:9000` (each of `AWS_ACCESS_KEY_ID`, `AWS_SECRET_ACCESS_KEY`, `AWS_REGION` left unset defaults to MinIO's `minioadmin`, `minioadmin`, `us-east-1`).
-- `OBJSTORE_TEST_R2_ENDPOINT`: `https://<account-id>.r2.cloudflarestorage.com`, with an R2 API token in `AWS_ACCESS_KEY_ID` / `AWS_SECRET_ACCESS_KEY` and `AWS_REGION=auto`. Runs `TestR2` in `./aws/s3`.
-- `OBJSTORE_TEST_GCS_PROJECT`: a GCP project where Application Default Credentials can create buckets. Runs `TestConformanceReal` in `./gcp/gcs` against a fresh `objstore-test-<nanos>` bucket, dropped afterwards. `TestConformance` runs on an in-process fake-gcs-server with no variable.
 
 ## License
 
