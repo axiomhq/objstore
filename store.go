@@ -312,6 +312,9 @@ func (s *Store) Delete(ctx context.Context, key string) error {
 // DeleteMany removes keys. Missing keys are not an error. Empty input is a
 // no-op.
 func (s *Store) DeleteMany(ctx context.Context, keys ...string) error {
+	if len(keys) == 0 {
+		return nil
+	}
 	release, err := s.enterWrite(ctx)
 	if err != nil {
 		return err

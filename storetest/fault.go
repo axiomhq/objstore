@@ -232,6 +232,12 @@ func NewFault(s *objstore.Store) (*objstore.Store, *Fault) {
 	}), f
 }
 
+// SupportsKMS preserves the wrapped backend's optional capability.
+func (f *Fault) SupportsKMS() bool {
+	k, ok := f.b.(interface{ SupportsKMS() bool })
+	return ok && k.SupportsKMS()
+}
+
 // SetShape replaces the transport shape; the zero Shape turns shaping
 // off. Calls already in flight keep the shape they started with.
 func (f *Fault) SetShape(s Shape) {
@@ -515,8 +521,10 @@ func (f *Fault) Put(ctx context.Context, key string, data []byte) error {
 	if hit && m != Ambiguous {
 		return f.pre(ctx, m)
 	}
-	if err := f.shapeCall(ctx, len(data)); err != nil {
-		return err
+	if !hit {
+		if err := f.shapeCall(ctx, len(data)); err != nil {
+			return err
+		}
 	}
 	err := f.b.Put(ctx, key, data)
 	if err == nil {
@@ -536,8 +544,10 @@ func (f *Fault) PutIfAbsent(ctx context.Context, key string, data []byte) (bool,
 	if hit && m != Ambiguous {
 		return false, f.pre(ctx, m)
 	}
-	if err := f.shapeCall(ctx, len(data)); err != nil {
-		return false, err
+	if !hit {
+		if err := f.shapeCall(ctx, len(data)); err != nil {
+			return false, err
+		}
 	}
 	ok, err := f.b.PutIfAbsent(ctx, key, data)
 	if ok && err == nil {
@@ -557,8 +567,10 @@ func (f *Fault) PutIfMatch(ctx context.Context, key string, data []byte, etag st
 	if hit && m != Ambiguous {
 		return false, f.pre(ctx, m)
 	}
-	if err := f.shapeCall(ctx, len(data)); err != nil {
-		return false, err
+	if !hit {
+		if err := f.shapeCall(ctx, len(data)); err != nil {
+			return false, err
+		}
 	}
 	ok, err := f.b.PutIfMatch(ctx, key, data, etag)
 	if ok && err == nil {
@@ -612,8 +624,10 @@ func (f *Fault) Delete(ctx context.Context, key string) error {
 	if hit && m != Ambiguous {
 		return f.pre(ctx, m)
 	}
-	if err := f.shapeCall(ctx, 0); err != nil {
-		return err
+	if !hit {
+		if err := f.shapeCall(ctx, 0); err != nil {
+			return err
+		}
 	}
 	err := f.b.Delete(ctx, key)
 	if err == nil {
@@ -634,8 +648,10 @@ func (f *Fault) DeleteMany(ctx context.Context, keys ...string) error {
 	if hit && m != Ambiguous {
 		return f.pre(ctx, m)
 	}
-	if err := f.shapeCall(ctx, 0); err != nil {
-		return err
+	if !hit {
+		if err := f.shapeCall(ctx, 0); err != nil {
+			return err
+		}
 	}
 	err := f.b.DeleteMany(ctx, keys...)
 	if err == nil {

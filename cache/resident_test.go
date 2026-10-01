@@ -2,6 +2,20 @@ package cache
 
 import "testing"
 
+func TestResidentRefusesUnchargedEntries(t *testing.T) {
+	for _, capacity := range []int{0, 100} {
+		for _, size := range []int{-1, 0} {
+			r := NewResident(capacity)
+			if r.Put("ns/a/wal/", 1, "ns/a/wal/1", new(int), size, 0) {
+				t.Errorf("capacity %d admitted size %d", capacity, size)
+			}
+			if _, ok := r.Get("ns/a/wal/1"); ok || r.Charge() != 0 {
+				t.Errorf("capacity %d retained an uncharged entry", capacity)
+			}
+		}
+	}
+}
+
 // Resident refuses what does not fit instead of evicting, refuses truncated
 // pages, and forgets a namespace's pages and floors on invalidation.
 func TestResidentBudgetFloorAndInvalidation(t *testing.T) {

@@ -33,13 +33,16 @@ func TestConformance(t *testing.T) {
 			name = "fake-304"
 		}
 		t.Run(name, func(t *testing.T) {
+			ctx, cancel := context.WithTimeout(t.Context(), time.Minute)
+			defer cancel()
 			server := fakestorage.NewServer(nil)
 			t.Cleanup(server.Stop)
 			hc := server.HTTPClient()
 			if notModified {
 				hc = &http.Client{Transport: notModifiedTransport{hc.Transport}}
 			}
-			s, err := gcs.Open(context.Background(), gcs.Config{
+			hc = &http.Client{Transport: boundedTransport{hc.Transport}}
+			s, err := gcs.Open(ctx, gcs.Config{
 				Bucket:    "conformance",
 				ProjectID: "test",
 				Options: []option.ClientOption{
@@ -51,12 +54,22 @@ func TestConformance(t *testing.T) {
 			if err != nil {
 				t.Fatal(err)
 			}
-			if err := s.EnsureBucket(context.Background()); err != nil {
+			if err := s.EnsureBucket(ctx); err != nil {
 				t.Fatal(err)
 			}
 			storetest.Conformance(t, s)
 		})
 	}
+}
+
+// Fail at the request boundary rather than let a hung fake pin the test.
+type boundedTransport struct{ next http.RoundTripper }
+
+func (b boundedTransport) RoundTrip(req *http.Request) (*http.Response, error) {
+	if _, ok := req.Context().Deadline(); !ok {
+		return nil, errors.New("GCS test request has no deadline")
+	}
+	return b.next.RoundTrip(req)
 }
 
 // notModifiedTransport turns a media download whose generation equals
@@ -88,7 +101,8 @@ func TestConformanceReal(t *testing.T) {
 	if project == "" {
 		t.Skip("OBJSTORE_TEST_GCS_PROJECT not set")
 	}
-	ctx := context.Background()
+	ctx, cancel := context.WithTimeout(t.Context(), time.Minute)
+	defer cancel()
 	s, err := gcs.Open(ctx, gcs.Config{
 		Bucket:    fmt.Sprintf("objstore-test-%d", time.Now().UnixNano()),
 		ProjectID: project,
@@ -100,7 +114,9 @@ func TestConformanceReal(t *testing.T) {
 		t.Fatal(err)
 	}
 	t.Cleanup(func() {
-		if err := s.DropBucket(context.Background()); err != nil {
+		ctx, cancel := context.WithTimeout(context.WithoutCancel(t.Context()), time.Minute)
+		defer cancel()
+		if err := s.DropBucket(ctx); err != nil {
 			t.Error(err)
 		}
 	})
@@ -135,21 +151,22 @@ func (k *kmsTransport) RoundTrip(req *http.Request) (*http.Response, error) {
 // TestKMSKeyPerObject: the Store's WithKMSKeys rides on the upload as
 // kmsKeyName, an unkeyed object carries none, and a 403 is ErrAccessDenied.
 func TestKMSKeyPerObject(t *testing.T) {
+	ctx, cancel := context.WithTimeout(t.Context(), time.Minute)
+	defer cancel()
 	server := fakestorage.NewServer(nil)
 	t.Cleanup(server.Stop)
 	tr := &kmsTransport{next: server.HTTPClient().Transport}
-	s, err := gcs.Open(context.Background(), gcs.Config{
+	s, err := gcs.Open(ctx, gcs.Config{
 		Bucket: "kms", ProjectID: "test",
 		Options: []option.ClientOption{
 			option.WithEndpoint(server.URL() + "/storage/v1/"),
 			option.WithoutAuthentication(),
-			option.WithHTTPClient(&http.Client{Transport: tr}),
+			option.WithHTTPClient(&http.Client{Transport: boundedTransport{tr}}),
 		},
 	}, objstore.Config{})
 	if err != nil {
 		t.Fatal(err)
 	}
-	ctx := context.Background()
 	if err := s.EnsureBucket(ctx); err != nil {
 		t.Fatal(err)
 	}

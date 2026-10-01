@@ -12,6 +12,7 @@ import (
 	"sync"
 	"sync/atomic"
 	"testing"
+	"testing/synctest"
 	"time"
 
 	"github.com/axiomhq/objstore"
@@ -133,9 +134,16 @@ func TestWalkParallelVisitError(t *testing.T) {
 	}
 }
 
+// errorText names what an error means, not its text: two walks reading the
+// same missing page from S3 get messages differing in their request IDs.
 func errorText(err error) string {
-	if err == nil {
+	switch {
+	case err == nil:
 		return ""
+	case errors.Is(err, ErrCorrupt):
+		return ErrCorrupt.Error()
+	case errors.Is(err, objstore.ErrNotFound):
+		return objstore.ErrNotFound.Error()
 	}
 	return err.Error()
 }
@@ -303,14 +311,37 @@ func decodeSynthetic(b []byte) (Header, int, error) {
 // most `workers` more fetched pages waiting for one; that is, what it
 // retains is at most the pool plus workers × maxPageBytes.
 func TestWalkParallelBoundsRetainedBytes(t *testing.T) {
+	synctest.Test(t, func(t *testing.T) { checkWalkParallelRetainedBytes(t, false) })
+}
+
+func TestWalkParallelBoundsCleanupEarlyExit(t *testing.T) {
+	synctest.Test(t, func(t *testing.T) { checkWalkParallelRetainedBytes(t, true) })
+}
+
+func checkWalkParallelRetainedBytes(t *testing.T, earlyExit bool) {
+	t.Helper()
 	const workers = 8
 	const size = 4 << 20                                   // wire bytes; a permit is 4x
 	const permitted = int64(maxInFlightBytes / (4 * size)) // pages the pool holds at once
 	pages := &syntheticPages{last: 100, size: size}
-	ctx, cancel := context.WithCancel(context.Background())
+	ctx, cancel := context.WithTimeout(t.Context(), 10*time.Second)
 	defer cancel()
 	stalled, resume := make(chan struct{}), make(chan struct{})
 	done := make(chan error, 1)
+	defer func() {
+		// An assertion failure must release the visitor and join the walk too.
+		cancel()
+		close(resume)
+		synctest.Wait()
+		select {
+		case err := <-done:
+			if !errors.Is(err, context.Canceled) {
+				t.Errorf("walk after cancellation: %v", err)
+			}
+		default:
+			t.Error("walk did not stop after releasing the visitor")
+		}
+	}()
 	go func() {
 		first := true
 		done <- WalkParallelWithGet(ctx, pages.get, testPrefix, 0, 0, workers, decodeSynthetic, nil, func(Entry[int]) error {
@@ -322,23 +353,18 @@ func TestWalkParallelBoundsRetainedBytes(t *testing.T) {
 			return nil
 		})
 	}()
-	<-stalled
-	// Let the walk run as far ahead as it can.
-	for last := int64(-1); ; {
-		time.Sleep(50 * time.Millisecond)
-		n := pages.gets.Load()
-		if n == last {
-			break
-		}
-		last = n
+	select {
+	case <-stalled:
+	case <-ctx.Done():
+		t.Fatal("visitor never stalled:", ctx.Err())
 	}
+	if earlyExit {
+		return // exercise the same exit path as an assertion failure
+	}
+	// Wait until every worker is blocked, not merely slow to fetch a page.
+	synctest.Wait()
 	if got, bound := pages.gets.Load(), permitted+workers; got > bound {
 		t.Fatalf("%d pages fetched with the visitor stalled on the first; want at most %d (pool %d + workers %d)", got, bound, permitted, workers)
-	}
-	close(resume)
-	cancel()
-	if err := <-done; !errors.Is(err, context.Canceled) {
-		t.Fatal(err)
 	}
 }
 

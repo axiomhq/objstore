@@ -5,9 +5,11 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"math"
 	"slices"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -130,6 +132,134 @@ func TestBadRecordAloneClaimsNothing(t *testing.T) {
 	}
 	if entries, err := replay(ctx, s, testPrefix, 0); err != nil || len(entries) != 1 || entries[0].Seq != 1 {
 		t.Fatalf("replay: %+v, %v", entries, err)
+	}
+}
+
+func TestBadRecordPreservesCause(t *testing.T) {
+	t.Run("standalone", func(t *testing.T) {
+		b := &batch[testRecord]{records: []testRecord{{fail: true}}}
+		if _, _, err := splitBatch(1, b); !errors.Is(err, ErrInvalidRecord) || !errors.Is(err, errBoom) {
+			t.Fatalf("splitBatch: %v, want ErrInvalidRecord and boom", err)
+		}
+	})
+	t.Run("writer", func(t *testing.T) {
+		ctx, cancel := context.WithTimeout(t.Context(), 10*time.Second)
+		defer cancel()
+		w := NewWriter[testRecord](bucket.NewFS(t), testPrefix, 1, nil, WithCommitInterval(MinCommitInterval))
+		defer w.Close()
+		if err := w.Append(ctx, []testRecord{{fail: true}}); !errors.Is(err, ErrInvalidRecord) || !errors.Is(err, errBoom) {
+			t.Fatalf("Append: %v, want ErrInvalidRecord and boom", err)
+		}
+	})
+}
+
+func TestEnqueueRefusesOverflowingSize(t *testing.T) {
+	ctx, cancel := context.WithTimeout(t.Context(), time.Second)
+	defer cancel()
+	// Admission alone: accepting the hostile size must not start encoding.
+	w := &Writer[testRecord]{unackedByteLimit: maxUnackedBytes, kick: make(chan struct{}, 1)}
+	if _, err := w.Enqueue(ctx, []testRecord{{size: math.MaxInt}}); !errors.Is(err, ErrRecordTooLarge) {
+		t.Fatalf("Enqueue: %v, reserved bytes %d; want ErrRecordTooLarge", err, w.Stats().UnackedBytes)
+	}
+	if st := w.Stats(); st.Pending != 0 || st.UnackedBytes != 0 {
+		t.Fatalf("refused record was queued: %+v", st)
+	}
+}
+
+func TestReservedEntryBytesOverflow(t *testing.T) {
+	for _, tc := range []struct{ bytes, records int }{{math.MaxInt, 1}, {0, math.MaxInt}} {
+		if n := reservedEntryBytes(tc.bytes, tc.records); n != math.MaxInt {
+			t.Fatalf("reservedEntryBytes(%d, %d) = %d, want saturation at math.MaxInt", tc.bytes, tc.records, n)
+		}
+	}
+}
+
+func TestWriterRefusesSequenceOverflow(t *testing.T) {
+	for _, seq := range []uint64{0, math.MaxUint64} {
+		t.Run(fmt.Sprint(seq), func(t *testing.T) {
+			ctx, cancel := context.WithTimeout(t.Context(), 10*time.Second)
+			defer cancel()
+			s, f := storetest.Faulty(t, bucket.NewFS(t))
+			w := NewWriter[Bytes](s, testPrefix, seq, nil, WithCommitInterval(MinCommitInterval))
+			defer w.Close()
+			for range 2 {
+				if err := w.Append(ctx, rows("not-written")); !errors.Is(err, ErrWriterFailed) || errors.Is(err, ErrUnresolved) {
+					t.Fatalf("Append at sequence %d: %v, want ErrWriterFailed", seq, err)
+				}
+			}
+			if ops := f.Ops(); len(ops) != 0 {
+				t.Fatalf("refused sequence reached the store: %v", ops)
+			}
+			if st := w.Stats(); !errors.Is(st.Terminal, ErrWriterFailed) || st.Unresolved != 0 {
+				t.Fatalf("stats: %+v", st)
+			}
+		})
+	}
+	t.Run("multi-page", func(t *testing.T) {
+		b := &batch[testRecord]{records: named("r", 3, 1000), pageLimit: 1100}
+		if pages, _, err := splitBatch(math.MaxUint64-1, b); !errors.Is(err, ErrWriterFailed) || pages != nil {
+			t.Fatalf("splitBatch: %d pages, %v; want ErrWriterFailed and no pages", len(pages), err)
+		}
+	})
+}
+
+func TestWriterRechecksFloorAfterClaim(t *testing.T) {
+	ctx, cancel := context.WithTimeout(t.Context(), 10*time.Second)
+	defer cancel()
+	s := bucket.NewFS(t)
+	var watermark atomic.Uint64
+	watermark.Store(1)
+	captured, resume := make(chan struct{}), make(chan struct{})
+	var release sync.Once
+	w := NewWriter[Bytes](s, testPrefix, 2, nil, WithCommitInterval(MinCommitInterval))
+	defer w.Close()
+	// Release the oracle before Close, including on assertion failures.
+	defer release.Do(func() { close(resume) })
+	first := true
+	w.SetFloor(func(ctx context.Context, retry bool) (uint64, error) {
+		f := watermark.Load()
+		if first {
+			first = false
+			close(captured)
+			select {
+			case <-resume:
+			case <-ctx.Done():
+				return 0, ctx.Err()
+			}
+		} else if !retry {
+			return 0, errors.New("post-claim floor must request a fresh watermark")
+		}
+		return f, nil
+	})
+	receipt, err := w.Enqueue(ctx, rows("stale"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	select {
+	case <-captured:
+	case <-ctx.Done():
+		t.Fatal("floor was not read:", ctx.Err())
+	}
+	replacement := NewWriter[Bytes](s, testPrefix, 2, nil, WithCommitInterval(MinCommitInterval))
+	defer replacement.Close()
+	if err := replacement.Append(ctx, rows("checkpointed")); err != nil {
+		t.Fatal(err)
+	}
+	watermark.Store(2)
+	if err := s.Delete(ctx, Key(testPrefix, 2)); err != nil {
+		t.Fatal(err)
+	}
+	release.Do(func() { close(resume) })
+	select {
+	case err := <-receipt:
+		if !errors.Is(err, ErrUnresolved) {
+			t.Fatalf("stale claim below checkpoint: %v, want ErrUnresolved", err)
+		}
+	case <-ctx.Done():
+		t.Fatal("stale claim did not finish:", ctx.Err())
+	}
+	if err := w.Append(ctx, rows("later")); !errors.Is(err, ErrWriterFailed) {
+		t.Fatalf("Append after covered claim: %v, want ErrWriterFailed", err)
 	}
 }
 

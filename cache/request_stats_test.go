@@ -2,9 +2,11 @@ package cache
 
 import (
 	"context"
+	"errors"
 	"strings"
 	"sync"
 	"testing"
+	"time"
 )
 
 func TestConcurrentRequestStatsStayIsolated(t *testing.T) {
@@ -121,6 +123,8 @@ func TestRequestStatsCountSlicesOfCachedObjects(t *testing.T) {
 }
 
 func TestClassCountsSplitLookupsByKeyAndOutcome(t *testing.T) {
+	ctx, cancel := context.WithTimeout(t.Context(), 5*time.Second)
+	defer cancel()
 	keys := Keys{Ranged: func(key string) bool { return strings.Contains(key, "#range#") }}
 	for key, want := range map[string]Class{
 		"ns/a/table/1#range#0+4096":  ClassBlock,
@@ -140,7 +144,7 @@ func TestClassCountsSplitLookupsByKeyAndOutcome(t *testing.T) {
 	load := func(context.Context) ([]byte, error) { return []byte("region"), nil }
 	cold := New(nil, 1<<20, disk, keys)
 	for range 2 { // a load, then a memory hit
-		if _, err := cold.FetchWith(context.Background(), key, load); err != nil {
+		if _, err := cold.FetchWith(ctx, key, load); err != nil {
 			t.Fatal(err)
 		}
 	}
@@ -149,14 +153,22 @@ func TestClassCountsSplitLookupsByKeyAndOutcome(t *testing.T) {
 	}
 	// A new process over the same disk tier: its memory misses, the disk answers.
 	warm := New(nil, 1<<20, disk, keys)
-	if _, err := warm.FetchWith(context.Background(), key, func(context.Context) ([]byte, error) {
-		t.Fatal("store read on a disk hit")
-		return nil, nil
-	}); err != nil {
+	unexpected := errors.New("store read on a disk hit")
+	diskHitLoad := func(context.Context) ([]byte, error) {
+		return nil, unexpected
+	}
+	if _, err := warm.FetchWith(ctx, key, diskHitLoad); err != nil {
 		t.Fatal(err)
 	}
 	if got := warm.ClassCounts(); got.Loads[ClassBlock] != 0 || got.DiskHits[ClassBlock] != 1 || got.MemoryHits[ClassBlock] != 0 {
 		t.Fatalf("disk-backed process: %+v, want one disk hit", got)
+	}
+	// Exercise the assertion's error path too: a loader must return rather
+	// than terminate singleflight's goroutine without answering its waiter.
+	missCtx, missCancel := context.WithTimeout(t.Context(), time.Second)
+	defer missCancel()
+	if _, err := warm.FetchWith(missCtx, key+"-missing", diskHitLoad); !errors.Is(err, unexpected) {
+		t.Fatalf("unexpected miss: %v, want %v", err, unexpected)
 	}
 }
 

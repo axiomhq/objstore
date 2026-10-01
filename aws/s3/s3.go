@@ -235,7 +235,7 @@ func (s *Backend) PutIfAbsent(ctx context.Context, key string, data []byte) (boo
 		case "PreconditionFailed":
 			return false, nil
 		case "ConditionalRequestConflict":
-			return false, opErr("put-if-absent", key, fmt.Errorf("%w: %v", objstore.ErrConflict, err))
+			return false, opErr("put-if-absent", key, fmt.Errorf("%w: %w", objstore.ErrConflict, err))
 		}
 		return false, opErr("put-if-absent", key, err)
 	}
@@ -256,7 +256,7 @@ func (s *Backend) Get(ctx context.Context, key string) ([]byte, error) {
 	out, err := s.client.GetObject(ctx, &awss3.GetObjectInput{Bucket: &s.bucket, Key: &key})
 	if err != nil {
 		if apiErrorCode(err) == "NoSuchKey" {
-			return nil, opErr("get", key, objstore.ErrNotFound)
+			return nil, opErr("get", key, fmt.Errorf("%w: %w", objstore.ErrNotFound, err))
 		}
 		return nil, opErr("get", key, err)
 	}
@@ -364,7 +364,12 @@ func (s *Backend) EnsureBucket(ctx context.Context) error {
 	if code := apiErrorCode(err); code != "NotFound" && code != "NoSuchBucket" {
 		return opErr("head-bucket", s.bucket, err)
 	}
-	_, err = s.client.CreateBucket(ctx, &awss3.CreateBucketInput{Bucket: &s.bucket})
+	in := &awss3.CreateBucketInput{Bucket: &s.bucket}
+	opts := s.client.Options()
+	if aws.ToString(opts.BaseEndpoint) == "" && opts.Region != "us-east-1" {
+		in.CreateBucketConfiguration = &types.CreateBucketConfiguration{LocationConstraint: types.BucketLocationConstraint(opts.Region)}
+	}
+	_, err = s.client.CreateBucket(ctx, in)
 	var owned *types.BucketAlreadyOwnedByYou
 	var exists *types.BucketAlreadyExists
 	if errors.As(err, &owned) || errors.As(err, &exists) {
@@ -404,7 +409,7 @@ func (s *Backend) GetWithETag(ctx context.Context, key string) ([]byte, string, 
 	out, err := s.client.GetObject(ctx, &awss3.GetObjectInput{Bucket: &s.bucket, Key: &key})
 	if err != nil {
 		if apiErrorCode(err) == "NoSuchKey" {
-			return nil, "", opErr("get-with-etag", key, objstore.ErrNotFound)
+			return nil, "", opErr("get-with-etag", key, fmt.Errorf("%w: %w", objstore.ErrNotFound, err))
 		}
 		return nil, "", opErr("get-with-etag", key, err)
 	}
@@ -432,7 +437,7 @@ func (s *Backend) GetIfChanged(ctx context.Context, key, etag string) ([]byte, s
 			return nil, etag, true, nil
 		}
 		if apiErrorCode(err) == "NoSuchKey" {
-			err = objstore.ErrNotFound
+			err = fmt.Errorf("%w: %w", objstore.ErrNotFound, err)
 		}
 		return nil, "", false, opErr("get-if-changed", key, err)
 	}
@@ -465,7 +470,7 @@ func (s *Backend) PutIfMatch(ctx context.Context, key string, data []byte, etag 
 		case "PreconditionFailed", "NoSuchKey":
 			return false, nil
 		case "ConditionalRequestConflict":
-			return false, opErr("put-if-match", key, fmt.Errorf("%w: %v", objstore.ErrConflict, err))
+			return false, opErr("put-if-match", key, fmt.Errorf("%w: %w", objstore.ErrConflict, err))
 		}
 		return false, opErr("put-if-match", key, err)
 	}
@@ -481,9 +486,9 @@ func (s *Backend) GetRange(ctx context.Context, key string, offset, length int64
 	if err != nil {
 		switch apiErrorCode(err) {
 		case "NoSuchKey":
-			err = objstore.ErrNotFound
+			err = fmt.Errorf("%w: %w", objstore.ErrNotFound, err)
 		case "InvalidRange":
-			err = objstore.ErrRange
+			err = fmt.Errorf("%w: %w", objstore.ErrRange, err)
 		}
 		return nil, opErr("get-range", key, err)
 	}

@@ -45,6 +45,7 @@ func TestFSSyncDirsDecision(t *testing.T) {
 	if err := f.EnsureBucket(ctx); err != nil {
 		t.Fatal(err)
 	}
+	f.dirSyncs.Store(0)
 	syncs := func() int64 { return f.dirSyncs.Load() }
 	check := func(want int64, what string) {
 		t.Helper()
@@ -552,8 +553,8 @@ func TestFSPutIfAbsentRetrySyncsAfterFailedDirSync(t *testing.T) {
 				t.Fatal("retry that found its own unsynced object issued no directory sync")
 			}
 			f.dirSyncs.Store(0)
-			if ok, err := f.PutIfAbsent(ctx, "log/1", []byte("v")); ok || err != nil || f.dirSyncs.Load() != 0 {
-				t.Fatalf("lost race on a synced directory: ok=%v err=%v syncs=%d, want no sync", ok, err, f.dirSyncs.Load())
+			if ok, err := f.PutIfAbsent(ctx, "log/1", []byte("v")); ok || err != nil || f.dirSyncs.Load() != 1 {
+				t.Fatalf("lost race on a synced directory: ok=%v err=%v syncs=%d, want one sync", ok, err, f.dirSyncs.Load())
 			}
 		})
 	}
@@ -683,5 +684,268 @@ func TestFSIDIsTheBucketDirectory(t *testing.T) {
 	a, again, other := Open(root, "a", objstore.Config{}), Open(root, "a", objstore.Config{}), Open(root, "b", objstore.Config{})
 	if a.ID() != again.ID() || a.ID() == other.ID() || !strings.HasPrefix(a.ID(), "file://") {
 		t.Fatalf("IDs %q %q %q", a.ID(), again.ID(), other.ID())
+	}
+}
+
+func TestFSListPrefixesPropagatesWalkCancellation(t *testing.T) {
+	ctx, cancel := context.WithTimeout(t.Context(), time.Minute)
+	defer cancel()
+	f := New(t.TempDir(), "b")
+	if err := f.EnsureBucket(ctx); err != nil {
+		t.Fatal(err)
+	}
+	if err := f.Put(ctx, "a/k", []byte("v")); err != nil {
+		t.Fatal(err)
+	}
+	// Cancel in hasObject's walk, after the outer walk has visited a/.
+	walking := cancelWhen{ctx, func() bool { return f.dirReads.Load() >= 2 }}
+	if _, _, err := f.ListPrefixesPage(walking, "", "", 10); !errors.Is(err, context.Canceled) {
+		t.Fatalf("cancelled subtree walk: %v, want context.Canceled", err)
+	}
+}
+
+func TestFSWriteTempStopsOnCancellation(t *testing.T) {
+	for _, size := range []int{writeBackChunk, 3 * writeBackChunk} {
+		t.Run(string(rune('0'+size/writeBackChunk)), func(t *testing.T) {
+			ctx, cancel := context.WithTimeout(t.Context(), time.Minute)
+			defer cancel()
+			f := New(t.TempDir(), "b")
+			if err := f.EnsureBucket(ctx); err != nil {
+				t.Fatal(err)
+			}
+			var timings objstore.Timings
+			writing := cancelWhen{objstore.WithTimings(ctx, &timings), func() bool {
+				for _, p := range fsTempFiles(f.root) {
+					if st, err := os.Stat(p); err == nil && st.Size() >= writeBackChunk {
+						return true
+					}
+				}
+				return false
+			}}
+			if err := f.Put(writing, "k", make([]byte, size)); !errors.Is(err, context.Canceled) {
+				t.Fatalf("cancelled write: %v", err)
+			}
+			for _, a := range timings.Attrs() {
+				if (a.Key == "sys_write_n" && a.Value.Int64() != 1) ||
+					((a.Key == "sys_writeback_n" || a.Key == "sys_fsync_n") && a.Value.Int64() != 0) {
+					t.Errorf("work continued after cancellation: %s=%d", a.Key, a.Value.Int64())
+				}
+			}
+			if temps := fsTempFiles(f.root); len(temps) != 0 {
+				t.Fatalf("temp files leaked: %v", temps)
+			}
+		})
+	}
+}
+
+func TestFSEnsureBucketSyncsCreatedParents(t *testing.T) {
+	ctx, cancel := context.WithTimeout(t.Context(), time.Minute)
+	defer cancel()
+	root := t.TempDir()
+	f := New(filepath.Join(root, "a", "b"), "bucket")
+	var dirs []string
+	f.syncFault = func(dir string) error { dirs = append(dirs, dir); return nil }
+	if err := f.EnsureBucket(ctx); err != nil {
+		t.Fatal(err)
+	}
+	var want []string
+	for dir := f.root; ; dir = filepath.Dir(dir) {
+		want = append(want, dir)
+		if dir == filepath.Dir(dir) {
+			break
+		}
+	}
+	if !slices.Equal(dirs, want) {
+		t.Fatalf("synced directories %v, want %v", dirs, want)
+	}
+	// Even an existing bucket must repay a previous failed sync.
+	injected := errors.New("directory sync failed")
+	f.syncFault = func(string) error { return injected }
+	if err := f.EnsureBucket(ctx); !errors.Is(err, injected) {
+		t.Fatalf("EnsureBucket lost sync error: %v", err)
+	}
+}
+
+func TestFSEnsureBucketRetrySyncsFailedAncestor(t *testing.T) {
+	ctx, cancel := context.WithTimeout(t.Context(), time.Minute)
+	defer cancel()
+	root := t.TempDir()
+	f := New(filepath.Join(root, "a", "b"), "bucket")
+	injected := errors.New("directory sync failed")
+	f.syncFault = func(dir string) error {
+		if dir == root {
+			return injected
+		}
+		return nil
+	}
+	if err := f.EnsureBucket(ctx); !errors.Is(err, injected) {
+		t.Fatalf("first EnsureBucket: %v, want sync failure", err)
+	}
+	var dirs []string
+	f.syncFault = func(dir string) error { dirs = append(dirs, dir); return nil }
+	if err := f.EnsureBucket(ctx); err != nil {
+		t.Fatal(err)
+	}
+	if !slices.Contains(dirs, root) {
+		t.Fatalf("retry synced %v, omitted failed ancestor %s", dirs, root)
+	}
+}
+
+func TestFSListPrefixesSkipsVanishedChild(t *testing.T) {
+	for _, replaced := range []bool{false, true} {
+		t.Run(map[bool]string{false: "removed", true: "replaced"}[replaced], func(t *testing.T) {
+			ctx, cancel := context.WithTimeout(t.Context(), time.Minute)
+			defer cancel()
+			f := New(t.TempDir(), "b")
+			if err := f.EnsureBucket(ctx); err != nil {
+				t.Fatal(err)
+			}
+			for _, key := range []string{"a/k", "b/k"} {
+				if err := f.Put(ctx, key, []byte("v")); err != nil {
+					t.Fatal(err)
+				}
+			}
+			changed := false
+			// Remove a/ after ReadDir has captured it, before hasObject reads it.
+			walking := cancelWhen{ctx, func() bool {
+				if !changed && f.dirReads.Load() == 1 {
+					changed = true
+					path := filepath.Join(f.root, "a")
+					if err := os.RemoveAll(path); err != nil {
+						t.Fatal(err)
+					}
+					if replaced {
+						if err := os.WriteFile(path, []byte("v"), 0o644); err != nil {
+							t.Fatal(err)
+						}
+					}
+				}
+				return false
+			}}
+			got, next, err := f.ListPrefixesPage(walking, "", "", 10)
+			if err != nil || next != "" || !slices.Equal(got, []string{"b/"}) {
+				t.Fatalf("listing after child vanished: %v %q %v, want [b/] and no error", got, next, err)
+			}
+		})
+	}
+}
+
+func TestFSPutIfAbsentSyncsOtherHandlesEntry(t *testing.T) {
+	ctx, cancel := context.WithTimeout(t.Context(), time.Minute)
+	defer cancel()
+	root := t.TempDir()
+	f, other := New(root, "b"), New(root, "b")
+	if err := f.EnsureBucket(ctx); err != nil {
+		t.Fatal(err)
+	}
+	if err := f.Put(ctx, "a/warm", []byte("v")); err != nil {
+		t.Fatal(err)
+	}
+	injected := errors.New("directory sync failed")
+	other.syncFault = func(string) error { return injected }
+	if ok, err := other.PutIfAbsent(ctx, "a/k", []byte("v")); !ok || !errors.Is(err, injected) {
+		t.Fatalf("other handle: %v %v", ok, err)
+	}
+	f.dirSyncs.Store(0)
+	if ok, err := f.PutIfAbsent(ctx, "a/k", []byte("v")); ok || err != nil {
+		t.Fatalf("lost race: %v %v", ok, err)
+	}
+	if got := f.dirSyncs.Load(); got != 1 {
+		t.Fatalf("lost race synced %d directories, want 1", got)
+	}
+}
+
+func TestFSDeleteSyncsDistinctParents(t *testing.T) {
+	for _, batch := range []bool{false, true} {
+		t.Run(map[bool]string{false: "single", true: "batch"}[batch], func(t *testing.T) {
+			ctx, cancel := context.WithTimeout(t.Context(), time.Minute)
+			defer cancel()
+			f := New(t.TempDir(), "b")
+			if err := f.EnsureBucket(ctx); err != nil {
+				t.Fatal(err)
+			}
+			keys := []string{"a/1", "a/2", "b/1"}
+			for _, key := range keys {
+				if err := f.Put(ctx, key, []byte("v")); err != nil {
+					t.Fatal(err)
+				}
+			}
+			var dirs []string
+			f.syncFault = func(dir string) error { dirs = append(dirs, dir); return nil }
+			var err error
+			want := []string{filepath.Join(f.root, "a")}
+			if batch {
+				err = f.DeleteMany(ctx, append(keys, "missing/k")...)
+				want = append(want, filepath.Join(f.root, "b"))
+			} else {
+				err = f.Delete(ctx, keys[0])
+			}
+			if err != nil || !slices.Equal(dirs, want) {
+				t.Fatalf("delete synced %v, want %v: %v", dirs, want, err)
+			}
+			if err := f.Put(ctx, "err/k", []byte("v")); err != nil {
+				t.Fatal(err)
+			}
+			injected := errors.New("directory sync failed")
+			f.syncFault = func(string) error { return injected }
+			if batch {
+				err = f.DeleteMany(ctx, "err/k")
+			} else {
+				err = f.Delete(ctx, "err/k")
+			}
+			if !errors.Is(err, injected) {
+				t.Fatalf("delete lost sync error: %v", err)
+			}
+		})
+	}
+}
+
+// TestFSEnsureBucketUnderUnreadableAncestor: a directory we may cross but not
+// read (mode 0311) was not created by EnsureBucket, so it is not synced and
+// does not fail the call.
+func TestFSEnsureBucketUnderUnreadableAncestor(t *testing.T) {
+	if os.Geteuid() == 0 {
+		t.Skip("root reads every directory")
+	}
+	ctx, cancel := context.WithTimeout(t.Context(), time.Minute)
+	defer cancel()
+	p := filepath.Join(t.TempDir(), "p")
+	if err := os.Mkdir(p, 0o311); err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { os.Chmod(p, 0o755) })
+	if err := New(filepath.Join(p, "data"), "b").EnsureBucket(ctx); err != nil {
+		t.Fatal(err)
+	}
+}
+
+// TestFSEnsureBucketReportsUnsyncableBucket: only an ancestor we may not open
+// is skipped. A bucket directory we cannot open, or an ancestor whose fsync
+// is refused, fails the call.
+func TestFSEnsureBucketReportsUnsyncableBucket(t *testing.T) {
+	if os.Geteuid() == 0 {
+		t.Skip("root reads every directory")
+	}
+	ctx, cancel := context.WithTimeout(t.Context(), time.Minute)
+	defer cancel()
+	root := t.TempDir()
+	bucket := filepath.Join(root, "b")
+	if err := os.Mkdir(bucket, 0o311); err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { os.Chmod(bucket, 0o755) })
+	if err := New(root, "b").EnsureBucket(ctx); !errors.Is(err, os.ErrPermission) {
+		t.Fatalf("unreadable bucket: %v, want ErrPermission", err)
+	}
+
+	f := New(t.TempDir(), "b")
+	f.syncFault = func(dir string) error {
+		if dir != f.root {
+			return os.ErrPermission // refused fsync, not a refused open
+		}
+		return nil
+	}
+	if err := f.EnsureBucket(ctx); !errors.Is(err, os.ErrPermission) {
+		t.Fatalf("refused ancestor fsync: %v, want ErrPermission", err)
 	}
 }

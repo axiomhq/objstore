@@ -4,12 +4,12 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"sync"
 	"testing"
 	"time"
 
 	"github.com/axiomhq/objstore"
 	"github.com/axiomhq/objstore/fs"
-	"github.com/axiomhq/objstore/storetest"
 )
 
 // TestWriteGateBoundsBulkWritesButNotUrgent pins the write path decoupling:
@@ -17,20 +17,10 @@ import (
 // (and honours its context), while an Urgent put — the shape of a WAL
 // commit, manifest swap, or lease heartbeat — goes straight through.
 func TestWriteGateBoundsBulkWritesButNotUrgent(t *testing.T) {
-	ctx := context.Background()
+	ctx, cancel := context.WithTimeout(t.Context(), 5*time.Second)
+	t.Cleanup(cancel)
 	base := openFS(t, objstore.Config{MaxInflightWrites: 1})
-	s, f := storetest.NewFault(base)
-	f.Set(storetest.Plan{Op: storetest.OpPut, N: 1, Mode: storetest.Pause, Key: "bulk-1"})
-
-	first := make(chan error, 1)
-	go func() { first <- s.Put(ctx, "bulk-1", []byte("a")) }()
-	deadline := time.Now().Add(5 * time.Second)
-	for f.Fired() == 0 {
-		if time.Now().After(deadline) {
-			t.Fatal("first put never reached the store")
-		}
-		time.Sleep(time.Millisecond)
-	}
+	s, first, resume := pauseWrite(t, ctx, base, "bulk-1")
 
 	short, cancel := context.WithTimeout(ctx, 100*time.Millisecond)
 	defer cancel()
@@ -44,8 +34,8 @@ func TestWriteGateBoundsBulkWritesButNotUrgent(t *testing.T) {
 		t.Fatalf("blocked bulk put must not have landed: err=%v", err)
 	}
 
-	f.Resume()
-	if err := <-first; err != nil {
+	resume()
+	if err := receiveWrite(t, ctx, first); err != nil {
 		t.Fatal(err)
 	}
 	if err := s.Put(ctx, "bulk-2", []byte("b")); err != nil {
@@ -59,25 +49,117 @@ func TestWriteGateBoundsBulkWritesButNotUrgent(t *testing.T) {
 // TestNegativeMaxInflightWritesIsUnbounded: a negative bound means no
 // bound, not a gate nobody can pass.
 func TestNegativeMaxInflightWritesIsUnbounded(t *testing.T) {
-	ctx := context.Background()
+	ctx, cancel := context.WithTimeout(t.Context(), 5*time.Second)
+	t.Cleanup(cancel)
 	base := openFS(t, objstore.Config{MaxInflightWrites: -1})
-	s, f := storetest.NewFault(base)
-	f.Set(storetest.Plan{Op: storetest.OpPut, N: 1, Mode: storetest.Pause, Key: "held"})
-	first := make(chan error, 1)
-	go func() { first <- s.Put(ctx, "held", []byte("a")) }()
-	for f.Fired() == 0 {
-		time.Sleep(time.Millisecond)
-	}
-	bounded, cancel := context.WithTimeout(ctx, 5*time.Second)
-	defer cancel()
+	s, first, resume := pauseWrite(t, ctx, base, "held")
 	for i := range 4 {
-		if err := s.Put(bounded, fmt.Sprintf("k%d", i), []byte("b")); err != nil {
+		if err := s.Put(ctx, fmt.Sprintf("k%d", i), []byte("b")); err != nil {
 			t.Fatalf("put %d beside a held write: %v", i, err)
 		}
 	}
-	f.Resume()
-	if err := <-first; err != nil {
+	resume()
+	if err := receiveWrite(t, ctx, first); err != nil {
 		t.Fatal(err)
+	}
+}
+
+func TestDeleteManyEmptyBypassesWriteGate(t *testing.T) {
+	ctx, cancel := context.WithTimeout(t.Context(), 5*time.Second)
+	t.Cleanup(cancel)
+	base := openFS(t, objstore.Config{MaxInflightWrites: 1})
+	s, first, resume := pauseWrite(t, ctx, base, "held")
+	short, cancel := context.WithTimeout(ctx, 100*time.Millisecond)
+	defer cancel()
+	if err := s.DeleteMany(short); err != nil {
+		t.Fatalf("empty DeleteMany waited for a write slot: %v", err)
+	}
+	resume()
+	if err := receiveWrite(t, ctx, first); err != nil {
+		t.Fatal(err)
+	}
+}
+
+func TestWriteGateCleanupOnEarlyReturn(t *testing.T) {
+	ctx, cancel := context.WithTimeout(t.Context(), 5*time.Second)
+	t.Cleanup(cancel)
+	base := openFS(t, objstore.Config{MaxInflightWrites: 1})
+	var first <-chan error
+	t.Run("PausedWriter", func(child *testing.T) {
+		_, first, _ = pauseWrite(child, ctx, base, "held")
+		// Return without Resume, as a failed assertion would. Cleanup must
+		// drain the writer before the test's bucket can be removed.
+	})
+	bounded, cancel := context.WithTimeout(ctx, 100*time.Millisecond)
+	defer cancel()
+	select {
+	case err := <-first:
+		if err != nil {
+			t.Fatal(err)
+		}
+	case <-bounded.Done():
+		t.Fatalf("paused writer outlived its test: %v", bounded.Err())
+	}
+}
+
+// pausedPut signals backend entry while the caller still holds its write slot.
+type pausedPut struct {
+	objstore.Backend
+	key     string
+	entered chan struct{}
+	resume  chan struct{}
+}
+
+func (p *pausedPut) Put(ctx context.Context, key string, data []byte) error {
+	if key == p.key {
+		close(p.entered)
+		select {
+		case <-p.resume:
+		case <-ctx.Done():
+			return ctx.Err()
+		}
+	}
+	return p.Backend.Put(ctx, key, data)
+}
+
+func pauseWrite(t *testing.T, ctx context.Context, base *objstore.Store, key string) (*objstore.Store, <-chan error, func()) {
+	t.Helper()
+	p := &pausedPut{key: key, entered: make(chan struct{}), resume: make(chan struct{})}
+	s := base.WithBackend(func(b objstore.Backend) objstore.Backend { p.Backend = b; return p })
+	var once sync.Once
+	resume := func() { once.Do(func() { close(p.resume) }) }
+	first := make(chan error, 1)
+	finished := make(chan struct{})
+	t.Cleanup(func() {
+		resume()
+		cleanupCtx, cancel := context.WithTimeout(context.WithoutCancel(ctx), 5*time.Second)
+		defer cancel()
+		select {
+		case <-finished:
+		case <-cleanupCtx.Done():
+			t.Error("paused writer did not exit during cleanup")
+		}
+	})
+	go func() {
+		defer close(finished)
+		first <- s.Put(ctx, key, []byte("a"))
+	}()
+	select {
+	case <-p.entered:
+	case <-ctx.Done():
+		t.Fatalf("first put never reached the store: %v", ctx.Err())
+	}
+	return s, first, resume
+}
+
+func receiveWrite(t *testing.T, ctx context.Context, ch <-chan error) error {
+	t.Helper()
+	select {
+	case err := <-ch:
+		return err
+	case <-ctx.Done():
+		t.Fatalf("put did not finish: %v", ctx.Err())
+		return ctx.Err()
 	}
 }
 
@@ -86,7 +168,9 @@ func TestNegativeMaxInflightWritesIsUnbounded(t *testing.T) {
 func openFS(t *testing.T, cfg objstore.Config) *objstore.Store {
 	t.Helper()
 	s := fs.Open(t.TempDir(), "b", cfg)
-	if err := s.EnsureBucket(context.Background()); errors.Is(err, errors.ErrUnsupported) {
+	ctx, cancel := context.WithTimeout(t.Context(), 5*time.Second)
+	defer cancel()
+	if err := s.EnsureBucket(ctx); errors.Is(err, errors.ErrUnsupported) {
 		t.Skip(err)
 	} else if err != nil {
 		t.Fatal(err)

@@ -258,6 +258,10 @@ func (c *Cache) FetchCached(ctx context.Context, key string, load func(context.C
 // waited on another's load is answered from memory), and whether this
 // lookup owns the request's miss of key (MarkMissed).
 func (c *Cache) fetchCached(ctx context.Context, key string, load func(context.Context) ([]byte, error), logical bool, storedBytes int) ([]byte, Outcome, bool, error) {
+	return c.fetchCachedOnce(ctx, key, load, logical, storedBytes, false)
+}
+
+func (c *Cache) fetchCachedOnce(ctx context.Context, key string, load func(context.Context) ([]byte, error), logical bool, storedBytes int, retried bool) ([]byte, Outcome, bool, error) {
 	memory := c.ByteCacheFor(key)
 	if b, ok := Scoped(ctx, key); ok {
 		return b, MemoryHit, false, nil
@@ -330,6 +334,11 @@ func (c *Cache) fetchCached(ctx context.Context, key string, load func(context.C
 	select {
 	case r := <-ch:
 		if r.Err != nil {
+			// A background leader's budget is not its follower's budget.
+			if errors.Is(r.Err, ErrBudget) && !led.Load() && !retried && ctx.Err() == nil {
+				b, o, _, err := c.fetchCachedOnce(ctx, key, load, false, storedBytes, true)
+				return b, o, owner, err
+			}
 			return nil, Load, false, r.Err
 		}
 		got := r.Val.(fetched)
@@ -436,11 +445,31 @@ func (c *Cache) Gated(ctx context.Context, read func(context.Context) ([]byte, e
 
 type resultsKey struct{}
 
+type resultsContext struct {
+	context.Context // the parent before this stage's scope
+	results         map[string][]byte
+}
+
+func (c *resultsContext) Value(key any) any {
+	if key == (resultsKey{}) {
+		return c.results
+	}
+	return c.Context.Value(key)
+}
+
 // WithResults publishes one query stage's exact children on ctx. FetchCached
 // prefers them over the LRU so a tiny cache cannot drop a working set the
 // stage already paid for.
+//
+// A previous scope is replaced only when ctx is directly the context
+// returned by WithResults. Wrapping it (for example, with context.WithValue
+// or context.WithCancel) retains that scope's buffers. Per-stage wrappers
+// should derive from the unscoped base context, not the previous scope.
 func WithResults(ctx context.Context, results map[string][]byte) context.Context {
-	return context.WithValue(ctx, resultsKey{}, results)
+	if previous, ok := ctx.(*resultsContext); ok {
+		ctx = previous.Context // do not retain the previous stage's buffers
+	}
+	return &resultsContext{Context: ctx, results: results}
 }
 
 // Scoped looks up a logical key in the stage results published by WithResults.

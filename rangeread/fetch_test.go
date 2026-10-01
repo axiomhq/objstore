@@ -5,13 +5,202 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"sync/atomic"
 	"testing"
 	"time"
 
+	"github.com/axiomhq/objstore"
 	"github.com/axiomhq/objstore/cache"
 	"github.com/axiomhq/objstore/storetest"
 	"github.com/axiomhq/objstore/storetest/bucket"
 )
+
+// readBackend supplies channel rendezvous at the actual store operation.
+type readBackend struct {
+	objstore.Backend
+	get      func(context.Context, string) ([]byte, error)
+	getRange func(context.Context, string, int64, int64) ([]byte, error)
+}
+
+func (b *readBackend) Get(ctx context.Context, key string) ([]byte, error) {
+	if b.get != nil {
+		return b.get(ctx, key)
+	}
+	return b.Backend.Get(ctx, key)
+}
+
+func (b *readBackend) GetRange(ctx context.Context, key string, off, n int64) ([]byte, error) {
+	if b.getRange != nil {
+		return b.getRange(ctx, key, off, n)
+	}
+	return b.Backend.GetRange(ctx, key, off, n)
+}
+
+func TestParentFlightKeyDoesNotAliasObjectGeneration(t *testing.T) {
+	ctx, cancel := context.WithTimeout(t.Context(), 5*time.Second)
+	defer cancel()
+	var r Reader
+	joined := make(chan struct{}, 2)
+	r.joined = func() { joined <- struct{}{} }
+	entered, release := make(chan struct{}), make(chan struct{})
+	x := Extent{Object: "ns/a/object", Length: 3}
+	if err := x.valid(); err != nil {
+		t.Fatal(err)
+	}
+	leader := make(chan error, 1)
+	go func() {
+		_, _, _, err := r.sharedParent(ctx, x, 1, func(ctx context.Context) ([]byte, cache.Outcome, error) {
+			close(entered)
+			select {
+			case <-release:
+				return []byte("ONE"), cache.Load, nil
+			case <-ctx.Done():
+				return nil, cache.Load, ctx.Err()
+			}
+		})
+		leader <- err
+	}()
+	select {
+	case <-entered:
+	case <-ctx.Done():
+		t.Fatal(ctx.Err())
+	}
+	await(t, joined, "generation 1 join")
+	x.Object = "1:ns/a/object"
+	if err := x.valid(); err != nil {
+		t.Fatal(err)
+	}
+	follower := make(chan error, 1)
+	go func() {
+		b, _, _, err := r.sharedParent(ctx, x, 0, func(context.Context) ([]byte, cache.Outcome, error) {
+			return []byte("TWO"), cache.Load, nil
+		})
+		if err == nil && string(b) != "TWO" {
+			err = fmt.Errorf("object %q at generation 0 read %q, want TWO", x.Object, b)
+		}
+		follower <- err
+	}()
+	await(t, joined, "generation 0 join")
+	close(release)
+	if err := await(t, leader, "generation 1 read"); err != nil {
+		t.Fatal(err)
+	}
+	if err := await(t, follower, "generation 0 read"); err != nil {
+		t.Fatal(err)
+	}
+}
+
+func BenchmarkFetchRangesMemoryHit(b *testing.B) {
+	ctx, cancel := context.WithTimeout(b.Context(), time.Minute)
+	defer cancel()
+	objects := cache.New(nil, 1<<20, nil, cache.Keys{})
+	b.Cleanup(objects.Close)
+	r, err := New(nil, objects, Config{})
+	if err != nil {
+		b.Fatal(err)
+	}
+	load := Load{Extent: Extent{Object: "ns/hit/object", Length: 1}, Key: "ns/hit/child"}
+	objects.Memory.Put(load.Key, []byte("x"), 0)
+	b.ReportAllocs()
+	b.ResetTimer()
+	for b.Loop() {
+		got, err := r.FetchRanges(ctx, []Load{load})
+		if data, ok := cache.Scoped(got, load.Key); err != nil || !ok || string(data) != "x" {
+			b.Fatalf("memory hit = %q, %v, %v", data, ok, err)
+		}
+	}
+}
+
+func TestSerialDecodeCancellationStopsPublication(t *testing.T) {
+	ctx, deadline := context.WithTimeout(t.Context(), 5*time.Second)
+	defer deadline()
+	ctx, cancel := context.WithCancel(ctx)
+	defer cancel()
+	s := bucket.NewFS(t)
+	disk, err := cache.NewDisk(t.TempDir(), 1<<20)
+	if err != nil {
+		t.Fatal(err)
+	}
+	objects := cache.New(s, 1<<20, disk, cache.Keys{})
+	t.Cleanup(objects.Close)
+	const object = "ns/cancel/object"
+	if err := s.Put(ctx, object, []byte("abcdef")); err != nil {
+		t.Fatal(err)
+	}
+	calls := 0
+	loads := []Load{
+		{Extent: Extent{Object: object, Length: 2}, Key: object + "#one", Decode: func(b []byte) ([]byte, error) { calls++; cancel(); return b, nil }},
+		{Extent: Extent{Object: object, Offset: 4, Length: 2}, Key: object + "#two", Decode: func(b []byte) ([]byte, error) { calls++; return b, nil }},
+	}
+	r := newReader(t, s, objects, Config{})
+	_, err = r.FetchRanges(ctx, loads)
+	if !errors.Is(err, context.Canceled) || calls != 1 || objects.Memory.Charge() != 0 || disk.Stats().Entries != 0 {
+		t.Fatalf("cancelled decode: err=%v calls=%d memory=%d disk=%d", err, calls, objects.Memory.Charge(), disk.Stats().Entries)
+	}
+}
+
+func TestParentFlightSeparatesNamespaceGenerations(t *testing.T) {
+	ctx, cancel := context.WithTimeout(t.Context(), 5*time.Second)
+	defer cancel()
+	entered, release := make(chan struct{}), make(chan struct{})
+	released := false
+	defer func() {
+		if !released {
+			close(release)
+		}
+	}()
+	s := bucket.NewFS(t).WithBackend(func(b objstore.Backend) objstore.Backend {
+		return &readBackend{Backend: b, getRange: func(ctx context.Context, _ string, _, _ int64) ([]byte, error) {
+			select {
+			case <-entered:
+				return []byte("NEW"), nil
+			default:
+				close(entered)
+			}
+			select {
+			case <-release:
+				return []byte("OLD"), nil
+			case <-ctx.Done():
+				return nil, ctx.Err()
+			}
+		}}
+	})
+	objects := cache.New(s, 1<<20, nil, cache.Keys{})
+	t.Cleanup(objects.Close)
+	r := newReader(t, s, objects, Config{})
+	joined := make(chan struct{}, 2)
+	r.joined = func() { joined <- struct{}{} }
+	loads := []Load{
+		{Extent: Extent{Object: "ns/g/object", Length: 1}, Key: "ns/g/one"},
+		{Extent: Extent{Object: "ns/g/object", Offset: 2, Length: 1}, Key: "ns/g/two"},
+	}
+	leader := make(chan error, 1)
+	go func() { _, err := r.FetchRanges(ctx, loads); leader <- err }()
+	await(t, entered, "old read")
+	await(t, joined, "old join")
+	objects.InvalidateNamespace("g")
+	follower := make(chan error, 1)
+	go func() {
+		got, err := r.FetchRanges(ctx, loads)
+		if b, _ := cache.Scoped(got, loads[0].Key); err == nil && string(b) != "N" {
+			err = fmt.Errorf("generation 1 cached %q, want N", b)
+		}
+		follower <- err
+	}()
+	await(t, joined, "new join")
+	// Release the old read only after the new caller has registered.
+	close(release)
+	released = true
+	if err := await(t, follower, "new stage"); err != nil {
+		t.Fatal(err)
+	}
+	if err := await(t, leader, "old stage"); err != nil {
+		t.Fatal(err)
+	}
+	if b, _ := objects.Memory.Peek(loads[0].Key); string(b) != "N" {
+		t.Fatalf("generation 1 memory = %q, want N", b)
+	}
+}
 
 func TestSingleChildPlanIsNotCachedTwice(t *testing.T) {
 	s, fault := storetest.NewFault(bucket.New(t))
@@ -193,12 +382,25 @@ func TestConcurrentColdParentsShareOneGet(t *testing.T) {
 // TestSharedParentOutlivesItsLeader: a query that joined another query's
 // parent GET does not inherit that query's cancellation.
 func TestSharedParentOutlivesItsLeader(t *testing.T) {
-	s, fault := storetest.NewFault(bucket.New(t))
+	ctx, deadline := context.WithTimeout(t.Context(), 5*time.Second)
+	defer deadline()
+	entered := make(chan struct{})
+	var reads atomic.Int32
+	s := bucket.NewFS(t).WithBackend(func(b objstore.Backend) objstore.Backend {
+		return &readBackend{Backend: b, getRange: func(ctx context.Context, key string, off, n int64) ([]byte, error) {
+			if reads.Add(1) == 1 {
+				close(entered)
+				<-ctx.Done()
+				return nil, ctx.Err()
+			}
+			return b.GetRange(ctx, key, off, n)
+		}}
+	})
 	objects := cache.New(s, 1<<20, nil, cache.Keys{})
 	t.Cleanup(objects.Close)
 	const object = "ns/leader/object"
 	whole := []byte("0123456789abcdefghijklmnopqrstuvwxyz")
-	if err := s.Put(t.Context(), object, whole); err != nil {
+	if err := s.Put(ctx, object, whole); err != nil {
 		t.Fatal(err)
 	}
 	loads := []Load{
@@ -213,24 +415,15 @@ func TestSharedParentOutlivesItsLeader(t *testing.T) {
 		default:
 		}
 	}
-	fault.Set(storetest.Plan{Op: storetest.OpGetRange, Key: object, N: 1, Mode: storetest.Hang})
-	leaderCtx, cancel := context.WithCancel(t.Context())
+	leaderCtx, cancel := context.WithCancel(ctx)
+	defer cancel()
 	leader, follower := make(chan error, 1), make(chan error, 1)
 	go func() { _, err := r.FetchRanges(leaderCtx, loads); leader <- err }()
 	await(t, joined, "leader join")
-	// The flight is registered before its GET starts: wait for the hung GET
-	// itself, or a cancel landing first would let the one-shot Hang fire on
-	// the follower's retry instead.
-	for deadline := time.Now().Add(10 * time.Second); fault.Fired() == 0; time.Sleep(time.Millisecond) {
-		if time.Now().After(deadline) {
-			t.Fatal("the leader's GET never started")
-		}
-	}
+	await(t, entered, "leader GET")
 	go func() {
-		fctx, fcancel := context.WithTimeout(t.Context(), 10*time.Second)
-		defer fcancel()
-		ctx, err := r.FetchRanges(fctx, loads)
-		if got, ok := cache.Scoped(ctx, loads[1].Key); err == nil && (!ok || !bytes.Equal(got, whole[12:18])) {
+		gotCtx, err := r.FetchRanges(ctx, loads)
+		if got, ok := cache.Scoped(gotCtx, loads[1].Key); err == nil && (!ok || !bytes.Equal(got, whole[12:18])) {
 			err = fmt.Errorf("child = %q", got)
 		}
 		follower <- err
@@ -263,7 +456,7 @@ func TestSharedParentFollowerRetriesTheLeadersError(t *testing.T) {
 	own := errors.New("the leader's own budget")
 	leader := make(chan error, 1)
 	go func() {
-		_, _, _, err := r.sharedParent(t.Context(), x, func(context.Context) ([]byte, cache.Outcome, error) {
+		_, _, _, err := r.sharedParent(t.Context(), x, 0, func(context.Context) ([]byte, cache.Outcome, error) {
 			close(started)
 			<-release
 			return nil, cache.Load, own
@@ -274,7 +467,7 @@ func TestSharedParentFollowerRetriesTheLeadersError(t *testing.T) {
 	await(t, joined, "leader join")
 	follower := make(chan error, 1)
 	go func() {
-		data, _, _, err := r.sharedParent(t.Context(), x, func(context.Context) ([]byte, cache.Outcome, error) {
+		data, _, _, err := r.sharedParent(t.Context(), x, 0, func(context.Context) ([]byte, cache.Outcome, error) {
 			return []byte("data"), cache.Load, nil
 		})
 		if err == nil && string(data) != "data" {

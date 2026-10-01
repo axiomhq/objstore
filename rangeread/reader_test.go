@@ -5,6 +5,7 @@ import (
 	"errors"
 	"fmt"
 	"strings"
+	"sync"
 	"testing"
 	"time"
 
@@ -13,6 +14,18 @@ import (
 	"github.com/axiomhq/objstore/storetest"
 	"github.com/axiomhq/objstore/storetest/bucket"
 )
+
+// waitingContext signals when Fetch's select has registered its flight.
+type waitingContext struct {
+	context.Context
+	once    sync.Once
+	waiting chan struct{}
+}
+
+func (c *waitingContext) Done() <-chan struct{} {
+	c.once.Do(func() { close(c.waiting) })
+	return c.Context.Done()
+}
 
 func newReader(t *testing.T, s *objstore.Store, objects *cache.Cache, cfg Config) *Reader {
 	t.Helper()
@@ -93,50 +106,43 @@ func TestReaderPrefetch(t *testing.T) {
 }
 
 // A follower on a shared fetch waits under its own context: a caller that
-// gives up leaves promptly while the leader's GET runs on under the
-// leader's context.
+// gives up leaves promptly while the GET runs on for the remaining waiter.
 func TestFetchFollowerContextCanCancel(t *testing.T) {
-	s, f := bucket.NewFaulty(t)
+	ctx, deadline := context.WithTimeout(t.Context(), 5*time.Second)
+	defer deadline()
+	entered, stopped := make(chan struct{}), make(chan struct{})
+	s := bucket.NewFS(t).WithBackend(func(b objstore.Backend) objstore.Backend {
+		return &readBackend{Backend: b, get: func(ctx context.Context, _ string) ([]byte, error) {
+			close(entered)
+			defer close(stopped)
+			<-ctx.Done()
+			return nil, ctx.Err()
+		}}
+	})
 	objects := cache.New(s, 1<<20, nil, cache.Keys{})
 	t.Cleanup(objects.Close)
 	r := newReader(t, s, objects, Config{})
 	const key = "x/seg/stall"
-	f.Set(storetest.Plan{Op: storetest.OpGet, N: 1, Mode: storetest.Hang, Key: key})
-	leaderCtx, cancelLeader := context.WithCancel(context.Background())
+	leaderCtx, cancelLeader := context.WithCancel(ctx)
 	defer cancelLeader()
 	leaderDone := make(chan error, 1)
 	go func() {
 		_, err := r.Fetch(leaderCtx, key)
 		leaderDone <- err
 	}()
-	for deadline := time.Now().Add(5 * time.Second); f.Fired() == 0; time.Sleep(time.Millisecond) {
-		if time.Now().After(deadline) {
-			t.Fatal("leader never reached the store")
-		}
-	}
-	misses := objects.Memory.Misses()
-	ctx, cancel := context.WithCancel(context.Background())
+	await(t, entered, "leader GET")
+	followerCtx, cancel := context.WithCancel(ctx)
 	defer cancel()
+	fctx := &waitingContext{Context: followerCtx, waiting: make(chan struct{})}
 	followerDone := make(chan error, 1)
 	go func() {
-		_, err := r.Fetch(ctx, key)
+		_, err := r.Fetch(fctx, key)
 		followerDone <- err
 	}()
-	// The follower's own miss precedes its join; it is parked behind the
-	// leader from here on.
-	for deadline := time.Now().Add(5 * time.Second); objects.Memory.Misses() == misses; time.Sleep(time.Millisecond) {
-		if time.Now().After(deadline) {
-			t.Fatal("follower never reached the flight")
-		}
-	}
+	await(t, fctx.waiting, "follower registration")
 	cancel()
-	select {
-	case err := <-followerDone:
-		if !errors.Is(err, context.Canceled) {
-			t.Fatalf("follower error = %v, want context.Canceled", err)
-		}
-	case <-time.After(2 * time.Second):
-		t.Fatal("cancelled follower remained parked behind the leader's GET")
+	if err := await(t, followerDone, "follower"); !errors.Is(err, context.Canceled) {
+		t.Fatalf("follower error = %v, want context.Canceled", err)
 	}
 	select {
 	case err := <-leaderDone:
@@ -144,14 +150,10 @@ func TestFetchFollowerContextCanCancel(t *testing.T) {
 	default:
 	}
 	cancelLeader()
-	select {
-	case err := <-leaderDone:
-		if !errors.Is(err, context.Canceled) {
-			t.Fatalf("leader error = %v, want context.Canceled", err)
-		}
-	case <-time.After(2 * time.Second):
-		t.Fatal("leader did not finish")
+	if err := await(t, leaderDone, "leader"); !errors.Is(err, context.Canceled) {
+		t.Fatalf("leader error = %v, want context.Canceled", err)
 	}
+	await(t, stopped, "last waiter cancelled the GET")
 }
 
 // A loader panic reaches every waiter as an error and never the process:

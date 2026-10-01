@@ -41,8 +41,9 @@ type Load struct {
 // keeps exact children in owned buffers, so a tiny cached child cannot
 // retain a large merged range. The returned scope supplies this query's
 // results even if the LRU is smaller than its selected working set; it
-// dies with the query stage, and a later FetchRanges on the returned ctx
-// replaces it rather than adding to it.
+// is replaced only when a later FetchRanges derives directly from the
+// returned ctx. Wrapping that ctx retains the old scope's buffers;
+// per-stage wrappers should derive from the unscoped base context instead.
 //
 // A stage whose children would retain more than Config.MaxInFlightBytes is
 // skipped: FetchRanges returns ctx unchanged and nil, and the consumer
@@ -94,7 +95,8 @@ func (r *Reader) FetchRanges(ctx context.Context, loads []Load) (context.Context
 			retained += n
 		}
 	}
-	var gens []uint64 // gens[i]: pending[i]'s namespace generation, read before its I/O
+	var gens []uint64                // gens[i]: pending[i]'s namespace generation, read before its I/O
+	var parentGens map[string]uint64 // physical objects' generations, read before planning
 	results := make(map[string][]byte, len(unique))
 	var pending []Load
 	var owners []bool // owners[i]: this lookup owns the request's miss of pending[i] (cache.MarkMissed)
@@ -116,6 +118,12 @@ func (r *Reader) FetchRanges(ctx context.Context, loads []Load) (context.Context
 		}
 		pending = append(pending, load)
 		gens = append(gens, memory.GenerationOf(load.Key))
+		if parentGens == nil {
+			parentGens = make(map[string]uint64)
+		}
+		if _, ok := parentGens[load.Object]; !ok {
+			parentGens[load.Object] = r.objects.ByteCacheFor(load.Object).GenerationOf(load.Object)
+		}
 		owners = append(owners, cache.MarkMissed(ctx, load.Key))
 		extents = append(extents, load.Extent)
 	}
@@ -247,7 +255,7 @@ func (r *Reader) FetchRanges(ctx context.Context, loads []Load) (context.Context
 				// retaining it beside them halves the room the children
 				// have. Concurrent cold reads planning the
 				// same parent still share its one GET.
-				data, src, counted, err = r.sharedParent(gctx, plan.Extent, read)
+				data, src, counted, err = r.sharedParent(gctx, plan.Extent, parentGens[plan.Object], read)
 			}
 			if err != nil {
 				return err
@@ -278,6 +286,9 @@ func (r *Reader) FetchRanges(ctx context.Context, loads []Load) (context.Context
 	// Every assembled child is decoded here, transient ones included; a
 	// direct child was decoded by FetchCachedRange, which cached it.
 	for i, load := range pending {
+		if err := ctx.Err(); err != nil {
+			return ctx, err
+		}
 		data := assembled[i]
 		memory := r.objects.ByteCacheFor(load.Key)
 		if load.Decode != nil && !direct[i] {
@@ -285,6 +296,9 @@ func (r *Reader) FetchRanges(ctx context.Context, loads []Load) (context.Context
 			if err != nil {
 				return ctx, err
 			}
+		}
+		if err := ctx.Err(); err != nil {
+			return ctx, err // a decoder may have cancelled the stage
 		}
 		memory.Missed(load.Key)
 		if o := outcome[i].Load(); o >= 0 {
@@ -297,6 +311,9 @@ func (r *Reader) FetchRanges(ctx context.Context, loads []Load) (context.Context
 			memory.Put(load.Key, data, gens[i])
 		}
 		results[load.Key] = data
+	}
+	if err := ctx.Err(); err != nil {
+		return ctx, err
 	}
 	return cache.WithResults(ctx, results), nil
 }
@@ -314,12 +331,12 @@ type parentRead struct {
 // leader's context, so its error may be the leader's own (a cancellation, a
 // per-request budget): a follower that gets one retries once, as a fresh
 // shared flight under its own context, rather than inherit it.
-func (r *Reader) sharedParent(ctx context.Context, x Extent, read func(context.Context) ([]byte, cache.Outcome, error)) (data []byte, src, counted cache.Outcome, err error) {
-	return r.sharedParentOnce(ctx, x, read, false)
+func (r *Reader) sharedParent(ctx context.Context, x Extent, generation uint64, read func(context.Context) ([]byte, cache.Outcome, error)) (data []byte, src, counted cache.Outcome, err error) {
+	return r.sharedParentOnce(ctx, x, generation, read, false)
 }
 
-func (r *Reader) sharedParentOnce(ctx context.Context, x Extent, read func(context.Context) ([]byte, cache.Outcome, error), retried bool) (data []byte, src, counted cache.Outcome, err error) {
-	key := x.Object + "\x00" + strconv.FormatInt(x.Offset, 10) + "+" + strconv.FormatInt(x.Length, 10)
+func (r *Reader) sharedParentOnce(ctx context.Context, x Extent, generation uint64, read func(context.Context) ([]byte, cache.Outcome, error), retried bool) (data []byte, src, counted cache.Outcome, err error) {
+	key := strconv.FormatUint(generation, 10) + "\x00" + x.Object + "\x00" + strconv.FormatInt(x.Offset, 10) + "+" + strconv.FormatInt(x.Length, 10)
 	var led atomic.Bool
 	ch := r.parents.DoChan(key, func() (v any, err error) {
 		led.Store(true)
@@ -340,7 +357,7 @@ func (r *Reader) sharedParentOnce(ctx context.Context, x Extent, read func(conte
 	case res := <-ch:
 		if res.Err != nil {
 			if !led.Load() && !retried && ctx.Err() == nil {
-				return r.sharedParentOnce(ctx, x, read, true)
+				return r.sharedParentOnce(ctx, x, generation, read, true)
 			}
 			return nil, cache.Load, cache.Load, res.Err
 		}

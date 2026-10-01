@@ -13,8 +13,9 @@ import (
 //
 // No store I/O runs under Shared's mutex: a Join that has to mint, and the
 // last Ref.Release, mark s busy instead, and other Joins wait for them.
-// Every method is callable from a fence callback, which runs on its own
-// goroutine.
+// Methods are callable from a fence callback installed after Join returns.
+// Call Start only after Join returns, not inside mint: an early fence runs
+// the callback on Start's goroutine, so a Join there waits on its own mint.
 type Shared struct {
 	mu   sync.Mutex
 	cond *sync.Cond // signals busy -> false; lazily bound to mu
@@ -50,7 +51,7 @@ func (s *Shared) idle() {
 
 // Join returns a reference to the lease s already holds, or calls mint to
 // acquire one and holds that. A held lease that is no longer valid (fenced,
-// lapsed) is not joined: ErrNotOwner, and mint is not called. Concurrent Joins mint once:
+// retired, lapsed) is not joined: ErrNotOwner, and mint is not called. Concurrent Joins mint once:
 // the others wait for that mint, and try their own if it failed.
 func (s *Shared) Join(mint func() (*Lease, error)) (*Ref, error) {
 	s.mu.Lock()
@@ -89,10 +90,16 @@ type Ref struct {
 	released bool
 }
 
-// Valid is the lease's Valid. A nil Ref holds nothing.
+// Valid is the lease's Valid unless this reference was released. A nil Ref
+// holds nothing.
 func (r *Ref) Valid() error {
-	if r == nil {
+	if r == nil || r.s == nil {
 		return fmt.Errorf("%w: no lease is held", ErrNotOwner)
+	}
+	r.s.mu.Lock()
+	defer r.s.mu.Unlock()
+	if r.released {
+		return fmt.Errorf("%w: this reference was released", ErrNotOwner)
 	}
 	return r.l.Valid()
 }

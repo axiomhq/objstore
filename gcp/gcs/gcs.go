@@ -222,7 +222,7 @@ func (g *Backend) get(ctx context.Context, op, key string) ([]byte, string, erro
 	r, err := g.bucket.Object(key).NewReader(ctx)
 	if err != nil {
 		if isNotFound(err) {
-			err = objstore.ErrNotFound
+			err = fmt.Errorf("%w: %w", objstore.ErrNotFound, err)
 		}
 		return nil, "", opErr(op, key, err)
 	}
@@ -268,7 +268,7 @@ func (g *Backend) GetIfChanged(ctx context.Context, key, etag string) ([]byte, s
 			return nil, etag, true, nil
 		}
 		if isNotFound(err) {
-			err = objstore.ErrNotFound
+			err = fmt.Errorf("%w: %w", objstore.ErrNotFound, err)
 		}
 		return nil, "", false, opErr("get-if-changed", key, err)
 	}
@@ -294,22 +294,22 @@ func (g *Backend) GetRange(ctx context.Context, key string, offset, length int64
 	if err != nil {
 		switch {
 		case isNotFound(err):
-			err = objstore.ErrNotFound
+			err = fmt.Errorf("%w: %w", objstore.ErrNotFound, err)
 		case httpCode(err) == http.StatusRequestedRangeNotSatisfiable:
-			err = objstore.ErrRange
+			err = fmt.Errorf("%w: %w", objstore.ErrRange, err)
 		}
 		return nil, opErr("get-range", key, err)
 	}
 	defer r.Close()
 	// A server ignoring Range must not turn a block read into an unbounded
 	// whole-object download.
-	if r.Remain() != length {
+	if r.Remain() != length || r.Attrs.StartOffset != offset {
 		return nil, opErr("get-range", key, objstore.ErrRange)
 	}
 	data := make([]byte, length)
 	if _, err := io.ReadFull(r, data); err != nil {
 		if errors.Is(err, io.ErrUnexpectedEOF) || errors.Is(err, io.EOF) {
-			err = objstore.ErrRange
+			err = fmt.Errorf("%w: %w", objstore.ErrRange, err)
 		}
 		return nil, opErr("get-range", key, err)
 	}

@@ -77,11 +77,14 @@ type Header struct {
 // length-prefixed, CRC32C. Encoding is deterministic, so retries of the
 // same batch write identical bytes: fix At once per batch.
 func Encode[R Record](h Header, records []R) ([]byte, error) {
+	if len(h.Nonce) > maxPageBytes {
+		return nil, fmt.Errorf("wal: page exceeds size limit")
+	}
 	size := headerReserve(len(h.Nonce))
 	for _, r := range records {
 		n := r.Size()
-		if n < 0 {
-			return nil, fmt.Errorf("wal: record Size %d is negative", n)
+		if err := checkRecordSize(n); err != nil {
+			return nil, err
 		}
 		if size += framedSize(n); size > maxPageBytes+binary.MaxVarintLen64*6 {
 			return nil, fmt.Errorf("wal: page exceeds size limit")
@@ -95,14 +98,17 @@ func Encode[R Record](h Header, records []R) ([]byte, error) {
 		if b, err = appendRecord(b, r); err != nil {
 			return nil, err
 		}
-		if len(b) > maxPageBytes-4 {
-			return nil, fmt.Errorf("wal: page exceeds size limit")
-		}
+	}
+	if len(b) > maxPageBytes-4 {
+		return nil, fmt.Errorf("wal: page exceeds size limit")
 	}
 	return seal(b), nil
 }
 
 func appendHeader(b []byte, h Header, records int, weight uint64) ([]byte, error) {
+	if !validBatch(h.BatchPages, h.BatchIndex) || records < 0 || records > maxPageBytes {
+		return nil, fmt.Errorf("wal: invalid page header")
+	}
 	b = append(b, pageMagic...)
 	b = binary.AppendUvarint(b, h.Seq)
 	b = binary.AppendUvarint(b, uint64(len(h.Nonce)))
@@ -128,6 +134,9 @@ func headerReserve(n int) int { return len(pageMagic) + 7*binary.MaxVarintLen64 
 
 func appendRecord[R Record](b []byte, r R) ([]byte, error) {
 	n := r.Size()
+	if err := checkRecordSize(n); err != nil {
+		return nil, err
+	}
 	b = binary.AppendUvarint(b, uint64(n))
 	start := len(b)
 	b, err := r.AppendTo(b)
@@ -138,6 +147,17 @@ func appendRecord[R Record](b []byte, r R) ([]byte, error) {
 		return nil, fmt.Errorf("wal: record wrote %d bytes, Size said %d", len(b)-start, n)
 	}
 	return b, nil
+}
+
+// checkRecordSize bounds n before framing arithmetic can overflow.
+func checkRecordSize(n int) error {
+	if n < 0 {
+		return fmt.Errorf("%w: Size %d is negative", ErrInvalidRecord, n)
+	}
+	if n > maxPageBytes {
+		return ErrRecordTooLarge
+	}
+	return nil
 }
 
 // framedSize is a record of n bytes with its length prefix.
@@ -242,7 +262,7 @@ func (r *pageReader) header() (Header, bool) {
 		h.At = time.UnixMilli(int64(at)).UTC()
 	}
 	h.BatchPages, h.BatchIndex = r.number(), r.number()
-	if (h.BatchPages == 0 && h.BatchIndex != 0) || (h.BatchPages != 0 && h.BatchIndex >= h.BatchPages) {
+	if !validBatch(h.BatchPages, h.BatchIndex) {
 		return Header{}, false
 	}
 	n := r.number()
@@ -252,6 +272,10 @@ func (r *pageReader) header() (Header, bool) {
 	}
 	h.Records = int(n)
 	return h, true
+}
+
+func validBatch(pages, index uint64) bool {
+	return (pages == 0 && index == 0) || index < pages
 }
 
 type pageReader struct {

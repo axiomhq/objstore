@@ -2,14 +2,242 @@ package cache
 
 import (
 	"bytes"
+	"context"
 	"errors"
+	"io/fs"
 	"os"
 	"path/filepath"
+	"runtime"
 	"strconv"
 	"sync"
+	"sync/atomic"
 	"testing"
+	"testing/synctest"
 	"time"
 )
+
+func TestWipeAccountsForInFlightFill(t *testing.T) {
+	for _, failRemoval := range []bool{false, true} {
+		t.Run(strconv.FormatBool(failRemoval), func(t *testing.T) {
+			if failRemoval && (runtime.GOOS == "windows" || os.Geteuid() == 0) {
+				t.Skip("requires Unix directory permissions without root privileges")
+			}
+			synctest.Test(t, func(t *testing.T) {
+				ctx, cancel := context.WithTimeout(t.Context(), 5*time.Second)
+				defer cancel()
+				c := newDisk(t, diskBlock)
+				written, releaseFill := make(chan struct{}), make(chan struct{})
+				var once sync.Once
+				c.written = func() {
+					once.Do(func() {
+						close(written)
+						select {
+						case <-releaseFill:
+						case <-ctx.Done():
+						}
+					})
+				}
+				removing, releaseRemoval := make(chan string, 1), make(chan struct{})
+				c.removing = func(trash string) {
+					removing <- trash
+					select {
+					case <-releaseRemoval:
+					case <-ctx.Done():
+					}
+				}
+				fill := make(chan error, 1)
+				go func() { fill <- c.PutChecked("ns/a/one", make([]byte, diskBlock)) }()
+				receive(t, ctx, written)
+				wipe := make(chan error, 1)
+				go func() { wipe <- c.Wipe() }()
+				synctest.Wait() // Wipe is waiting on the fill or at removal, not on scheduling.
+				close(releaseFill)
+				_ = receive(t, ctx, fill)
+				trash := receive(t, ctx, removing)
+				if got := c.Stats().UsedBytes; got != diskBlock {
+					t.Errorf("detached fill charge = %d, want %d", got, diskBlock)
+				}
+				if !failRemoval {
+					if err := c.PutChecked("ns/b/two", make([]byte, diskBlock)); !errors.Is(err, ErrWarmCache) {
+						t.Errorf("fill beside unremoved trash = %v, want ErrWarmCache", err)
+					}
+					var physical int64
+					err := filepath.WalkDir(c.home, func(path string, e fs.DirEntry, err error) error {
+						if err != nil || e.IsDir() || e.Name() == lockName {
+							return err
+						}
+						info, err := e.Info()
+						if err == nil {
+							physical += DiskCharge(int(info.Size()))
+						}
+						return err
+					})
+					if err != nil {
+						t.Fatal(err)
+					}
+					if physical > c.cap {
+						t.Errorf("physical bytes = %d, capacity = %d", physical, c.cap)
+					}
+				} else {
+					path := filepath.Join(trash, dataDir)
+					if err := os.Chmod(path, 0500); err != nil {
+						t.Fatal(err)
+					}
+					t.Cleanup(func() { _ = os.Chmod(path, 0700) })
+				}
+				close(releaseRemoval)
+				err := receive(t, ctx, wipe)
+				if failRemoval {
+					if err == nil {
+						t.Error("Wipe removed an unwritable directory")
+					}
+					if got := c.Stats().UsedBytes; got != diskBlock {
+						t.Errorf("failed Wipe fill charge = %d, want %d", got, diskBlock)
+					}
+					if err := c.PutChecked("ns/b/two", []byte("two")); !errors.Is(err, ErrWarmCache) {
+						t.Errorf("fill after failed Wipe = %v, want ErrWarmCache", err)
+					}
+				} else if err != nil {
+					t.Fatal(err)
+				} else if got := c.Stats().UsedBytes; got != 0 {
+					t.Errorf("charge after Wipe = %d, want 0", got)
+				}
+			})
+		})
+	}
+}
+
+// TestWipeDrainsFills: while Wipe waits for in-flight fills, new fills are
+// refused, so a steady stream of them cannot keep it waiting; and Close ends
+// the wait, since it owns the directory from then on.
+func TestWipeDrainsFills(t *testing.T) {
+	for _, closeDuring := range []bool{false, true} {
+		t.Run("close="+strconv.FormatBool(closeDuring), func(t *testing.T) {
+			synctest.Test(t, func(t *testing.T) {
+				ctx, cancel := context.WithTimeout(t.Context(), 5*time.Second)
+				defer cancel()
+				c := newDisk(t, 2*diskBlock)
+				written, releaseFill := make(chan struct{}), make(chan struct{})
+				var stalled atomic.Bool // only the first fill stalls
+				c.written = func() {
+					if stalled.CompareAndSwap(false, true) {
+						close(written)
+						select {
+						case <-releaseFill:
+						case <-ctx.Done():
+						}
+					}
+				}
+				fill := make(chan error, 1)
+				go func() { fill <- c.PutChecked("ns/a/one", make([]byte, diskBlock)) }()
+				receive(t, ctx, written)
+				wipe := make(chan error, 1)
+				go func() { wipe <- c.Wipe() }()
+				synctest.Wait() // Wipe is waiting for the stalled fill.
+				if closeDuring {
+					c.Close()
+					// Well before the stalled fill gives up at ctx's deadline.
+					waitCtx, waitCancel := context.WithTimeout(ctx, time.Second)
+					defer waitCancel()
+					receive(t, waitCtx, wipe)
+				} else if err := c.PutChecked("ns/b/two", make([]byte, diskBlock)); !errors.Is(err, ErrWarmCache) {
+					t.Errorf("fill during Wipe's drain = %v, want ErrWarmCache", err)
+				}
+				close(releaseFill)
+				receive(t, ctx, fill)
+				if !closeDuring {
+					if err := receive(t, ctx, wipe); err != nil {
+						t.Fatal(err)
+					}
+					if err := c.PutChecked("ns/b/two", make([]byte, diskBlock)); err != nil {
+						t.Errorf("fill after Wipe = %v, want nil", err)
+					}
+				}
+			})
+		})
+	}
+}
+
+func TestWipeRemovalFailureKeepsCharge(t *testing.T) {
+	if runtime.GOOS == "windows" || os.Geteuid() == 0 {
+		t.Skip("requires Unix directory permissions without root privileges")
+	}
+	c, err := NewDisk(t.TempDir(), diskBlock)
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(c.Close)
+	c.Put("ns/a/one", []byte("one"))
+	// Rename still works, but the detached directory's file cannot be removed.
+	locked := filepath.Join(c.dir, "locked")
+	if err := os.Mkdir(locked, 0700); err != nil {
+		t.Fatal(err)
+	}
+	e := c.items["ns/a/one"].Value.(*diskEntry)
+	path := filepath.Join(locked, filepath.Base(e.path))
+	if err := os.Rename(e.path, path); err != nil {
+		t.Fatal(err)
+	}
+	e.path = path
+	if err := os.Chmod(locked, 0500); err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() {
+		_ = filepath.WalkDir(c.home, func(path string, e fs.DirEntry, err error) error {
+			if err == nil && e.IsDir() {
+				return os.Chmod(path, 0700)
+			}
+			return err
+		})
+		c.Close()
+		if _, err := os.Stat(c.home); !os.IsNotExist(err) {
+			t.Errorf("Close left failed Wipe's directory: %v", err)
+		}
+		if got := c.Stats().UsedBytes; got != 0 {
+			t.Errorf("charge after Close = %d, want 0", got)
+		}
+	})
+	if err := c.Wipe(); err == nil {
+		t.Fatal("Wipe removed an unwritable directory")
+	} else {
+		t.Logf("Wipe: %v", err)
+	}
+	if got := c.Stats().UsedBytes; got != diskBlock {
+		t.Errorf("failed Wipe charge = %d, want %d", got, diskBlock)
+	}
+	if err := c.PutChecked("ns/b/two", []byte("two")); !errors.Is(err, ErrWarmCache) {
+		t.Errorf("fill after failed Wipe = %v, want ErrWarmCache", err)
+	}
+	if _, closed := c.PinState(); !closed {
+		t.Error("failed Wipe left fills enabled")
+	}
+}
+
+func TestDiskActivityBoundedByResidentNamespaces(t *testing.T) {
+	c, err := NewDisk(t.TempDir(), 2*diskBlock)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer c.Close()
+	c.Put("ns/shared/one", []byte("one"))
+	c.Put("ns/shared/two", []byte("two"))
+	c.Put("ns/other/one", []byte("one"))
+	if _, ok := c.lastAccess["shared"]; !ok {
+		t.Fatal("evicting one of two entries lost namespace activity")
+	}
+	for i := range 100 {
+		c.Put("ns/"+strconv.Itoa(i)+"/one", []byte("one"))
+	}
+	if got := len(c.lastAccess); got != c.Stats().Entries {
+		t.Fatalf("%d activity entries for %d resident namespaces", got, c.Stats().Entries)
+	}
+	if err := c.Wipe(); err != nil {
+		t.Fatal(err)
+	}
+	if len(c.lastAccess) != 0 {
+		t.Fatal("Wipe retained namespace activity")
+	}
+}
 
 func TestDiskCachePinCapacityAndEviction(t *testing.T) {
 	c, err := NewDisk(t.TempDir(), 8192, 4096)

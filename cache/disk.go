@@ -43,11 +43,14 @@ type Disk struct {
 	// ponytail: one pin transaction per worker; shard this lock if pin churn matters.
 	pinMu                             sync.Mutex
 	mu                                sync.Mutex
-	home                              string   // the locked directory: lockName, dataDir and Wipe's trash
-	lock                              *os.File // holds home's flock until Close; nil once closed
-	dir                               string   // home/dataDir: the cached files
+	fillDone                          *sync.Cond // Wipe waits for reserved fills; initialized under mu
+	home                              string     // the locked directory: lockName, dataDir and Wipe's trash
+	lock                              *os.File   // holds home's flock until Close; nil once closed
+	dir                               string     // home/dataDir: the cached files
 	cap, size                         int64
 	reserved                          int64 // charges of Puts writing their temporary file
+	wiping                            int   // Wipes draining fills; new fills are refused meanwhile
+	detached                          int64 // Wipe's bytes until their directory is removed
 	ll                                list.List
 	items                             map[string]*list.Element
 	closed                            bool
@@ -60,8 +63,11 @@ type Disk struct {
 	pinned                            map[string]int       // disk key → number of names pinning it
 	pinnedResident                    int64                // charge of resident entries that are pinned
 	lastAccess                        map[string]time.Time // namespace → last Get hit or Put of one of its objects
+	nsEntries                         map[string]int       // namespace → resident entry count
 	hits, misses, evictions, failures uint64
-	inactiveExpiries                  uint64 // namespaces ExpireInactive evicted
+	inactiveExpiries                  uint64       // namespaces ExpireInactive evicted
+	written                           func()       // test rendezvous after writing a fill, before publishing it
+	removing                          func(string) // test rendezvous before removing Wipe's trash
 }
 
 // ErrPinCapacity is Pin's refusal: the reservation does not fit the pin
@@ -142,7 +148,7 @@ func NewDisk(root string, capacity int64, pinCapacity ...int64) (*Disk, error) {
 		removeHome(home, lock)
 		return nil, err
 	}
-	return &Disk{home: home, lock: lock, dir: dir, cap: capacity, pinCap: pc, maxPinned: MaxPinnedNamespaces, items: make(map[string]*list.Element), pins: make(map[string]map[string]int64), pinBytes: make(map[string]int64), pinAt: make(map[string]time.Time), pinPrevAt: make(map[string]time.Time), pinned: make(map[string]int), lastAccess: make(map[string]time.Time)}, nil
+	return &Disk{home: home, lock: lock, dir: dir, cap: capacity, pinCap: pc, maxPinned: MaxPinnedNamespaces, items: make(map[string]*list.Element), pins: make(map[string]map[string]int64), pinBytes: make(map[string]int64), pinAt: make(map[string]time.Time), pinPrevAt: make(map[string]time.Time), pinned: make(map[string]int), lastAccess: make(map[string]time.Time), nsEntries: make(map[string]int)}, nil
 }
 
 // sweepStale removes the Disk directories under root whose lock is free.
@@ -374,6 +380,10 @@ func (c *Disk) PutChecked(key string, b []byte) error {
 		c.mu.Unlock()
 		return nil
 	}
+	if c.wiping > 0 { // Wipe is waiting for fills to drain; don't feed it more
+		c.mu.Unlock()
+		return ErrWarmCache
+	}
 	// Reserve the charge before writing: temporary files count against the
 	// capacity, so a warm's 32 concurrent fills of objects up to 32 MB cannot
 	// overshoot it on disk, and a fill that cannot fit writes nothing.
@@ -387,9 +397,13 @@ func (c *Disk) PutChecked(key string, b []byte) error {
 	// Write and hash outside the lock (see Get); the rename below publishes
 	// the complete file under it, so readers never see a partial one.
 	tmp, sums, werr := writeTemp(dir, b)
+	if c.written != nil {
+		c.written()
+	}
 	c.mu.Lock()
 	defer c.mu.Unlock()
 	c.reserved -= charge
+	c.wakeWipes()
 	discard := func() {
 		if tmp == "" {
 			return
@@ -432,6 +446,9 @@ func (c *Disk) PutChecked(key string, b []byte) error {
 	if c.isPinned(key) {
 		c.pinnedResident += charge
 	}
+	if name := keyNamespace(key); name != "" {
+		c.nsEntries[name]++
+	}
 	c.touch(key)
 	return nil
 }
@@ -457,6 +474,8 @@ func (c *Disk) detachDir(recreate bool) (string, error) {
 		return "", err
 	}
 	clear(c.items)
+	clear(c.lastAccess)
+	clear(c.nsEntries)
 	c.ll.Init()
 	c.size, c.pinnedResident = 0, 0
 	if recreate {
@@ -471,11 +490,11 @@ func (c *Disk) detachDir(recreate bool) (string, error) {
 // bytes fit beside the entries and the in-flight reservations. It evicts
 // nothing when even evicting every unpinned entry could not make room.
 func (c *Disk) makeRoom(charge int64) bool {
-	if c.cap-c.pinnedResident-c.reserved < charge {
+	if c.cap-c.pinnedResident-c.reserved-c.detached < charge {
 		return false
 	}
 	el := c.ll.Back()
-	for c.size+c.reserved > c.cap-charge {
+	for c.size+c.reserved+c.detached > c.cap-charge {
 		for el != nil && c.isPinned(el.Value.(*diskEntry).key) {
 			el = el.Prev()
 		}
@@ -547,7 +566,7 @@ func keyNamespace(key string) string {
 }
 
 func (c *Disk) touch(key string) {
-	if name := keyNamespace(key); name != "" {
+	if name := keyNamespace(key); name != "" && c.nsEntries[name] > 0 {
 		c.lastAccess[name] = time.Now()
 	}
 }
@@ -726,23 +745,59 @@ func (c *Disk) unpinLocked(name string) {
 	delete(c.pinPrevAt, name)
 }
 
+// wakeWipes tells waiting Wipes that a fill finished or the disk closed.
+// Callers hold c.mu.
+func (c *Disk) wakeWipes() {
+	if c.fillDone != nil {
+		c.fillDone.Broadcast()
+	}
+}
+
 // Wipe models loss of disposable local storage while retaining
 // reservations: every entry is dropped and the directory starts empty.
+// Fills already writing finish first; new ones are refused until then.
 func (c *Disk) Wipe() error {
 	if c == nil {
 		return nil
 	}
 	c.mu.Lock()
+	// A fill's temporary path must stay valid until it is published or removed.
+	c.wiping++
+	for !c.closed && c.reserved != 0 {
+		if c.fillDone == nil {
+			c.fillDone = sync.NewCond(&c.mu)
+		}
+		c.fillDone.Wait()
+	}
+	c.wiping--
 	if c.closed {
 		c.mu.Unlock()
 		return nil // Close dropped every entry and owns the directory's removal
 	}
+	charge := c.size
 	trash, err := c.detachDir(true)
+	if trash != "" {
+		c.detached += charge
+	}
+	if err != nil {
+		c.closed = true
+	}
 	c.mu.Unlock()
 	if trash != "" {
-		if rerr := os.RemoveAll(trash); err == nil {
-			err = rerr
+		if c.removing != nil {
+			c.removing(trash)
 		}
+		rerr := os.RemoveAll(trash)
+		c.mu.Lock()
+		if rerr == nil {
+			c.detached = max(0, c.detached-charge) // Close may have removed the home meanwhile
+		} else {
+			// Unreclaimed files still count. Close owns the remaining cleanup.
+			c.closed = true
+			c.failures++
+		}
+		c.mu.Unlock()
+		err = errors.Join(err, rerr)
 	}
 	return err
 }
@@ -759,6 +814,12 @@ func (c *Disk) remove(el *list.Element) bool {
 	delete(c.items, e.key)
 	c.ll.Remove(el)
 	c.size -= e.charge
+	if name := keyNamespace(e.key); name != "" {
+		if c.nsEntries[name]--; c.nsEntries[name] == 0 {
+			delete(c.nsEntries, name)
+			delete(c.lastAccess, name)
+		}
+	}
 	if c.isPinned(e.key) {
 		c.pinnedResident -= e.charge
 	}
@@ -798,7 +859,7 @@ func (c *Disk) Stats() DiskStats {
 	}
 	c.mu.Lock()
 	defer c.mu.Unlock()
-	return DiskStats{CapacityBytes: c.cap, UsedBytes: c.size, PinCapacityBytes: c.pinCap, PinnedBytes: c.pinnedBytes, PinnedNamespaces: len(c.pins), Entries: len(c.items), Hits: c.hits, Misses: c.misses, Evictions: c.evictions, Failures: c.failures, InactiveExpiries: c.inactiveExpiries}
+	return DiskStats{CapacityBytes: c.cap, UsedBytes: c.size + c.detached, PinCapacityBytes: c.pinCap, PinnedBytes: c.pinnedBytes, PinnedNamespaces: len(c.pins), Entries: len(c.items), Hits: c.hits, Misses: c.misses, Evictions: c.evictions, Failures: c.failures, InactiveExpiries: c.inactiveExpiries}
 }
 
 // Close stops caching, removes the directory and releases its lock.
@@ -811,6 +872,7 @@ func (c *Disk) Close() {
 	c.mu.Lock()
 	lock := c.lock
 	c.lock, c.closed = nil, true
+	c.wakeWipes() // Close owns the directory now; a waiting Wipe has nothing left to do
 	if lock == nil {
 		c.mu.Unlock()
 		return
@@ -831,6 +893,10 @@ func (c *Disk) Close() {
 	}
 	if err != nil {
 		logger.Error("cache: remove disk tier directory", "dir", c.home, "err", err)
+	} else {
+		c.mu.Lock()
+		c.detached = 0
+		c.mu.Unlock()
 	}
 }
 

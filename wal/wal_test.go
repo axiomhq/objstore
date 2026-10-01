@@ -6,6 +6,7 @@ import (
 	"encoding/binary"
 	"errors"
 	"hash/crc32"
+	"math"
 	"math/rand/v2"
 	"reflect"
 	"slices"
@@ -276,6 +277,33 @@ func TestDecodeRejectsHugeDeclaredCountWithoutAllocation(t *testing.T) {
 		}
 	}); allocs > 5 {
 		t.Fatalf("huge count used %.0f allocations, want constant-size rejection", allocs)
+	}
+}
+
+func TestEncodeRefusesOverflowingSize(t *testing.T) {
+	defer func() {
+		if p := recover(); p != nil {
+			t.Fatalf("Encode panicked instead of refusing Size math.MaxInt: %v", p)
+		}
+	}()
+	if _, err := Encode(Header{}, []testRecord{{size: math.MaxInt}}); !errors.Is(err, ErrRecordTooLarge) {
+		t.Fatalf("Encode: %v, want ErrRecordTooLarge", err)
+	}
+}
+
+func TestEncodeRefusesUndecodablePage(t *testing.T) {
+	for name, h := range map[string]Header{
+		"oversized-empty": {Nonce: strings.Repeat("n", maxPageBytes)},
+		"no-batch-index":  {BatchIndex: 1},
+		"past-batch-end":  {BatchPages: 2, BatchIndex: 2},
+	} {
+		t.Run(name, func(t *testing.T) {
+			data, err := Encode[Bytes](h, nil)
+			if err == nil {
+				_, _, derr := Decode(data)
+				t.Fatalf("Encode accepted a %d-byte page Decode rejects: %v", len(data), derr)
+			}
+		})
 	}
 }
 

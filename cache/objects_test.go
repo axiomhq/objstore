@@ -12,8 +12,10 @@ import (
 	"slices"
 	"strconv"
 	"strings"
+	"sync"
 	"testing"
 	"time"
+	"weak"
 
 	"github.com/axiomhq/objstore"
 	"github.com/axiomhq/objstore/fs"
@@ -383,5 +385,92 @@ func TestInvalidatedLoadSkipsTheDiskTier(t *testing.T) {
 	}
 	if _, ok := c.Memory.Peek(key); ok {
 		t.Fatal("memory kept a retired generation's value")
+	}
+}
+
+// waitingContext signals once Fetch's select has registered its flight.
+type waitingContext struct {
+	context.Context
+	once    sync.Once
+	waiting chan struct{}
+}
+
+func (c *waitingContext) Done() <-chan struct{} {
+	c.once.Do(func() { close(c.waiting) })
+	return c.Context.Done()
+}
+
+func receive[T any](t *testing.T, ctx context.Context, ch <-chan T) T {
+	t.Helper()
+	select {
+	case v := <-ch:
+		return v
+	case <-ctx.Done():
+		t.Fatal(ctx.Err())
+		panic("unreachable")
+	}
+}
+
+func TestFetchFollowerRetriesBudget(t *testing.T) {
+	ctx, cancel := context.WithTimeout(t.Context(), 5*time.Second)
+	defer cancel()
+	c := New(nil, 1<<20, nil, Keys{})
+	leaderCtx, _ := WithBudget(ctx, 0)
+	entered, release := make(chan struct{}), make(chan struct{})
+	leader := make(chan error, 1)
+	go func() {
+		_, err := c.FetchWith(leaderCtx, "k", func(ctx context.Context) ([]byte, error) {
+			close(entered)
+			select {
+			case <-release:
+			case <-ctx.Done():
+				return nil, ctx.Err()
+			}
+			return c.Gated(ctx, func(context.Context) ([]byte, error) { return []byte("leader"), nil })
+		})
+		leader <- err
+	}()
+	receive(t, ctx, entered)
+	fctx := &waitingContext{Context: ctx, waiting: make(chan struct{})}
+	follower := make(chan error, 1)
+	go func() {
+		b, err := c.FetchWith(fctx, "k", func(ctx context.Context) ([]byte, error) {
+			return c.Gated(ctx, func(context.Context) ([]byte, error) { return []byte("fresh"), nil })
+		})
+		if err == nil && string(b) != "fresh" {
+			err = fmt.Errorf("follower read %q", b)
+		}
+		follower <- err
+	}()
+	receive(t, ctx, fctx.waiting)
+	close(release)
+	if err := receive(t, ctx, leader); !errors.Is(err, ErrBudget) {
+		t.Fatalf("leader: %v, want ErrBudget", err)
+	}
+	if err := receive(t, ctx, follower); err != nil {
+		t.Fatalf("follower inherited the leader's budget: %v", err)
+	}
+}
+
+func TestWithResultsReleasesPreviousStage(t *testing.T) {
+	ctx, cancel := context.WithTimeout(t.Context(), 2*time.Second)
+	defer cancel()
+	// Return only the new scope and a weak reference to the old buffer.
+	// A lookup alone cannot detect a shadowed map retained by the context.
+	next, old := func() (context.Context, weak.Pointer[byte]) {
+		b := make([]byte, 1<<20)
+		old := weak.Make(&b[0])
+		first := WithResults(ctx, map[string][]byte{"old": b})
+		return WithResults(first, map[string][]byte{"new": []byte("new")}), old
+	}()
+	if _, ok := Scoped(next, "old"); ok {
+		t.Fatal("new scope serves the old stage")
+	}
+	for old.Value() != nil && ctx.Err() == nil {
+		runtime.GC()
+	}
+	runtime.KeepAlive(next)
+	if old.Value() != nil {
+		t.Fatal("new scope retains the old stage's buffer")
 	}
 }

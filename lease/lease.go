@@ -71,9 +71,10 @@ type Lease struct {
 	// or the lease was retired under it) or the renewal goroutine it starts
 	// closes done. retire closes done only when started is false.
 	started  bool
-	released bool      // Release was called: Valid refuses from here on
-	nonce    string    // last attributed acquisition/renewal; owner alone is not continuity
-	deadline time.Time // LOCAL clock: this process stops serving here
+	cancel   context.CancelFunc // cancels the acquisition or renewer on retirement
+	released bool               // Release was called: Valid refuses from here on
+	nonce    string             // last attributed acquisition/renewal; owner alone is not continuity
+	deadline time.Time          // LOCAL clock: this process stops serving here
 	// pending is every write attempt whose answer was lost, by nonce, with
 	// the time it started: a record later found in our name with one of
 	// these nonces is that write landing late, and it is ours.
@@ -160,11 +161,14 @@ func (l *Lease) Acquire(ctx context.Context) error {
 		return fmt.Errorf("lease %s: Acquire called twice, or after Release or Retire; use a fresh New", l.key)
 	}
 	l.started = true
+	acquireCtx, cancel := context.WithCancel(ctx)
+	l.cancel = cancel
 	l.mu.Unlock()
-	err := l.Take(ctx)
+	err := l.Take(acquireCtx)
+	cancel()
 	l.mu.Lock()
 	defer l.mu.Unlock()
-	if err == nil && l.stopped() {
+	if l.stopped() {
 		err = fmt.Errorf("%w: %s was released or retired during Acquire", ErrNotOwner, l.key)
 	}
 	if err != nil {
@@ -174,7 +178,9 @@ func (l *Lease) Acquire(ctx context.Context) error {
 		}
 		return err
 	}
-	go l.renew()
+	renewCtx, cancel := context.WithCancel(context.WithoutCancel(ctx))
+	l.cancel = cancel
+	go l.renew(renewCtx)
 	return nil
 }
 
@@ -237,6 +243,8 @@ func (l *Lease) leave() {
 // goroutine, so the callback may call anything on the lease, Release and
 // Retire included; Retire and Release do not wait for it, and it must not
 // wait on Done(), which waits for it. A Release or Retire never runs it.
+// For a Shared lease, call Start only after Join returns: an immediate
+// callback that calls Join from inside mint would wait on its own mint.
 func (l *Lease) Start(fence func()) {
 	if fence == nil {
 		fence = func() {}
@@ -360,7 +368,10 @@ func (l *Lease) write(ctx context.Context, etag string) error {
 	back, _, gerr := Load(ctx, l.store, l.key)
 	if gerr != nil {
 		l.notePending(body.Nonce, start)
-		return fmt.Errorf("lease %s: outcome unknown: %w", l.key, gerr)
+		if err != nil {
+			return fmt.Errorf("lease %s: outcome unknown: PUT: %w; read-back: %w", l.key, err, gerr)
+		}
+		return fmt.Errorf("lease %s: outcome unknown: read-back: %w", l.key, gerr)
 	}
 	if back.Nonce == body.Nonce {
 		return l.hold(start, body.Nonce)
@@ -384,6 +395,14 @@ func (l *Lease) notePending(nonce string, start time.Time) {
 	defer l.mu.Unlock()
 	if l.pending == nil {
 		l.pending = map[string]time.Time{}
+	}
+	// An attempt past its local interval cannot be adopted, even while
+	// its stored expiry still keeps other takers out for half a TTL.
+	now := time.Now()
+	for n, st := range l.pending {
+		if !Before(now, now.Round(0), st.Add(l.ttl)) {
+			delete(l.pending, n)
+		}
 	}
 	l.pending[nonce] = start
 }
@@ -438,6 +457,9 @@ func (l *Lease) Valid() error {
 	if l.released {
 		return fmt.Errorf("%w: %s was released in this process; a fresh acquisition is needed", ErrNotOwner, l.key)
 	}
+	if l.stopped() {
+		return fmt.Errorf("%w: %s was retired in this process; a fresh acquisition is needed", ErrNotOwner, l.key)
+	}
 	if l.fenced {
 		return fmt.Errorf("%w: %s was fenced in this process; a fresh acquisition is needed", ErrNotOwner, l.key)
 	}
@@ -464,8 +486,9 @@ func Before(now, wallNow, deadline time.Time) bool {
 // renew re-takes the lease every TTL/4 for as long as it is ours. It fences
 // on proof (a foreign owner) or on a lapse (renewals kept failing until the
 // local deadline passed): one slow call, or two, is just a retry.
-func (l *Lease) renew() {
+func (l *Lease) renew(ctx context.Context) {
 	defer l.finish()
+	defer l.cancel()
 	every := l.ttl / 4
 	if every <= 0 {
 		every = time.Millisecond
@@ -490,14 +513,14 @@ func (l *Lease) renew() {
 			return
 		}
 		// Bounded: a hung store makes a renewal unresolved, never a pinned
-		// goroutine. Background context on purpose: the lease outlives any
-		// one request. Half a TTL for the attempt (the tick is a quarter),
-		// and a second attempt straight away on a failure that was not a
-		// refusal: a renewal that only stalled must not wait a whole tick to
-		// try again.
+		// goroutine. Keep the acquisition's values, not its cancellation:
+		// the lease outlives any one request. Half a TTL for the attempt
+		// (the tick is a quarter), and a second attempt straight away on a
+		// failure that was not a refusal: a renewal that only stalled must
+		// not wait a whole tick to try again.
 		var err error
 		for attempt := 0; attempt < 2; attempt++ {
-			ctx, cancel := context.WithTimeout(context.Background(), l.ttl/2)
+			ctx, cancel := context.WithTimeout(ctx, l.ttl/2)
 			t0 := time.Now()
 			err = l.Take(ctx)
 			cancel()
@@ -563,10 +586,12 @@ func (l *Lease) fenceFor(reason error) {
 }
 
 // Retire stops renewing without touching the object. The lease then simply
-// expires for whoever wants it next. It waits for a running renewal
-// goroutine to exit (at most about one TTL), not for a fence callback. A
-// fence callback owed to Start (the lease was fenced before Start) is
-// given up: Start will not run it. A nil lease is a no-op.
+// expires for whoever wants it next. Valid returns ErrNotOwner from then on,
+// although the stored expiry may not have passed: a retired holder must not
+// act on time it no longer renews. It cancels any in-flight acquisition
+// or renewal and waits for it to exit (at most about one TTL), not for a
+// fence callback. A fence callback owed to Start (the lease was fenced
+// before Start) is given up: Start will not run it. A nil lease is a no-op.
 func (l *Lease) Retire() {
 	if l == nil {
 		return
@@ -584,6 +609,9 @@ func (l *Lease) retire(released bool) {
 	l.interrupted = true
 	l.released = l.released || released
 	l.stopOnce.Do(func() { close(l.stop) })
+	if l.cancel != nil {
+		l.cancel()
+	}
 	if !l.started {
 		l.finish()
 	}
@@ -639,6 +667,8 @@ func (l *Lease) Release(ctx context.Context) {
 	if l == nil {
 		return
 	}
+	ctx, cancel := context.WithTimeout(objstore.Urgent(ctx), l.ttl)
+	defer cancel()
 	// Local first, and unconditionally: having promised the lease to
 	// whoever takes it next, this process must stop acting on it now, not
 	// when the deadline it last renewed happens to run out. Valid refuses
@@ -666,8 +696,6 @@ func (l *Lease) Release(ctx context.Context) {
 	}
 	// Urgent like Take: the handover must not queue behind bulk writes, or
 	// the next holder waits the TTL instead of taking over now.
-	ctx, cancel := context.WithTimeout(objstore.Urgent(ctx), l.ttl)
-	defer cancel()
 	cur, etag, err := Load(ctx, l.store, l.key)
 	if err != nil {
 		if log != nil {

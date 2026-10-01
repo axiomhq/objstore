@@ -20,8 +20,6 @@ type memBackend struct {
 
 func newMemBackend() *memBackend { return &memBackend{exists: true, objects: map[string][]byte{}} }
 
-func newMemStore() *Store { return Open(newMemBackend(), Config{}) }
-
 func memETag(data []byte) string { h := sha256.Sum256(data); return hex.EncodeToString(h[:]) }
 
 var errNoBucket = errors.New("bucket does not exist")

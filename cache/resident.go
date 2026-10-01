@@ -59,13 +59,16 @@ func (r *Resident) GenerationOf(key string) uint64 { return r.gens.of(key) }
 func (r *Resident) Put(prefix string, seq uint64, key string, value any, size int, generation uint64) bool {
 	r.mu.Lock()
 	defer r.mu.Unlock()
+	if size <= 0 || r.Cap <= 0 {
+		return false
+	}
 	if generation != r.gens.of(key) || seq <= r.floors[prefix] {
 		return false
 	}
 	if _, ok := r.items[key]; ok {
 		return true
 	}
-	if size < 0 || size > r.Cap-r.size {
+	if size > r.Cap-r.size {
 		return false
 	}
 	r.items[key] = residentEntry{value: value, prefix: prefix, seq: seq, size: size}

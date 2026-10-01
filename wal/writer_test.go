@@ -190,23 +190,21 @@ func TestWriterAmbiguousPutOwnNonce(t *testing.T) {
 	// Simulates a PUT that succeeded server-side while the response was
 	// lost: the entry exists at nextSeq bearing THIS BATCH's nonce. commit
 	// must treat it as committed — not split brain — and continue at seq+1.
-	s := bucket.New(t)
-	ctx := context.Background()
+	s, f := bucket.NewFaulty(t)
+	ctx, cancel := context.WithTimeout(t.Context(), 10*time.Second)
+	defer cancel()
 	prior := rows("already-durable")
-	ok, err := put(ctx, s, testPrefix, Header{Seq: 1, Nonce: "batch-nonce-x"}, prior...)
-	if err != nil || !ok {
-		t.Fatalf("seed entry: ok=%v err=%v", ok, err)
-	}
-	w := NewWriter[Bytes](s, testPrefix, 1, nil)
+	f.Set(storetest.Plan{Op: storetest.OpPutIfAbsent, N: 1, Mode: storetest.Ambiguous})
+	w := NewWriter[Bytes](s, testPrefix, 1, nil, WithCommitInterval(MinCommitInterval))
 	defer w.Close()
-	w.mu.Lock()
-	w.testNonce = "batch-nonce-x"
-	w.mu.Unlock()
 	if err := w.Append(ctx, prior); err != nil {
 		t.Fatalf("ambiguous PUT with own batch nonce must succeed: %v", err)
 	}
 	if err := w.Append(ctx, rows("next")); err != nil {
 		t.Fatalf("writer poisoned after ambiguity: %v", err)
+	}
+	if ops := f.Ops(); f.Fired() != 1 || ops[storetest.OpGet] != 1 || ops[storetest.OpPutIfAbsent] != 3 {
+		t.Fatalf("ambiguous PUT was not adopted: fired %d, ops %v", f.Fired(), ops)
 	}
 	entries, err := replay(ctx, s, testPrefix, 0)
 	if err != nil || len(entries) != 2 {
@@ -214,6 +212,22 @@ func TestWriterAmbiguousPutOwnNonce(t *testing.T) {
 	}
 	if !slices.Equal(ids(entries[0]), []string{"already-durable"}) || !slices.Equal(ids(entries[1]), []string{"next"}) {
 		t.Fatalf("history wrong: %+v", entries)
+	}
+}
+
+func TestWriterAdoptsLegacyPage(t *testing.T) {
+	ctx, cancel := context.WithTimeout(t.Context(), 10*time.Second)
+	defer cancel()
+	s := bucket.NewFS(t)
+	records := rows("already-durable")
+	if ok, err := put(ctx, s, testPrefix, Header{Seq: 1, Nonce: "legacy"}, records...); !ok || err != nil {
+		t.Fatal(ok, err)
+	}
+	// Exercise legacy BatchPages=0 read-back without changing nonce generation.
+	w := &Writer[Bytes]{store: s, prefix: testPrefix, nextSeq: 1, attemptTimeout: time.Second}
+	b := &batch[Bytes]{records: records, nonce: "legacy"}
+	if err := w.commit(b); err != nil || w.nextSeq != 2 || b.landed != 1 {
+		t.Fatalf("legacy adoption: %v, next seq %d, landed %d", err, w.nextSeq, b.landed)
 	}
 }
 
@@ -530,6 +544,8 @@ func (h *lineHandler) snapshot() []string {
 // newest failed attempt, the log says it once per window rather than once
 // per tick, and the first commit that lands clears the record.
 func TestWriterReportsBackendCause(t *testing.T) {
+	ctx, cancel := context.WithTimeout(t.Context(), 30*time.Second)
+	defer cancel()
 	s, f := bucket.NewFaulty(t)
 	h := &lineHandler{}
 	w := NewWriter[Bytes](s, testPrefix, 1, nil, WithCommitInterval(10*time.Millisecond))
@@ -538,14 +554,16 @@ func TestWriterReportsBackendCause(t *testing.T) {
 	f.SetShape(storetest.Shape{ErrorRate: 1, Seed: 1}) // every call fails, until cleared
 
 	done := make(chan error, 1)
-	go func() { done <- w.Append(context.Background(), rows("a")) }()
-	deadline := time.Now().Add(30 * time.Second)
+	go func() { done <- w.Append(ctx, rows("a")) }()
+	poll := time.NewTicker(time.Millisecond)
+	defer poll.Stop()
 	attempts := func() int { return f.Ops()[storetest.OpPutIfAbsent] }
-	for attempts() < 1 {
-		if time.Now().After(deadline) {
-			t.Fatal("the writer never attempted a PUT")
+	for w.Stats().LastError.At.IsZero() {
+		select {
+		case <-ctx.Done():
+			t.Fatal("the writer never reported a failed PUT:", ctx.Err())
+		case <-poll.C:
 		}
-		time.Sleep(time.Millisecond)
 	}
 	// Within one attempt the cause is visible, with its age and key.
 	st := w.Stats()
@@ -562,10 +580,11 @@ func TestWriterReportsBackendCause(t *testing.T) {
 	// Several retries later there is still exactly one log line: the rate
 	// window (errorLogEvery) is far longer than this loop.
 	for attempts() < 4 {
-		if time.Now().After(deadline) {
+		select {
+		case <-ctx.Done():
 			t.Fatalf("only %d attempts in 30s; the batch was not retried", attempts())
+		case <-poll.C:
 		}
-		time.Sleep(time.Millisecond)
 	}
 	lines := h.snapshot()
 	if len(lines) != 1 {
@@ -579,8 +598,13 @@ func TestWriterReportsBackendCause(t *testing.T) {
 
 	// The store recovers: the same batch lands and the record is gone.
 	f.SetShape(storetest.Shape{})
-	if err := <-done; err != nil {
-		t.Fatalf("append after the store recovered: %v", err)
+	select {
+	case err := <-done:
+		if err != nil {
+			t.Fatalf("append after the store recovered: %v", err)
+		}
+	case <-ctx.Done():
+		t.Fatal("append never recovered:", ctx.Err())
 	}
 	if st := w.Stats(); !st.LastError.At.IsZero() || st.Pending != 0 {
 		t.Fatalf("a successful commit must clear the last error: %+v", st)

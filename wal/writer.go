@@ -7,6 +7,7 @@ import (
 	"errors"
 	"fmt"
 	"log/slog"
+	"math"
 	"sync"
 	"time"
 
@@ -70,7 +71,8 @@ var (
 	ErrUnresolved = errors.New("wal: write outcome unknown; batch may already be committed")
 	// ErrWriterFailed answers an Append the writer refused because it had
 	// already finished (Stats.Terminal): queued behind the batch that
-	// finished it, or enqueued later. Its records were not and will not be
+	// finished it, or enqueued later. It also refuses a batch whose sequence
+	// range would exhaust the writer. Its records were not and will not be
 	// written. The error names the terminal cause, but errors.Is matches
 	// only ErrWriterFailed: ErrLostRace and ErrUnresolved answer the batch
 	// that made the claim.
@@ -188,7 +190,8 @@ type Writer[R Record] struct {
 	store  *objstore.Store
 	prefix string
 	// onCommit applies a durable batch: its records in append order, and
-	// the sequence of its last page.
+	// the sequence of its last page. It must not wait on this writer's flush
+	// goroutine (NewWriter).
 	onCommit func(seq uint64, at time.Time, records []R)
 	// floor, when set, reports the log's current watermark: pages at or
 	// below it may have been truncated. A claim at or below it is refused as
@@ -196,12 +199,11 @@ type Writer[R Record] struct {
 	// stale writer would win a sequence nobody holds and the entry would sit
 	// below every future replay's start — an acknowledged, invisible write).
 	//
-	// retry says whether the batch being claimed has been attempted before,
-	// which is the case the oracle CANNOT answer locally: a batch whose
-	// first PUT landed and lost its answer may have been checkpointed and
-	// truncated by another process while this writer still holds the
-	// lease. A first attempt is the one an owner can vouch for from its own
-	// state.
+	// retry says whether the batch may already be durable: a retry or the
+	// post-claim check. That is the case the oracle CANNOT answer locally:
+	// another process may have checkpointed and truncated the batch while
+	// this writer still holds the lease. Only before a first attempt is it
+	// false, when an owner can vouch for the watermark from its own state.
 	floor func(ctx context.Context, retry bool) (uint64, error)
 	// maxUnacked is an optional bound on accepted-but-unacked records.
 	// The default admission bound is always measured in encoded bytes.
@@ -230,7 +232,8 @@ type Writer[R Record] struct {
 	closed  bool
 	// terminal latches the error that finished the writer: ErrLostRace
 	// (another writer owns the log) or ErrUnresolved (the next sequence is
-	// unknowable). Nil while the writer is usable.
+	// unknowable), or ErrWriterFailed (sequence space exhausted). Nil while
+	// the writer is usable.
 	terminal error
 	// pendingSince is when pending stopped being empty; zero when it is.
 	// Promoted into batch.enqueued so the age survives the flush boundary.
@@ -249,8 +252,6 @@ type Writer[R Record] struct {
 	lastCommit time.Time // start time of the last proven successful PUT, under mu
 	nextRetry  time.Time // retry unresolved flight no earlier than this
 
-	testNonce string // test-only, set under mu by this package's tests: consumed as the next minted nonce
-
 	kick    chan struct{}
 	done    chan struct{}
 	stopped chan struct{} // closed when loop() exits; Close blocks on it
@@ -264,7 +265,7 @@ type Stats struct {
 	OldestPending   time.Time  // when the oldest un-acked record was accepted; zero when idle
 	LostRace        int64      // ErrLostRace ever returned to a waiter (split brain); the batch that lost only
 	Lost            bool       // the writer lost the race and refuses every Append (Terminal is ErrLostRace)
-	Terminal        error      // what finished the writer (ErrLostRace or ErrUnresolved); nil while usable. Queued and later Appends get ErrWriterFailed
+	Terminal        error      // what finished the writer (ErrLostRace, ErrUnresolved or ErrWriterFailed); nil while usable. Queued and later Appends get ErrWriterFailed
 	Unresolved      int64      // ErrUnresolved ever returned to a waiter whose batch claimed a sequence: at Close, or a claim the floor or a corrupt read-back left unprovable. ErrWriterFailed is not counted
 	Rejected        int64      // ErrOverloaded ever returned: Appends shed at the bound
 	MaxUnacked      int        // optional record bound, zero when byte-only
@@ -295,8 +296,10 @@ func (w *Writer[R]) Stats() Stats {
 // DefaultCommitInterval). Fixed at NewWriter, so no lock is needed.
 func (w *Writer[R]) CommitInterval() time.Duration { return w.commitInterval }
 
-// SetFloor installs the watermark oracle commit consults before every claim
-// (see Writer.floor). Safe to call after NewWriter; nil disables the check,
+// SetFloor installs the watermark oracle commit consults before and after
+// every claim (see Writer.floor). The post-claim check passes retry=true:
+// the batch may now be durable, so the oracle must revalidate the watermark.
+// Safe to call after NewWriter; nil disables the check,
 // and so does an oracle that answers 0, which is how an owner skips the
 // round trip while its lease is fresh. A claim the watermark covers is
 // terminal: the batch gets ErrUnresolved, and every queued and later
@@ -364,6 +367,10 @@ func WithCommitInterval(d time.Duration) Option {
 // NewWriter starts a writer that claims pages Key(prefix, nextSeq),
 // Key(prefix, nextSeq+1), ... onCommit, if not nil, runs on the flush
 // goroutine for every durable batch, before its callers are acked.
+// It must not call Close or blocking Append on this writer, or wait for
+// an Enqueue receipt from it: those operations need the flush goroutine.
+// A batch starting at zero or exhausting the sequence space is refused
+// with terminal ErrWriterFailed before any page is written.
 func NewWriter[R Record](s *objstore.Store, prefix string, nextSeq uint64, onCommit func(seq uint64, at time.Time, records []R), opts ...Option) *Writer[R] {
 	o := options{commitInterval: DefaultCommitInterval}
 	for _, opt := range opts {
@@ -426,8 +433,11 @@ func (w *Writer[R]) Enqueue(ctx context.Context, records []R) (<-chan error, err
 		if n < 0 {
 			return nil, fmt.Errorf("%w: record %d: Size %d", ErrInvalidRecord, i, n)
 		}
-		if framedSize(n) > maxPageBytes-entryHeaderReserve {
+		if n > maxPageBytes || framedSize(n) > maxPageBytes-entryHeaderReserve {
 			return nil, fmt.Errorf("%w: record %d is %d bytes", ErrRecordTooLarge, i, n)
+		}
+		if bytes > math.MaxInt-framedSize(n) {
+			return nil, fmt.Errorf("%w: batch size overflows", ErrRecordTooLarge)
 		}
 		bytes += framedSize(n)
 	}
@@ -450,7 +460,7 @@ func (w *Writer[R]) Enqueue(ctx context.Context, records []R) (<-chan error, err
 	// Include the incoming records and a header reserve per record, the
 	// maximum number of pages they could need. Pending and flight are separate.
 	// Refuse promptly even when the store has stopped acknowledging writes.
-	if n := len(w.pending) + w.inflightRecordsLocked(); (w.maxUnacked > 0 && n+len(records) > w.maxUnacked) || reservedEntryBytes(w.pendingBytes+bytes, len(w.pending)+len(records))+w.inflightBytesLocked() > w.unackedByteLimit {
+	if n := len(w.pending) + w.inflightRecordsLocked(); (w.maxUnacked > 0 && len(records) > w.maxUnacked-n) || reservedEntryBytes(w.pendingBytes, len(w.pending))+w.inflightBytesLocked() > w.unackedByteLimit-reservedEntryBytes(bytes, len(records)) {
 		w.rejected++
 		reserved := reservedEntryBytes(w.pendingBytes, len(w.pending)) + w.inflightBytesLocked()
 		w.mu.Unlock()
@@ -495,10 +505,14 @@ func (w *Writer[R]) inflightBytesLocked() int {
 }
 
 // reservedEntryBytes bounds encoded size even if every record forces a page
-// cut. Exact boundaries are determined at sealing.
+// cut. Saturating on overflow keeps admission from accepting a wrapped size.
+// Exact boundaries are determined at sealing.
 func reservedEntryBytes(bytes, records int) int {
 	if records == 0 {
 		return 0
+	}
+	if records > (math.MaxInt-bytes)/entryHeaderReserve {
+		return math.MaxInt
 	}
 	return bytes + records*entryHeaderReserve
 }
@@ -617,7 +631,7 @@ func (w *Writer[R]) flush() {
 		if len(b.pages) > 0 {
 			w.lastErr = WriteError{} // the store is answering again
 		}
-	case errors.Is(err, ErrLostRace), errors.Is(err, ErrUnresolved):
+	case errors.Is(err, ErrLostRace), errors.Is(err, ErrUnresolved), errors.Is(err, ErrWriterFailed):
 		// Terminal. ErrLostRace: another writer owns the log, and everything
 		// queued would lose the same race. ErrUnresolved: the claim was
 		// covered by the floor or met a corrupt page, so the next sequence
@@ -625,12 +639,13 @@ func (w *Writer[R]) flush() {
 		// (acknowledged, never replayed) or contend with this batch's own
 		// pages. Only b claimed a sequence: what queued behind it was never
 		// written, so it gets ErrWriterFailed and is not counted.
+		// Sequence exhaustion is also terminal, but nothing was claimed.
 		w.terminal = err
 		queued, failed = w.calls, w.failedLocked()
 		w.pending, w.pendingBytes, w.calls, w.pendingSince = nil, 0, nil, time.Time{}
 		if errors.Is(err, ErrLostRace) {
 			w.lostRace += live(b.calls)
-		} else {
+		} else if errors.Is(err, ErrUnresolved) {
 			w.unresolved += live(b.calls)
 		}
 	}
@@ -664,11 +679,6 @@ func (w *Writer[R]) finalDrain() {
 // mintNonceLocked returns a fresh random identity for one batch. Caller
 // holds w.mu.
 func (w *Writer[R]) mintNonceLocked() string {
-	if w.testNonce != "" {
-		n := w.testNonce
-		w.testNonce = ""
-		return n
-	}
 	buf := make([]byte, 16)
 	rand.Read(buf) // never fails: since Go 1.24 it crashes the program instead
 	return hex.EncodeToString(buf)
@@ -788,6 +798,17 @@ func (w *Writer[R]) putPages(ctx context.Context, b *batch[R], floor func(contex
 				return ErrLostRace
 			}
 		}
+		if floor != nil {
+			// A deleted claim can win after a replacement checkpointed it.
+			// Revalidate now that our PUT may be durable, even on its first try.
+			f, err := floor(ctx, true)
+			if err != nil {
+				return w.retry("floor", key, err)
+			}
+			if seq <= f {
+				return fmt.Errorf("%w: sequence %d is covered by watermark %d", ErrUnresolved, seq, f)
+			}
+		}
 		b.landed = i + 1
 	}
 	return nil
@@ -820,6 +841,10 @@ func (w *Writer[R]) retry(op, key string, cause error) error {
 // error: every call failed. Without calls (standalone callers) any failing
 // record fails the batch.
 func splitBatch[R Record](seq uint64, b *batch[R]) (pages [][]byte, kept []R, err error) {
+	// Keep the next sequence representable too: zero is outside replay.
+	if seq == 0 || seq == math.MaxUint64 {
+		return nil, nil, fmt.Errorf("%w: sequence space exhausted at %d", ErrWriterFailed, seq)
+	}
 	head := Header{Seq: seq, Nonce: b.nonce, At: b.at, BatchPages: 1}
 	header, err := appendHeader(nil, head, len(b.records), weightOf(b.records))
 	if err != nil {
@@ -828,7 +853,14 @@ func splitBatch[R Record](seq uint64, b *batch[R]) (pages [][]byte, kept []R, er
 	hdr := len(header)
 	total := hdr
 	for _, r := range b.records {
-		total += framedSize(r.Size())
+		n := r.Size()
+		if err := checkRecordSize(n); err != nil {
+			return nil, nil, err
+		}
+		if total > math.MaxInt-4-framedSize(n) {
+			return nil, nil, ErrRecordTooLarge
+		}
+		total += framedSize(n)
 	}
 	buf := make([]byte, hdr, total+4)
 	copy(buf, header)
@@ -853,9 +885,9 @@ func splitBatch[R Record](seq uint64, b *batch[R]) (pages [][]byte, kept []R, er
 		next += g.n
 		if err != nil {
 			if len(b.calls) == 0 {
-				return nil, nil, fmt.Errorf("%w: %v", ErrInvalidRecord, err)
+				return nil, nil, fmt.Errorf("%w: %w", ErrInvalidRecord, err)
 			}
-			g.err = fmt.Errorf("%w: %v", ErrInvalidRecord, err)
+			g.err = fmt.Errorf("%w: %w", ErrInvalidRecord, err)
 			buf, ends, err, dropped = buf[:mark], ends[:marks], nil, true
 		}
 	}
@@ -930,6 +962,9 @@ func splitBatch[R Record](seq uint64, b *batch[R]) (pages [][]byte, kept []R, er
 		}
 	}
 	bounds = append(bounds, len(records))
+	if uint64(len(bounds)-1) > math.MaxUint64-seq {
+		return nil, kept, fmt.Errorf("%w: sequence space exhausted at %d", ErrWriterFailed, seq)
+	}
 	pages = make([][]byte, len(bounds)-1)
 	head.BatchPages = uint64(len(pages))
 	for i := range pages {

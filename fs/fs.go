@@ -10,6 +10,7 @@ import (
 	"fmt"
 	"io"
 	iofs "io/fs"
+	"maps"
 	"os"
 	"path/filepath"
 	"slices"
@@ -111,7 +112,7 @@ const writeBackChunk = 256 << 10
 // key sub-directories beneath it are created here. An urgent write (a log
 // commit) is written whole; others over writeBackChunk are written back as
 // they are written (see writeBackChunk).
-func (f *Backend) writeTemp(dst string, data []byte, urgent bool, t *objstore.Timings) (string, error) {
+func (f *Backend) writeTemp(ctx context.Context, dst string, data []byte, urgent bool, t *objstore.Timings) (string, error) {
 	if _, err := os.Stat(f.root); errors.Is(err, iofs.ErrNotExist) {
 		return "", fmt.Errorf("store: bucket %s: %w", f.root, objstore.ErrNotFound)
 	} else if err != nil {
@@ -127,39 +128,52 @@ func (f *Backend) writeTemp(dst string, data []byte, urgent bool, t *objstore.Ti
 	if err != nil {
 		return "", err
 	}
+	// Until publication, cancellation can discard all work safely.
+	defer func() {
+		if tmp != nil {
+			tmp.Close()
+			os.Remove(tmp.Name())
+		}
+	}()
 	chunk := writeBackChunk
 	if urgent || len(data) <= chunk {
 		chunk = len(data) // one write, left to the fsync
 	}
 	for off := 0; off < len(data); off += chunk {
+		if err := ctx.Err(); err != nil {
+			return "", err
+		}
 		part := data[off:min(off+chunk, len(data))]
 		start = time.Now()
 		_, err := tmp.Write(part)
 		t.Since(objstore.CallWrite, start)
 		if err == nil && chunk < len(data) {
+			if err := ctx.Err(); err != nil {
+				return "", err
+			}
 			start = time.Now()
 			err = writeBack(tmp, int64(off), int64(len(part)))
 			t.Since(objstore.CallWriteBack, start)
 		}
 		if err != nil {
-			tmp.Close()
-			os.Remove(tmp.Name())
 			return "", err
 		}
+	}
+	if err := ctx.Err(); err != nil {
+		return "", err
 	}
 	start = time.Now()
 	err = tmp.Sync()
 	t.Since(objstore.CallFsync, start)
 	if err != nil {
-		tmp.Close()
-		os.Remove(tmp.Name())
 		return "", err
 	}
 	if err := tmp.Close(); err != nil {
-		os.Remove(tmp.Name())
 		return "", err
 	}
-	return tmp.Name(), nil
+	name := tmp.Name()
+	tmp = nil
+	return name, nil
 }
 
 // reserved reports whether a file name is the backend's own: the root lock,
@@ -318,7 +332,7 @@ func (f *Backend) put(ctx context.Context, key string, data []byte) error {
 	if err := ctx.Err(); err != nil {
 		return err
 	}
-	tmp, err := f.writeTemp(dst, data, objstore.IsUrgent(ctx), objstore.TimingsOf(ctx))
+	tmp, err := f.writeTemp(ctx, dst, data, objstore.IsUrgent(ctx), objstore.TimingsOf(ctx))
 	if err != nil {
 		return err
 	}
@@ -359,7 +373,7 @@ func (f *Backend) putIfAbsent(ctx context.Context, key string, data []byte) (boo
 	if err := ctx.Err(); err != nil {
 		return false, err
 	}
-	tmp, err := f.writeTemp(dst, data, objstore.IsUrgent(ctx), objstore.TimingsOf(ctx))
+	tmp, err := f.writeTemp(ctx, dst, data, objstore.IsUrgent(ctx), objstore.TimingsOf(ctx))
 	if err != nil {
 		return false, err
 	}
@@ -381,14 +395,8 @@ func (f *Backend) putIfAbsent(ctx context.Context, key string, data []byte) (boo
 		if !errors.Is(err, iofs.ErrExist) {
 			return false, err
 		}
-		// The object may be this process's own from a try whose directory
-		// sync failed: owe the sync until this process has made it.
-		if _, walked := f.durable.Load(filepath.Dir(dst)); !walked {
-			if err := f.syncPublishedDir(dst, t); err != nil {
-				return false, err
-			}
-		}
-		return false, nil
+		// Another handle may have published without completing its sync.
+		return false, f.syncPublishedDir(dst, t)
 	}
 	return true, f.syncPublishedDir(dst, t)
 }
@@ -459,7 +467,7 @@ func (f *Backend) putIfMatch(ctx context.Context, key string, data []byte, etag 
 		return false, err
 	}
 	t := objstore.TimingsOf(ctx)
-	tmp, err := f.writeTemp(dst, data, objstore.IsUrgent(ctx), t)
+	tmp, err := f.writeTemp(ctx, dst, data, objstore.IsUrgent(ctx), t)
 	if err != nil {
 		return false, err
 	}
@@ -504,16 +512,16 @@ func (f *Backend) putIfMatch(ctx context.Context, key string, data []byte, etag 
 // one key past the page: a page costs the directories it touches, not the
 // bucket.
 func (f *Backend) ListPage(ctx context.Context, prefix, after string, limit int) ([]string, string, error) {
-	keys, err := f.list(ctx, prefix, limit, func(key string, isDir bool, out []string) ([]string, bool) {
+	keys, err := f.list(ctx, prefix, limit, func(key string, isDir bool, out []string) ([]string, bool, error) {
 		if isDir {
 			// A subtree's keys all start with key: some may follow after
 			// only if after is inside it or it sorts past after.
-			return out, strings.HasPrefix(after, key) || key > after
+			return out, strings.HasPrefix(after, key) || key > after, nil
 		}
 		if key > after {
 			out = append(out, key)
 		}
-		return out, false
+		return out, false, nil
 	})
 	if err != nil {
 		return nil, "", objstore.OpErr("list-page", prefix, err)
@@ -526,15 +534,24 @@ func (f *Backend) ListPage(ctx context.Context, prefix, after string, limit int)
 // left empty by a Delete is invisible here exactly as it is on S3, which
 // has no directories at all.
 func (f *Backend) ListPrefixesPage(ctx context.Context, prefix, after string, limit int) ([]string, string, error) {
-	keys, err := f.list(ctx, prefix, limit, func(key string, isDir bool, out []string) ([]string, bool) {
+	keys, err := f.list(ctx, prefix, limit, func(key string, isDir bool, out []string) ([]string, bool, error) {
 		if !isDir || !strings.HasPrefix(key, prefix) || len(key) == len(prefix) {
-			return out, isDir // an object at the prefix level, or prefix's own directory
+			return out, isDir, nil // an object at the prefix level, or prefix's own directory
 		}
 		// key is one level under prefix: a child prefix, never descended.
-		if key > after && f.hasObject(ctx, key) {
-			out = append(out, key)
+		if key > after {
+			found, err := f.hasObject(ctx, key)
+			if errors.Is(err, iofs.ErrNotExist) || errors.Is(err, syscall.ENOTDIR) {
+				return out, false, nil // vanished or replaced mid-walk
+			}
+			if err != nil {
+				return out, false, err
+			}
+			if found {
+				out = append(out, key)
+			}
 		}
-		return out, false
+		return out, false, nil
 	})
 	if err != nil {
 		return nil, "", objstore.OpErr("list-prefixes-page", prefix, err)
@@ -554,7 +571,7 @@ func page(keys []string, limit int) ([]string, string, error) {
 // each object key under prefix, and each directory (as "dir/") that is an
 // ancestor of prefix or lies under it, and returns out with any additions
 // and, for a directory, whether to descend into it.
-func (f *Backend) list(ctx context.Context, prefix string, limit int, take func(key string, isDir bool, out []string) ([]string, bool)) ([]string, error) {
+func (f *Backend) list(ctx context.Context, prefix string, limit int, take func(key string, isDir bool, out []string) ([]string, bool, error)) ([]string, error) {
 	if limit < 1 {
 		return nil, fmt.Errorf("limit %d < 1", limit)
 	}
@@ -571,13 +588,13 @@ func (f *Backend) list(ctx context.Context, prefix string, limit int, take func(
 		}
 	}
 	var out []string
-	_, err := f.walk(ctx, start, func(key string, isDir bool) (descend, stop bool) {
+	_, err := f.walk(ctx, start, func(key string, isDir bool) (descend, stop bool, err error) {
 		if !strings.HasPrefix(key, prefix) && !(isDir && strings.HasPrefix(prefix, key)) {
 			// Past prefix in key order means past every key under it.
-			return false, key > prefix
+			return false, key > prefix, nil
 		}
-		out, descend = take(key, isDir, out)
-		return descend, len(out) > limit
+		out, descend, err = take(key, isDir, out)
+		return descend, len(out) > limit, err
 	})
 	if err == nil || start == "" || !(errors.Is(err, iofs.ErrNotExist) || errors.Is(err, syscall.ENOTDIR)) {
 		return out, f.bucketErr(err)
@@ -599,9 +616,8 @@ func (f *Backend) bucketErr(err error) error {
 }
 
 // hasObject reports whether any object lives under dir ("a/b/").
-func (f *Backend) hasObject(ctx context.Context, dir string) bool {
-	found, _ := f.walk(ctx, dir, func(_ string, isDir bool) (bool, bool) { return isDir, !isDir })
-	return found
+func (f *Backend) hasObject(ctx context.Context, dir string) (bool, error) {
+	return f.walk(ctx, dir, func(_ string, isDir bool) (bool, bool, error) { return isDir, !isDir, nil })
 }
 
 // walk visits the entries under dir (a key prefix ending in "/", or "" for
@@ -612,7 +628,10 @@ func (f *Backend) hasObject(ctx context.Context, dir string) bool {
 // whether to descend. walk returns true as soon as visit says stop.
 // Directories vanishing mid-walk are skipped; the reserved lock and temp
 // files are not objects.
-func (f *Backend) walk(ctx context.Context, dir string, visit func(key string, isDir bool) (descend, stop bool)) (bool, error) {
+func (f *Backend) walk(ctx context.Context, dir string, visit func(key string, isDir bool) (descend, stop bool, err error)) (bool, error) {
+	if err := ctx.Err(); err != nil {
+		return false, err
+	}
 	f.dirReads.Add(1)
 	entries, err := os.ReadDir(filepath.Join(f.root, filepath.FromSlash(dir)))
 	if err != nil {
@@ -636,14 +655,17 @@ func (f *Backend) walk(ctx context.Context, dir string, visit func(key string, i
 		if err := ctx.Err(); err != nil {
 			return false, err
 		}
-		descend, stop := visit(e.key, e.isDir)
+		descend, stop, err := visit(e.key, e.isDir)
+		if err != nil {
+			return false, err
+		}
 		if stop {
 			return true, nil
 		}
 		if !e.isDir || !descend {
 			continue
 		}
-		stop, err := f.walk(ctx, e.key, visit)
+		stop, err = f.walk(ctx, e.key, visit)
 		if errors.Is(err, iofs.ErrNotExist) || errors.Is(err, syscall.ENOTDIR) {
 			continue // vanished or replaced mid-walk
 		}
@@ -656,10 +678,10 @@ func (f *Backend) walk(ctx context.Context, dir string, visit func(key string, i
 
 // Delete removes the object at key. A missing key is not an error.
 func (f *Backend) Delete(ctx context.Context, key string) error {
-	return objstore.OpErr("delete", key, f.delete(ctx, key))
+	return objstore.OpErr("delete", key, f.delete(ctx, key, nil))
 }
 
-func (f *Backend) delete(ctx context.Context, key string) error {
+func (f *Backend) delete(ctx context.Context, key string, dirs map[string]string) error {
 	p, err := f.path(key)
 	if err != nil {
 		return err
@@ -673,17 +695,39 @@ func (f *Backend) delete(ctx context.Context, key string) error {
 	}
 	defer unlock()
 	defer t.Since(objstore.CallDelete, time.Now())
-	if err := os.Remove(p); err != nil && !errors.Is(err, iofs.ErrNotExist) {
-		return err
+	if err := os.Remove(p); err != nil {
+		if !errors.Is(err, iofs.ErrNotExist) {
+			return err
+		}
+		// A retry after a failed sync still owes the parent, if it exists.
+		if _, err := os.Stat(filepath.Dir(p)); err != nil {
+			if errors.Is(err, iofs.ErrNotExist) {
+				return nil
+			}
+			return err
+		}
 	}
-	return nil
+	if dirs != nil {
+		dirs[filepath.Dir(p)] = key
+		return nil
+	}
+	defer t.Since(objstore.CallDirSync, time.Now())
+	return f.syncDir(filepath.Dir(p))
 }
 
 // DeleteMany removes keys one by one. Missing keys are not an error.
-func (f *Backend) DeleteMany(ctx context.Context, keys ...string) error {
+func (f *Backend) DeleteMany(ctx context.Context, keys ...string) (err error) {
+	dirs := make(map[string]string)
+	// Complete durability work even if a later key fails or ctx ends.
+	defer func() {
+		defer objstore.TimingsOf(ctx).Since(objstore.CallDirSync, time.Now())
+		for _, dir := range slices.Sorted(maps.Keys(dirs)) {
+			err = errors.Join(err, objstore.OpErr("delete-many", dirs[dir], f.syncDir(dir)))
+		}
+	}()
 	for _, k := range keys {
-		if err := f.Delete(ctx, k); err != nil {
-			return err
+		if err := f.delete(ctx, k, dirs); err != nil {
+			return objstore.OpErr("delete-many", k, err)
 		}
 	}
 	return nil
@@ -691,11 +735,37 @@ func (f *Backend) DeleteMany(ctx context.Context, keys ...string) error {
 
 // EnsureBucket creates the bucket directory if missing. It is the only
 // creator of the root; writes into a missing bucket fail with ErrNotFound.
+// It fsyncs the bucket and each ancestor up to the first one this process
+// may not open, which it cannot sync.
 func (f *Backend) EnsureBucket(ctx context.Context) error {
 	if err := ctx.Err(); err != nil {
 		return objstore.OpErr("create-bucket", f.root, err)
 	}
-	return objstore.OpErr("create-bucket", f.root, os.MkdirAll(f.root, 0o755))
+	root, err := filepath.Abs(f.root)
+	if err != nil {
+		return objstore.OpErr("create-bucket", f.root, err)
+	}
+	if err := os.MkdirAll(f.root, 0o755); err != nil {
+		return objstore.OpErr("create-bucket", f.root, err)
+	}
+	// The configured root may also be new. Existence after a failed sync
+	// proves nothing: repay the whole chain through the filesystem root.
+	// An ancestor we may cross but not open (mode 0311, say) cannot be
+	// synced by this process at all, so the climb stops there and a new
+	// entry in it is only as durable as the filesystem makes it.
+	for dir := root; ; dir = filepath.Dir(dir) {
+		err := f.syncDir(dir)
+		var pe *iofs.PathError
+		if dir != root && errors.As(err, &pe) && pe.Op == "open" && errors.Is(err, iofs.ErrPermission) {
+			return nil
+		}
+		if err != nil {
+			return objstore.OpErr("create-bucket", f.root, err)
+		}
+		if dir == filepath.Dir(dir) {
+			return nil
+		}
+	}
 }
 
 // DropBucket removes the bucket directory and everything in it. A missing

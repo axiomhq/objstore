@@ -67,31 +67,16 @@ type entry struct {
 	key        string
 	val        []byte
 	low        bool
-	decoded    sizedDecoded // optional typed decode of val; evicted with the bytes
-	dsize      int          // charged retained size of decoded (see PutDecoded)
+	decoded    any // optional typed decode of val; evicted with the bytes
+	dsize      int // charged retained size of decoded (see PutDecoded)
 	prev, next *entry
 }
-
-type sizedDecoded interface {
-	retainedBytes() int
-	decodedValue() any
-}
-
-type concreteDecoded struct {
-	value any
-	bytes int
-}
-
-func (v concreteDecoded) retainedBytes() int { return v.bytes }
-func (v concreteDecoded) decodedValue() any  { return v.value }
 
 // Sizer is a decoded value that knows its retained charge: PutDecoded with
 // a zero size charges CacheBytes.
 type Sizer interface {
 	CacheBytes() int
 }
-
-var _ sizedDecoded = concreteDecoded{}
 
 // generations counts invalidations per namespace. A key's generation is
 // its namespace's; keys outside ns/<name>/ are always at generation 0.
@@ -337,7 +322,7 @@ func (c *ByteCache) PutValue(key string, v any, size int, generation uint64) {
 	if _, ok := s.items[key]; ok {
 		return
 	}
-	e := &entry{key: key, low: c.isLow(key), decoded: concreteDecoded{value: v, bytes: size}, dsize: size}
+	e := &entry{key: key, low: c.isLow(key), decoded: v, dsize: size}
 	if size > s.cap-e.base() {
 		return
 	}
@@ -381,7 +366,7 @@ func (c *ByteCache) PutDecoded(key string, v any, size int, generation uint64) {
 		return
 	}
 	s.charge(e, size-e.dsize) // a re-decode replaces the charge, never doubles it
-	e.decoded, e.dsize = concreteDecoded{value: v, bytes: size}, size
+	e.decoded, e.dsize = v, size
 	s.evictLocked()
 }
 
@@ -404,7 +389,7 @@ func (c *ByteCache) Recharge(key string, v any, size int, generation uint64) boo
 		return false
 	}
 	e, ok := s.items[key]
-	if !ok || e.decoded == nil || e.decoded.decodedValue() != v {
+	if !ok || e.decoded == nil || e.decoded != v {
 		return false
 	}
 	if size > s.cap-e.base() {
@@ -412,7 +397,7 @@ func (c *ByteCache) Recharge(key string, v any, size int, generation uint64) boo
 		return false
 	}
 	s.charge(e, size-e.dsize)
-	e.decoded, e.dsize = concreteDecoded{value: v, bytes: size}, size
+	e.decoded, e.dsize = v, size
 	s.evictLocked()
 	return true
 }
@@ -455,7 +440,7 @@ func Decoded[T any](c *ByteCache, key string) (T, bool) {
 	if v == nil {
 		return zero, false
 	}
-	t, ok := v.decodedValue().(T)
+	t, ok := v.(T)
 	if ok {
 		s.touch(e)
 	}

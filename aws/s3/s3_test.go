@@ -11,6 +11,12 @@ import (
 	"strings"
 	"sync/atomic"
 	"testing"
+	"time"
+
+	"github.com/aws/aws-sdk-go-v2/aws"
+	awss3 "github.com/aws/aws-sdk-go-v2/service/s3"
+	"github.com/aws/smithy-go"
+	smithyendpoints "github.com/aws/smithy-go/endpoints"
 
 	"github.com/axiomhq/objstore"
 )
@@ -491,5 +497,128 @@ func TestS3KMSKeyPerObject(t *testing.T) {
 		if err := s.Put(ctx, "a/x", []byte("x")); !errors.Is(err, objstore.ErrAccessDenied) {
 			t.Fatalf("PUT on %s: %v", code, err)
 		}
+	}
+}
+
+func TestS3TranslationsPreserveCause(t *testing.T) {
+	for _, op := range []string{"PutIfAbsent", "PutIfMatch", "Get", "GetWithETag", "GetIfChanged", "GetRange", "InvalidRange"} {
+		t.Run(op, func(t *testing.T) {
+			ctx, cancel := context.WithTimeout(t.Context(), time.Minute)
+			defer cancel()
+			code, status, sentinel := "NoSuchKey", http.StatusNotFound, objstore.ErrNotFound
+			if strings.HasPrefix(op, "Put") {
+				code, status, sentinel = "ConditionalRequestConflict", http.StatusConflict, objstore.ErrConflict
+			} else if op == "InvalidRange" {
+				code, status, sentinel = "InvalidRange", http.StatusRequestedRangeNotSatisfiable, objstore.ErrRange
+			}
+			b := fakeS3(t, func(w http.ResponseWriter, _ *http.Request) { s3Error(w, status, code) })
+			var err error
+			switch op {
+			case "PutIfAbsent":
+				_, err = b.PutIfAbsent(ctx, "k", []byte("v"))
+			case "PutIfMatch":
+				_, err = b.PutIfMatch(ctx, "k", []byte("v"), "tag")
+			case "Get":
+				_, err = b.Get(ctx, "k")
+			case "GetWithETag":
+				_, _, err = b.GetWithETag(ctx, "k")
+			case "GetIfChanged":
+				_, _, _, err = b.GetIfChanged(ctx, "k", "tag")
+			default:
+				_, err = b.GetRange(ctx, "k", 1, 2)
+			}
+			var provider smithy.APIError
+			if !errors.Is(err, sentinel) || !errors.As(err, &provider) || provider.ErrorCode() != code {
+				t.Fatalf("lost sentinel or provider cause: %v", err)
+			}
+		})
+	}
+}
+
+func TestS3EnsureBucketLocationConstraint(t *testing.T) {
+	for _, tc := range []struct {
+		region string
+		custom bool
+	}{
+		{"us-east-1", false}, {"eu-west-1", false}, {"eu-west-1", true},
+	} {
+		t.Run(tc.region+map[bool]string{true: "-custom", false: "-aws"}[tc.custom], func(t *testing.T) {
+			ctx, cancel := context.WithTimeout(t.Context(), time.Minute)
+			defer cancel()
+			var body atomic.Value
+			b := fakeS3(t, func(w http.ResponseWriter, r *http.Request) {
+				if r.Method == http.MethodHead {
+					w.WriteHeader(http.StatusNotFound)
+					return
+				}
+				data, err := io.ReadAll(r.Body)
+				if err != nil {
+					t.Error(err)
+				}
+				body.Store(string(data))
+				w.WriteHeader(http.StatusOK)
+			})
+			// Keep transport pointed at the fake while selecting the AWS policy.
+			endpoint := b.endpoint
+			b.client = awss3.NewFromConfig(aws.Config{Region: tc.region, Credentials: b.client.Options().Credentials}, func(o *awss3.Options) {
+				if tc.custom {
+					o.BaseEndpoint = &endpoint
+				} else {
+					o.EndpointResolverV2 = fakeAWSResolver{endpoint}
+				}
+				o.UsePathStyle = true
+			})
+			if !tc.custom {
+				b.endpoint = ""
+			}
+			if err := b.EnsureBucket(ctx); err != nil {
+				t.Fatal(err)
+			}
+			got := body.Load().(string)
+			want := !tc.custom && tc.region != "us-east-1"
+			if strings.Contains(got, "<LocationConstraint>"+tc.region+"</LocationConstraint>") != want || (!want && got != "") {
+				t.Fatalf("CreateBucket body = %q, want location constraint=%v", got, want)
+			}
+		})
+	}
+}
+
+type fakeAWSResolver struct{ endpoint string }
+
+func (r fakeAWSResolver) ResolveEndpoint(ctx context.Context, params awss3.EndpointParameters) (smithyendpoints.Endpoint, error) {
+	params.Endpoint = &r.endpoint
+	return awss3.NewDefaultEndpointResolverV2().ResolveEndpoint(ctx, params)
+}
+
+func TestS3EnsureBucketEnvironmentEndpoint(t *testing.T) {
+	ctx, cancel := context.WithTimeout(t.Context(), time.Minute)
+	defer cancel()
+	var body atomic.Value
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.Method == http.MethodHead {
+			w.WriteHeader(http.StatusNotFound)
+			return
+		}
+		data, err := io.ReadAll(r.Body)
+		if err != nil {
+			t.Error(err)
+		}
+		body.Store(string(data))
+		w.WriteHeader(http.StatusOK)
+	}))
+	t.Cleanup(srv.Close)
+	t.Setenv("AWS_ACCESS_KEY_ID", "test")
+	t.Setenv("AWS_SECRET_ACCESS_KEY", "test")
+	t.Setenv("AWS_ENDPOINT_URL_S3", srv.URL)
+	t.Setenv("AWS_REGION", "eu-west-1")
+	b, err := New(ctx, Config{Bucket: "b"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := b.EnsureBucket(ctx); err != nil {
+		t.Fatal(err)
+	}
+	if got := body.Load().(string); got != "" {
+		t.Fatalf("environment endpoint CreateBucket body = %q, want empty", got)
 	}
 }

@@ -48,11 +48,10 @@ func (r *Reader) Store() *objstore.Store { return r.store }
 
 // Fetch returns an immutable object via the cache. Cached bytes must never
 // be mutated: every decoder copies out. Concurrent misses for the same key
-// share one GET under the leader's ctx, but each caller waits under its
-// own: a background prefetch unwinds at shutdown behind a request-led GET,
-// and a cancelled request does not hold its admission slot until the
-// leader's GET ends. The shared call runs on and is forgotten when it
-// completes.
+// share one GET with the leader's context values but not its cancellation.
+// Each caller waits under its own context. The GET runs while any waiter
+// remains; the last waiter leaving cancels it and forgets the flight so a
+// later caller starts afresh.
 func (r *Reader) Fetch(ctx context.Context, key string) ([]byte, error) {
 	return r.objects.FetchWith(ctx, key, func(ctx context.Context) ([]byte, error) {
 		return r.objects.Gated(ctx, func(ctx context.Context) ([]byte, error) { return r.store.Get(ctx, key) })

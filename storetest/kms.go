@@ -13,9 +13,10 @@ import (
 // as S3 does. It encrypts nothing.
 type KMS struct {
 	objstore.Backend
-	mu      sync.Mutex
-	keys    map[string]string // object -> KMS key id
-	revoked map[string]bool
+	mutation sync.Mutex // backing mutations and their key bookkeeping
+	mu       sync.Mutex
+	keys     map[string]string // object -> KMS key id
+	revoked  map[string]bool
 }
 
 // NewKMS wraps s's backend in a KMS. The returned Store reports KMS() true.
@@ -59,11 +60,18 @@ func (k *KMS) wrote(ctx context.Context, object string) {
 	}
 }
 
+// plain strips the KMS key from ctx before a write reaches the wrapped
+// backend. KMS stands in for the key service, so the backend underneath must
+// not see a key: a real S3 without KMS (MinIO in CI) refuses SSE-KMS writes.
+func plain(ctx context.Context) context.Context { return objstore.WithKMSKey(ctx, "") }
+
 func (k *KMS) Put(ctx context.Context, key string, data []byte) error {
+	k.mutation.Lock()
+	defer k.mutation.Unlock()
 	if err := k.denied(objstore.KMSKey(ctx)); err != nil {
 		return err
 	}
-	err := k.Backend.Put(ctx, key, data)
+	err := k.Backend.Put(plain(ctx), key, data)
 	if err == nil {
 		k.wrote(ctx, key)
 	}
@@ -71,10 +79,12 @@ func (k *KMS) Put(ctx context.Context, key string, data []byte) error {
 }
 
 func (k *KMS) PutIfAbsent(ctx context.Context, key string, data []byte) (bool, error) {
+	k.mutation.Lock()
+	defer k.mutation.Unlock()
 	if err := k.denied(objstore.KMSKey(ctx)); err != nil {
 		return false, err
 	}
-	ok, err := k.Backend.PutIfAbsent(ctx, key, data)
+	ok, err := k.Backend.PutIfAbsent(plain(ctx), key, data)
 	if ok && err == nil {
 		k.wrote(ctx, key)
 	}
@@ -82,14 +92,56 @@ func (k *KMS) PutIfAbsent(ctx context.Context, key string, data []byte) (bool, e
 }
 
 func (k *KMS) PutIfMatch(ctx context.Context, key string, data []byte, etag string) (bool, error) {
+	k.mutation.Lock()
+	defer k.mutation.Unlock()
 	if err := k.denied(objstore.KMSKey(ctx)); err != nil {
 		return false, err
 	}
-	ok, err := k.Backend.PutIfMatch(ctx, key, data, etag)
+	ok, err := k.Backend.PutIfMatch(plain(ctx), key, data, etag)
 	if ok && err == nil {
 		k.wrote(ctx, key)
 	}
 	return ok, err
+}
+
+func (k *KMS) forget(keys ...string) {
+	k.mu.Lock()
+	defer k.mu.Unlock()
+	for _, key := range keys {
+		delete(k.keys, key)
+	}
+}
+
+func (k *KMS) Delete(ctx context.Context, key string) error {
+	k.mutation.Lock()
+	defer k.mutation.Unlock()
+	err := k.Backend.Delete(ctx, key)
+	if err == nil {
+		k.forget(key)
+	}
+	return err
+}
+
+func (k *KMS) DeleteMany(ctx context.Context, keys ...string) error {
+	k.mutation.Lock()
+	defer k.mutation.Unlock()
+	err := k.Backend.DeleteMany(ctx, keys...)
+	if err == nil {
+		k.forget(keys...)
+	}
+	return err
+}
+
+func (k *KMS) DropBucket(ctx context.Context) error {
+	k.mutation.Lock()
+	defer k.mutation.Unlock()
+	err := k.Backend.DropBucket(ctx)
+	if err == nil {
+		k.mu.Lock()
+		clear(k.keys)
+		k.mu.Unlock()
+	}
+	return err
 }
 
 func (k *KMS) Get(ctx context.Context, key string) ([]byte, error) {

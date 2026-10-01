@@ -34,8 +34,10 @@ func New(t testing.TB) *objstore.Store {
 // a platform the file backend does not support (no flock).
 func NewFS(t testing.TB) *objstore.Store {
 	t.Helper()
+	ctx, cancel := context.WithTimeout(t.Context(), time.Minute)
+	defer cancel()
 	s := fs.Open(t.TempDir(), "bucket", objstore.Config{})
-	if err := s.EnsureBucket(context.Background()); errors.Is(err, errors.ErrUnsupported) {
+	if err := s.EnsureBucket(ctx); errors.Is(err, errors.ErrUnsupported) {
 		t.Skip(err)
 	} else if err != nil {
 		t.Fatal(err)
@@ -57,7 +59,7 @@ func NewS3(t testing.TB, endpoint string) *objstore.Store {
 			t.Setenv(k, v)
 		}
 	}
-	ctx, cancel := context.WithTimeout(context.Background(), time.Minute)
+	ctx, cancel := context.WithTimeout(t.Context(), time.Minute)
 	defer cancel()
 	// The random suffix keeps two test binaries started in the same
 	// nanosecond (go test ./... runs packages in parallel) apart.
@@ -72,7 +74,7 @@ func NewS3(t testing.TB, endpoint string) *objstore.Store {
 	// Tear the bucket down with the test: a dev MinIO carrying thousands of
 	// leftover buckets got slow enough to miss lease renewals (2026-09-05).
 	t.Cleanup(func() {
-		ctx, cancel := context.WithTimeout(context.Background(), time.Minute)
+		ctx, cancel := context.WithTimeout(context.WithoutCancel(t.Context()), time.Minute)
 		defer cancel()
 		if err := s.DropBucket(ctx); err != nil {
 			t.Logf("storetest: drop bucket %s: %v", bucket, err)

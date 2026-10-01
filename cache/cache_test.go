@@ -116,8 +116,8 @@ func TestDecodedRetainedBytesStayWithinCap(t *testing.T) {
 		s := &c.stripes[i]
 		s.mu.Lock()
 		for e := s.lists[0].head; e != nil; e = e.next {
-			if e.decoded != nil && e.dsize != e.decoded.retainedBytes() {
-				t.Fatalf("decoded charge %d != concrete size %d", e.dsize, e.decoded.retainedBytes())
+			if v, ok := e.decoded.(text); ok && e.dsize != v.CacheBytes() {
+				t.Fatalf("decoded charge %d != retained size %d", e.dsize, v.CacheBytes())
 			}
 		}
 		s.mu.Unlock()

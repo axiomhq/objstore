@@ -6,6 +6,7 @@ import (
 	"strings"
 	"sync"
 	"testing"
+	"time"
 
 	"github.com/axiomhq/objstore"
 )
@@ -16,7 +17,8 @@ import (
 // writes under its own key prefix, so they can run in any order (or
 // -run one alone) against one bucket. s should start empty.
 func Conformance(t *testing.T, s *objstore.Store) {
-	ctx := t.Context()
+	ctx, cancel := context.WithTimeout(t.Context(), 5*time.Minute)
+	defer cancel()
 	// raw is the backend itself: the Store's write gate and ctx checks
 	// would answer a cancelled call before the backend ever saw it.
 	var raw objstore.Backend

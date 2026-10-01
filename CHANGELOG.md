@@ -1,5 +1,27 @@
 # Changelog
 
+## Unreleased
+
+### Changed behaviour
+
+- **lease**: `Valid` returns `ErrNotOwner` after `Retire`, even before the stored expiry: a retired holder no longer renews, so it must not act. A released `Shared` ref is no longer valid while other refs hold the lease.
+- **lease**: renewals keep the acquiring context's values (a `WithKMSKey`, say), not its cancellation. `Release` bounds its wait for an in-flight `Acquire` by the TTL, and `Retire` cancels in-flight acquisition and renewal.
+- **wal**: `NewWriter` refuses `nextSeq` 0, and a batch whose sequences would pass `MaxUint64` is refused before any PUT and finishes the writer. With a floor oracle installed, a claim is checked against the floor again before it is acked; a covered claim is `ErrUnresolved`.
+- **wal**: a record whose size overflows page framing is `ErrRecordTooLarge`; `Encode` refuses pages `Decode` would reject. `ErrInvalidRecord` from `AppendTo` now wraps the record's own error.
+- **fs**: `Delete` fsyncs the parent directory; `DeleteMany` once per distinct directory. `EnsureBucket` fsyncs the bucket and its ancestors up to the first one this process may not open. `PutIfAbsent` that loses a race fsyncs the directory before reporting it.
+- **aws/s3**, **gcp/gcs**: translated errors (`ErrNotFound`, `ErrRange`) also wrap the provider's error, which now appears in the message. S3 `EnsureBucket` sends the region's `LocationConstraint` on AWS outside us-east-1. GCS `GetRange` rejects a response starting at the wrong offset with `ErrRange`.
+- **cache**: `Disk.Wipe` waits for fills already writing and refuses new ones until then. `Resident.Put` refuses entries of size zero or less. A follower of a shared load that got the leader's `ErrBudget` retries once under its own context.
+- **rangeread**: requests never share a parent read across an `InvalidateNamespace`. `FetchRanges` stops decoding and publishing once its context ends.
+- `DeleteMany` with no keys returns at once instead of waiting for a write slot.
+
+### Added
+
+- `storetest.Fault.SupportsKMS`: a faulty wrapper keeps the wrapped store's KMS capability.
+
+### Fixed
+
+- `storetest.KMS` no longer passes KMS keys to the store underneath, so its tests run on S3 stores without KMS (MinIO). It forgets an object's key when the object is deleted, and an `Ambiguous` fault lands its write even when a `Shape` would fail it.
+
 ## v0.7.0
 
 ### Breaking changes

@@ -15,7 +15,8 @@ import (
 
 func TestFaultModes(t *testing.T) {
 	s, f := bucket.NewFaulty(t)
-	ctx := context.Background()
+	ctx, cancel := context.WithTimeout(t.Context(), time.Minute)
+	defer cancel()
 
 	t.Run("NthCallOnly", func(t *testing.T) {
 		f.Set(storetest.Plan{Op: storetest.OpPut, N: 2})
@@ -192,7 +193,8 @@ func TestFaultShapeIsDeterministicAndBounded(t *testing.T) {
 // wraps is mid-request. The swap is under the injector's mutex, so under
 // -race this is the whole assertion; it runs on file:// so it needs no MinIO.
 func TestFaultSetShapeRacesCalls(t *testing.T) {
-	ctx := context.Background()
+	ctx, cancel := context.WithTimeout(t.Context(), time.Minute)
+	defer cancel()
 	raw := fs.Open(t.TempDir(), "shape-race", objstore.Config{})
 	if err := raw.EnsureBucket(ctx); err != nil {
 		t.Fatal(err)
@@ -318,7 +320,8 @@ func TestShapedReadReturnsNothing(t *testing.T) {
 }
 
 func TestFaultPauseResume(t *testing.T) {
-	ctx := context.Background()
+	ctx, cancel := context.WithTimeout(t.Context(), time.Minute)
+	defer cancel()
 
 	t.Run("Resume", func(t *testing.T) {
 		s, f := bucket.NewFaulty(t)
@@ -478,7 +481,8 @@ func TestFaultZeroValue(t *testing.T) {
 // before the Set does not release it, and one Resume releases calls paused
 // under earlier plans too.
 func TestFaultPauseRearm(t *testing.T) {
-	ctx := t.Context()
+	ctx, cancel := context.WithTimeout(t.Context(), time.Minute)
+	defer cancel()
 	s, f := bucket.NewFaulty(t)
 	f.Resume() // before the plan: must not pre-release it
 	f.Set(storetest.Plan{Op: storetest.OpPut, N: 1, Mode: storetest.Pause, Key: "first"})
@@ -508,13 +512,15 @@ func TestFaultPauseRearm(t *testing.T) {
 // TestFaultyDrainWaitsForResumedWrite: Faulty's cleanup waits for a
 // resumed write to finish at the backend, not just to leave the pause.
 func TestFaultyDrainWaitsForResumedWrite(t *testing.T) {
+	ctx, cancel := context.WithTimeout(t.Context(), time.Minute)
+	defer cancel()
 	inner, slow := storetest.NewFault(bucket.New(t))
 	slow.SetShape(storetest.Shape{Latency: 100 * time.Millisecond}) // after the pause, before storage
 	done := make(chan error, 1)
 	t.Run("paused", func(t *testing.T) {
 		s, f := storetest.Faulty(t, inner)
 		f.Set(storetest.Plan{Op: storetest.OpPut, N: 1, Mode: storetest.Pause})
-		go func() { done <- s.Put(context.Background(), "drain", []byte("x")) }()
+		go func() { done <- s.Put(ctx, "drain", []byte("x")) }()
 		waitFor(t, func() bool { return f.Fired() != 0 })
 	}) // cleanup: Resume, then drain
 	if slow.WriteKeys()["drain"] != 1 {
@@ -555,4 +561,70 @@ func TestFaultFromOnNonRangeOpPanics(t *testing.T) {
 		}
 	}()
 	f.Set(storetest.Plan{Op: storetest.OpGet, N: 1, From: 4})
+}
+
+func TestFaultPreservesKMS(t *testing.T) {
+	plain := bucket.NewFS(t)
+	keyed, _ := storetest.NewKMS(plain)
+	for _, s := range []*objstore.Store{plain, keyed} {
+		wrapped, _ := storetest.NewFault(s)
+		if wrapped.KMS() != s.KMS() {
+			t.Fatalf("Fault.KMS() = %v, wrapped store = %v", wrapped.KMS(), s.KMS())
+		}
+	}
+}
+
+func TestFaultAmbiguousBypassesShape(t *testing.T) {
+	for _, op := range []string{"Put", "PutIfAbsent", "PutIfMatch", "Delete", "DeleteMany"} {
+		t.Run(op, func(t *testing.T) {
+			ctx, cancel := context.WithTimeout(t.Context(), time.Minute)
+			defer cancel()
+			raw := bucket.NewFS(t)
+			var tag string
+			if op != "PutIfAbsent" {
+				if err := raw.Put(ctx, "k", []byte("old")); err != nil {
+					t.Fatal(err)
+				}
+				var err error
+				_, tag, err = raw.GetWithETag(ctx, "k")
+				if err != nil {
+					t.Fatal(err)
+				}
+			}
+			s, f := storetest.NewFault(raw)
+			planOp := storetest.Op(op)
+			if op == "DeleteMany" {
+				planOp = storetest.OpDelete
+			}
+			f.Set(storetest.Plan{Op: planOp, N: 1, Mode: storetest.Ambiguous})
+			f.SetShape(storetest.Shape{ErrorRate: 1})
+			var err error
+			switch op {
+			case "Put":
+				err = s.Put(ctx, "k", []byte("new"))
+			case "PutIfAbsent":
+				_, err = s.PutIfAbsent(ctx, "k", []byte("new"))
+			case "PutIfMatch":
+				_, err = s.PutIfMatch(ctx, "k", []byte("new"), tag)
+			case "Delete":
+				err = s.Delete(ctx, "k")
+			case "DeleteMany":
+				err = s.DeleteMany(ctx, "k")
+			}
+			if !errors.Is(err, storetest.ErrFault) {
+				t.Fatalf("ambiguous response: %v", err)
+			}
+			got, err := raw.Get(ctx, "k")
+			if op == "Delete" || op == "DeleteMany" {
+				if !errors.Is(err, objstore.ErrNotFound) {
+					t.Fatalf("ambiguous delete did not land: %q %v", got, err)
+				}
+			} else if err != nil || string(got) != "new" {
+				t.Fatalf("ambiguous write did not land: %q %v", got, err)
+			}
+			if f.ShapeErrors() != 0 || f.Fired() != 1 {
+				t.Fatalf("shape errors=%d fired=%d", f.ShapeErrors(), f.Fired())
+			}
+		})
+	}
 }
