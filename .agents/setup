@@ -1,0 +1,83 @@
+#!/usr/bin/env bash
+# Prepares an Amp orb to build and test objstore. Runs once per fresh orb and
+# again on a stale snapshot, so every step is idempotent and cheap when warm.
+set -euo pipefail
+
+cd "$(dirname "${BASH_SOURCE[0]}")/.."
+
+step() {
+	local name=$1
+	shift
+	echo "==> $name"
+	local start=$SECONDS
+	"$@"
+	echo "<== $name ($((SECONDS - start))s)"
+}
+
+# The Go version CI's actions/setup-go picks from go.mod: the toolchain
+# directive if present, otherwise the go directive.
+go_version() {
+	local v
+	v=$(awk '$1 == "toolchain" { sub(/^go/, "", $2); print $2; exit }' go.mod)
+	[[ -n $v ]] || v=$(awk '$1 == "go" { print $2; exit }' go.mod)
+	[[ -n $v ]] || { echo "no go version in go.mod" >&2; return 1; }
+	echo "$v"
+}
+
+install_go() {
+	local version root arch
+	version=$(go_version)
+	root=/usr/local/go-$version
+	case $(uname -m) in
+	x86_64) arch=amd64 ;;
+	aarch64) arch=arm64 ;;
+	*) echo "unsupported arch $(uname -m)" >&2; return 1 ;;
+	esac
+	if [[ ! -x $root/bin/go ]]; then
+		local tmp
+		tmp=$(mktemp -d)
+		curl -fsSL "https://go.dev/dl/go$version.linux-$arch.tar.gz" | tar -xz -C "$tmp"
+		sudo rm -rf "$root"
+		sudo mv "$tmp/go" "$root"
+		rm -rf "$tmp"
+	fi
+	# /usr/local/bin is on PATH for Amp, services and login shells alike.
+	sudo ln -sfn "$root" /usr/local/go
+	sudo ln -sfn /usr/local/go/bin/go /usr/local/bin/go
+	sudo ln -sfn /usr/local/go/bin/gofmt /usr/local/bin/gofmt
+	go version
+}
+
+# `go mod tidy -diff` (run in CI) also needs the test dependencies of
+# dependencies. Running it fetches them without writing go.mod or go.sum,
+# which `go mod download all` would. An untidy go.mod is CI's to report, not
+# a reason to fail setup.
+download_modules() {
+	go mod download
+	go mod tidy -diff >/dev/null || echo "warning: go.mod is not tidy (go mod tidy -diff)"
+}
+
+# Compiles packages and race-instrumented test binaries into the build cache
+# without running tests, so the first `go test -race ./...` starts quickly.
+warm_build_cache() {
+	go build ./...
+	go vet ./...
+	go test -race -count=1 -run '^$' ./... >/dev/null
+}
+
+# CI runs staticcheck with `go run pkg@version`; prefetching that module and
+# building it makes the same command fast in the orb.
+warm_staticcheck() {
+	local pkg
+	pkg=$(grep -oE 'honnef\.co/go/tools/cmd/staticcheck@v[0-9.]+' .github/workflows/ci.yml | head -n1 || true)
+	if [[ -z $pkg ]]; then
+		echo "staticcheck version not found in ci.yml; skipping"
+		return 0
+	fi
+	go run "$pkg" -version
+}
+
+step "install Go" install_go
+step "download modules" download_modules
+step "warm build cache" warm_build_cache
+step "warm staticcheck" warm_staticcheck
