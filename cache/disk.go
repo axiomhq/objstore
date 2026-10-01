@@ -34,8 +34,7 @@ type Disk struct {
 	// Logger receives failures the cache survives but an operator should
 	// see (a temporary file or a directory it could not remove). Nil logs
 	// to slog.Default(), as Cache.Logger does. Set it before first use.
-	// NewDisk's sweep of stale directories runs before it can be set and
-	// always logs to slog.Default().
+	// Use OpenDisk to supply it before the sweep of stale directories.
 	Logger *slog.Logger
 
 	// Pin transactions include reservation and warming. Serializing them keeps
@@ -117,16 +116,33 @@ const (
 // A root may host several Disks, in this process or others: each holds an
 // exclusive lock on its directory for its lifetime, and NewDisk removes the
 // stale directories under root (a crash skips Close) whose lock is free.
-// One it cannot remove is logged to slog.Default() and left. With
-// root == "" nothing is swept; neither is anything on platforms without a
+// One it cannot remove is logged to slog.Default() and left (OpenDisk can
+// supply a logger before the sweep). With root == "" nothing is swept;
+// neither is anything on platforms without a
 // file lock (flock on Unix, LockFileEx on Windows).
 func NewDisk(root string, capacity int64, pinCapacity ...int64) (*Disk, error) {
-	if capacity <= 0 {
-		return nil, nil
-	}
 	pc := capacity
 	if len(pinCapacity) > 0 {
 		pc = pinCapacity[0]
+	}
+	return OpenDisk(DiskConfig{Root: root, Capacity: capacity, PinCapacity: pc})
+}
+
+// DiskConfig configures OpenDisk. PinCapacity bounds pin reservations;
+// zero allows no pinned bytes. Logger receives sweep and disk failures; nil uses
+// slog.Default().
+type DiskConfig struct {
+	Root                  string
+	Capacity, PinCapacity int64
+	Logger                *slog.Logger
+}
+
+// OpenDisk creates a disk tier as NewDisk does, with its logger installed
+// before sweeping stale directories. Capacity <= 0 returns a nil *Disk.
+func OpenDisk(cfg DiskConfig) (*Disk, error) {
+	root, capacity, pc := cfg.Root, cfg.Capacity, cfg.PinCapacity
+	if capacity <= 0 {
+		return nil, nil
 	}
 	if pc < 0 || pc > capacity {
 		return nil, ErrPinCapacity
@@ -135,7 +151,7 @@ func NewDisk(root string, capacity int64, pinCapacity ...int64) (*Disk, error) {
 		if err := os.MkdirAll(root, 0700); err != nil {
 			return nil, err
 		}
-		if err := sweepStale(root); err != nil {
+		if err := sweepStale(root, cfg.Logger); err != nil {
 			return nil, err
 		}
 	}
@@ -148,14 +164,17 @@ func NewDisk(root string, capacity int64, pinCapacity ...int64) (*Disk, error) {
 		removeHome(home, lock)
 		return nil, err
 	}
-	return &Disk{home: home, lock: lock, dir: dir, cap: capacity, pinCap: pc, maxPinned: MaxPinnedNamespaces, items: make(map[string]*list.Element), pins: make(map[string]map[string]int64), pinBytes: make(map[string]int64), pinAt: make(map[string]time.Time), pinPrevAt: make(map[string]time.Time), pinned: make(map[string]int), lastAccess: make(map[string]time.Time), nsEntries: make(map[string]int)}, nil
+	return &Disk{Logger: cfg.Logger, home: home, lock: lock, dir: dir, cap: capacity, pinCap: pc, maxPinned: MaxPinnedNamespaces, items: make(map[string]*list.Element), pins: make(map[string]map[string]int64), pinBytes: make(map[string]int64), pinAt: make(map[string]time.Time), pinPrevAt: make(map[string]time.Time), pinned: make(map[string]int), lastAccess: make(map[string]time.Time), nsEntries: make(map[string]int)}, nil
 }
 
 // sweepStale removes the Disk directories under root whose lock is free.
 // A live Disk holds its lock, so its directory is skipped.
-func sweepStale(root string) error {
+func sweepStale(root string, logger *slog.Logger) error {
 	if !sweepable {
 		return nil
+	}
+	if logger == nil {
+		logger = slog.Default()
 	}
 	// Not filepath.Glob: root may contain pattern characters.
 	entries, err := os.ReadDir(root)
@@ -170,7 +189,7 @@ func sweepStale(root string) error {
 		lock, ok, err := lockFile(filepath.Join(dir, lockName))
 		if err != nil {
 			if !errors.Is(err, fs.ErrNotExist) { // gone meanwhile: nothing to sweep
-				slog.Warn("cache: skip stale disk directory: cannot lock it", "dir", dir, "err", err)
+				logger.Warn("cache: skip stale disk directory: cannot lock it", "dir", dir, "err", err)
 			}
 			continue
 		}
@@ -178,7 +197,7 @@ func sweepStale(root string) error {
 			continue // a live Disk holds it
 		}
 		if err := removeHome(dir, lock); err != nil {
-			slog.Warn("cache: skip stale disk directory: cannot remove it", "dir", dir, "err", err)
+			logger.Warn("cache: skip stale disk directory: cannot remove it", "dir", dir, "err", err)
 		}
 	}
 	return nil
@@ -611,8 +630,11 @@ func (c *Disk) ExpireInactive(ttl time.Duration, now time.Time) []string {
 			c.remove(el)
 		}
 	}
-	names := make([]string, 0, len(idle))
+	var names []string
 	for name := range idle {
+		if c.nsEntries[name] > 0 {
+			continue // failed removals or pins still need an inactivity clock
+		}
 		delete(c.lastAccess, name)
 		names = append(names, name)
 	}

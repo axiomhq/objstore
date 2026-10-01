@@ -6,6 +6,7 @@ import (
 	"errors"
 	"fmt"
 	"math"
+	"runtime"
 	"slices"
 	"strings"
 	"sync"
@@ -19,6 +20,256 @@ import (
 )
 
 var errBoom = errors.New("boom")
+
+func TestWriterWeightOverflowFailsOnlyItsCall(t *testing.T) {
+	ctx, cancel := context.WithTimeout(t.Context(), 10*time.Second)
+	defer cancel()
+	s := bucket.New(t)
+	entered, resume := make(chan struct{}), make(chan struct{})
+	w := NewWriter(s, testPrefix, 1, func(seq uint64, _ time.Time, _ []weighed) {
+		if seq == 1 {
+			close(entered)
+			<-resume
+		}
+	}, WithCommitInterval(MinCommitInterval))
+	t.Cleanup(w.Close)
+	release := sync.OnceFunc(func() { close(resume) })
+	defer release()
+	enqueue := func(records ...weighed) <-chan error {
+		t.Helper()
+		receipt, err := w.Enqueue(ctx, records)
+		if err != nil {
+			t.Fatal(err)
+		}
+		return receipt
+	}
+	first := enqueue(weighed{Bytes("wedge"), 0})
+	select {
+	case <-entered:
+	case <-ctx.Done():
+		t.Fatal("writer did not reach onCommit:", ctx.Err())
+	}
+	a := enqueue(weighed{Bytes("a"), math.MaxUint64})
+	b := enqueue(weighed{Bytes("b1"), 0}, weighed{Bytes("b2"), 1})
+	c := enqueue(weighed{Bytes("c"), 0})
+	release()
+	for name, receipt := range map[string]<-chan error{"first": first, "a": a, "b": b, "c": c} {
+		select {
+		case err := <-receipt:
+			if name == "b" {
+				if !errors.Is(err, ErrInvalidRecord) {
+					t.Fatalf("overflowing call: %v, want ErrInvalidRecord", err)
+				}
+			} else if err != nil {
+				t.Fatalf("good call %s: %v", name, err)
+			}
+		case <-ctx.Done():
+			t.Fatal("missing verdict:", ctx.Err())
+		}
+	}
+	entries, err := replay(ctx, s, testPrefix, 0)
+	if err != nil || len(entries) != 2 || !slices.Equal(ids(entries[1]), []string{"a", "c"}) || entries[1].Weight != math.MaxUint64 {
+		t.Fatalf("replay: %+v, %v", entries, err)
+	}
+	if err := w.Append(ctx, []weighed{{Bytes("after"), 1}}); err != nil {
+		t.Fatalf("writer unusable after rejection: %v", err)
+	}
+}
+
+func TestSplitBatchWeightOverflow(t *testing.T) {
+	t.Run("standalone", func(t *testing.T) {
+		b := &batch[weighed]{records: []weighed{{Bytes("a"), math.MaxUint64}, {Bytes("b"), 1}}}
+		if pages, _, err := splitBatch(1, b); !errors.Is(err, ErrInvalidRecord) || pages != nil {
+			t.Fatalf("splitBatch overflowing weight: %d pages, %v, want ErrInvalidRecord", len(pages), err)
+		}
+	})
+	t.Run("per-page", func(t *testing.T) {
+		records := []weighed{{filled('a', 100), math.MaxUint64}, {filled('b', 100), math.MaxUint64}, {filled('c', 100), math.MaxUint64}}
+		b := &batch[weighed]{records: records, pageLimit: headerReserve(0) + 150}
+		pages, _, err := splitBatch(1, b)
+		if err != nil || len(pages) != 3 {
+			t.Fatalf("splitBatch per-page weights: %d pages, %v", len(pages), err)
+		}
+		for _, page := range pages {
+			h, _, err := Decode(page)
+			if err != nil || h.Weight != math.MaxUint64 {
+				t.Fatalf("page weight: %d, %v", h.Weight, err)
+			}
+		}
+	})
+}
+
+// TestSplitBatchRefusesOverflowingCallsInOnePass: many calls that each
+// overflow their page are refused together, not one per rescan of the batch,
+// which made the flush goroutine's work quadratic in the batch.
+func TestSplitBatchRefusesOverflowingCallsInOnePass(t *testing.T) {
+	const n = 8000
+	records := make([]weighed, n)
+	calls := make([]call, n)
+	for i := range records {
+		records[i] = weighed{Bytes("x"), math.MaxUint64}
+		calls[i] = call{n: 1}
+	}
+	b := &batch[weighed]{records: records, calls: calls}
+	var before, after runtime.MemStats
+	runtime.ReadMemStats(&before)
+	pages, kept, err := splitBatch(1, b)
+	runtime.ReadMemStats(&after)
+	if err != nil || len(pages) != 1 || len(kept) != 1 || calls[0].err != nil {
+		t.Fatalf("split: %d pages, %d kept, %v, first call %v", len(pages), len(kept), err, calls[0].err)
+	}
+	for i := 1; i < n; i++ {
+		if !errors.Is(calls[i].err, ErrInvalidRecord) {
+			t.Fatalf("call %d: %v, want ErrInvalidRecord", i, calls[i].err)
+		}
+	}
+	// One pass allocates about a megabyte; one pass per call allocated a gigabyte.
+	if alloc := after.TotalAlloc - before.TotalAlloc; alloc > 64<<20 {
+		t.Fatalf("splitBatch allocated %d MiB refusing %d calls", alloc>>20, n-1)
+	}
+}
+
+// countedWeight counts Weight calls, a measure of splitBatch's work.
+type countedWeight struct {
+	Bytes
+	w     uint64
+	calls *int
+}
+
+func (r countedWeight) Weight() uint64 { *r.calls++; return r.w }
+
+// TestSplitBatchWeightRefusalIsLinear: a heavy record that nearly fills the
+// first page, then many light calls. Refusing one call and recutting used to
+// pull the next call onto the first page, one rescan per call.
+func TestSplitBatchWeightRefusalIsLinear(t *testing.T) {
+	for _, n := range []int{100, 800} {
+		var weighs int
+		records := []countedWeight{{filled('a', 100), math.MaxUint64, &weighs}}
+		calls := []call{{n: 1}}
+		for range n {
+			records = append(records, countedWeight{Bytes("x"), 1, &weighs})
+			calls = append(calls, call{n: 1})
+		}
+		b := &batch[countedWeight]{records: records, calls: calls, pageLimit: headerReserve(0) + 150}
+		pages, kept, err := splitBatch(1, b)
+		if err != nil || len(pages) != 1 || len(kept) != 1 || calls[0].err != nil {
+			t.Fatalf("n=%d: %d pages, %d kept, %v, first call %v", n, len(pages), len(kept), err, calls[0].err)
+		}
+		for i := 1; i <= n; i++ {
+			if !errors.Is(calls[i].err, ErrInvalidRecord) {
+				t.Fatalf("n=%d: call %d: %v, want ErrInvalidRecord", n, i, calls[i].err)
+			}
+		}
+		if weighs > 4*(n+1) {
+			t.Fatalf("n=%d: %d Weight calls for %d records, want linear", n, weighs, n+1)
+		}
+	}
+}
+
+func TestSplitBatchWeightDropRecuts(t *testing.T) {
+	for name, tailWeight := range map[string]uint64{"zero-tail": 0, "overflow-after-recut": math.MaxUint64} {
+		t.Run(name, func(t *testing.T) {
+			records := []weighed{
+				{filled('a', 100), math.MaxUint64},
+				{filled('b', 100), 1}, {filled('b', 100), 0},
+				{filled('c', 100), tailWeight},
+			}
+			b := &batch[weighed]{records: records, calls: []call{{n: 1}, {n: 2}, {n: 1}}, pageLimit: headerReserve(0) + 250}
+			pages, kept, err := splitBatch(1, b)
+			if err != nil || len(pages) != 1 || b.calls[0].err != nil || !errors.Is(b.calls[1].err, ErrInvalidRecord) {
+				t.Fatalf("split: %d pages, %v, calls %+v", len(pages), err, b.calls)
+			}
+			want := []weighed{records[0]}
+			if tailWeight == 0 {
+				want = append(want, records[3])
+				if b.calls[2].err != nil {
+					t.Fatal("zero-weight tail refused:", b.calls[2].err)
+				}
+			} else if !errors.Is(b.calls[2].err, ErrInvalidRecord) {
+				t.Fatal("recut hid overflowing tail:", b.calls[2].err)
+			}
+			canonical, err := Encode(Header{Seq: 1, BatchPages: 1}, want)
+			if err != nil || !bytes.Equal(pages[0], canonical) || !slices.EqualFunc(kept, want, func(a, b weighed) bool {
+				return bytes.Equal(a.Bytes, b.Bytes) && a.w == b.w
+			}) {
+				t.Fatalf("surviving page is not canonical: kept %d, want %d, %v", len(kept), len(want), err)
+			}
+		})
+	}
+}
+
+func TestWriterContextValuesSurviveCancellation(t *testing.T) {
+	ctx, cancel := context.WithTimeout(t.Context(), 10*time.Second)
+	defer cancel()
+	values, cancelValues := context.WithCancel(objstore.WithKMSKey(ctx, "writer-key"))
+	defer cancelValues()
+	s, kms := storetest.NewKMS(bucket.New(t))
+	w := NewWriter[Bytes](s, testPrefix, 1, nil, WithCommitInterval(MinCommitInterval), WithContext(values))
+	w.SetAttemptTimeout(time.Second)
+	defer w.Close()
+	if err := w.Append(values, rows("first")); err != nil {
+		t.Fatal(err)
+	}
+	if got := kms.KeyOf(Key(testPrefix, 1)); got != "writer-key" {
+		t.Fatalf("commit KMS key = %q, want writer-key", got)
+	}
+	cancelValues()
+	var floorCalls int
+	w.SetFloor(func(ctx context.Context, _ bool) (uint64, error) {
+		floorCalls++
+		if got := objstore.KMSKey(ctx); got != "writer-key" {
+			t.Errorf("floor KMS key = %q, want writer-key", got)
+		}
+		return 0, ctx.Err()
+	})
+	if err := w.Append(ctx, rows("after-cancel")); err != nil {
+		t.Fatalf("option cancellation stopped writer: %v", err)
+	}
+	if got := kms.KeyOf(Key(testPrefix, 2)); got != "writer-key" || floorCalls != 2 {
+		t.Fatalf("after cancellation: KMS key %q, floor calls %d", got, floorCalls)
+	}
+}
+
+type contextReadback struct {
+	objstore.Backend
+	keys chan string
+}
+
+func (s *contextReadback) Get(ctx context.Context, key string) ([]byte, error) {
+	select {
+	case s.keys <- objstore.KMSKey(ctx):
+	case <-ctx.Done():
+		return nil, ctx.Err()
+	}
+	return s.Backend.Get(ctx, key)
+}
+
+func TestWriterContextValuesReachReadback(t *testing.T) {
+	ctx, cancel := context.WithTimeout(t.Context(), 10*time.Second)
+	defer cancel()
+	s, _ := storetest.NewKMS(bucket.New(t))
+	if ok, err := put(ctx, s, testPrefix, Header{Seq: 1, Nonce: "foreign"}, Bytes("existing")); !ok || err != nil {
+		t.Fatal(ok, err)
+	}
+	keys := make(chan string, 1)
+	s = s.WithBackend(func(b objstore.Backend) objstore.Backend { return &contextReadback{Backend: b, keys: keys} })
+	values, cancelValues := context.WithCancel(objstore.WithKMSKey(ctx, "readback-key"))
+	cancelValues()
+	w := NewWriter[Bytes](s, testPrefix, 1, nil, WithContext(values))
+	w.SetAttemptTimeout(time.Second)
+	defer w.Close()
+	if err := w.Append(ctx, rows("contender")); !errors.Is(err, ErrLostRace) {
+		t.Fatalf("cancelled option context stopped readback: %v", err)
+	}
+	select {
+	case got := <-keys:
+		if got != "readback-key" {
+			t.Fatalf("readback KMS key = %q, want readback-key", got)
+		}
+	default:
+		t.Fatal("no readback")
+	}
+}
 
 // testRecord is a Record that can misbehave: fail AppendTo, or report a
 // Size (size, when non-zero) other than the bytes it appends.

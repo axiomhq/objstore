@@ -5,10 +5,12 @@ import (
 	"context"
 	"errors"
 	"io/fs"
+	"log/slog"
 	"os"
 	"path/filepath"
 	"runtime"
 	"strconv"
+	"strings"
 	"sync"
 	"sync/atomic"
 	"testing"
@@ -622,6 +624,75 @@ func TestExpireInactive(t *testing.T) {
 	}
 	if got := c.ExpireInactive(time.Minute, later); got != nil {
 		t.Fatalf("expired %v twice", got)
+	}
+}
+
+func TestExpireInactiveRemovalFailureKeepsActivity(t *testing.T) {
+	c := newDisk(t, 4*diskBlock)
+	for _, key := range []string{"ns/a/1", "ns/a/2", "ns/b/1"} {
+		c.Put(key, []byte(key))
+	}
+	at := c.lastAccess["a"]
+	e := c.items["ns/a/1"].Value.(*diskEntry)
+	// A nonempty directory makes Remove fail even with root privileges.
+	if err := os.Remove(e.path); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Mkdir(e.path, 0700); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(e.path, "keep"), nil, 0600); err != nil {
+		t.Fatal(err)
+	}
+	later := time.Now().Add(time.Hour)
+	if got := c.ExpireInactive(time.Minute, later); len(got) != 1 || got[0] != "b" {
+		t.Errorf("expired %v after a removal failure, want [b]", got)
+	}
+	if !c.lastAccess["a"].Equal(at) || c.nsEntries["a"] != 1 {
+		t.Errorf("remaining namespace lost activity: at %v, entries %d", c.lastAccess["a"], c.nsEntries["a"])
+	}
+	if st := c.Stats(); st.Entries != 1 || st.UsedBytes != diskBlock || st.Failures != 1 || st.InactiveExpiries != 1 {
+		t.Errorf("after failed removal: %+v", st)
+	}
+	if err := os.RemoveAll(e.path); err != nil {
+		t.Fatal(err)
+	}
+	if got := c.ExpireInactive(time.Minute, later); len(got) != 1 || got[0] != "a" {
+		t.Errorf("retry expired %v, want [a]", got)
+	}
+	if st := c.Stats(); st.Entries != 0 || st.UsedBytes != 0 || st.InactiveExpiries != 2 || len(c.lastAccess) != 0 || len(c.nsEntries) != 0 {
+		t.Errorf("after retry: %+v, activity %v, entries %v", st, c.lastAccess, c.nsEntries)
+	}
+}
+
+func TestOpenDiskSweepUsesLogger(t *testing.T) {
+	if !sweepable {
+		t.Skip("no file lock: nothing is swept")
+	}
+	root := t.TempDir()
+	stale := filepath.Join(root, dirPrefix+"stale")
+	// A directory at the lock path fails on every platform, without chmod.
+	if err := os.MkdirAll(filepath.Join(stale, lockName), 0700); err != nil {
+		t.Fatal(err)
+	}
+	var injected, fallback bytes.Buffer
+	logger := slog.New(slog.NewTextHandler(&injected, nil))
+	previous := slog.Default()
+	slog.SetDefault(slog.New(slog.NewTextHandler(&fallback, nil)))
+	t.Cleanup(func() { slog.SetDefault(previous) })
+	c, err := OpenDisk(DiskConfig{Root: root, Capacity: diskBlock, PinCapacity: diskBlock, Logger: logger})
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(c.Close)
+	if c.Logger != logger {
+		t.Error("disk did not retain the injected logger")
+	}
+	if !strings.Contains(injected.String(), "cannot lock it") || !strings.Contains(injected.String(), stale) {
+		t.Errorf("injected logger did not receive sweep failure: %q", injected.String())
+	}
+	if fallback.Len() != 0 {
+		t.Errorf("sweep logged to slog.Default(): %q", fallback.String())
 	}
 }
 

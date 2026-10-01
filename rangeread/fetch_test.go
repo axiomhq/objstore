@@ -553,6 +553,68 @@ func TestConcurrentColdParentsShareOneGet(t *testing.T) {
 	}
 }
 
+func TestSharedParentFollowersShareDeterministicError(t *testing.T) {
+	for _, tc := range []struct {
+		name string
+		err  error
+	}{
+		{"access-denied", objstore.ErrAccessDenied},
+		{"not-found", objstore.ErrNotFound},
+		{"range", objstore.ErrRange},
+		{"corrupt", ErrCorrupt},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			ctx, cancel := context.WithTimeout(t.Context(), 5*time.Second)
+			defer cancel()
+			const followers = 8
+			entered, release := make(chan struct{}), make(chan struct{})
+			var gets atomic.Int32
+			s := bucket.NewFS(t).WithBackend(func(b objstore.Backend) objstore.Backend {
+				return &readBackend{Backend: b, getRange: func(ctx context.Context, _ string, _, _ int64) ([]byte, error) {
+					if gets.Add(1) == 1 {
+						close(entered)
+					}
+					select {
+					case <-release:
+						return nil, fmt.Errorf("read: %w", tc.err)
+					case <-ctx.Done():
+						return nil, ctx.Err()
+					}
+				}}
+			})
+			objects := cache.New(s, 1<<20, nil, cache.Keys{})
+			t.Cleanup(objects.Close)
+			r := newReader(t, s, objects, Config{})
+			joined := make(chan struct{}, 2*(followers+1))
+			r.joined = func() { joined <- struct{}{} }
+			loads := []Load{
+				{Extent: Extent{Object: "o", Offset: 2, Length: 6}, Key: "child1"},
+				{Extent: Extent{Object: "o", Offset: 12, Length: 6}, Key: "child2"},
+			}
+			done := make(chan error, followers+1)
+			fetch := func() { _, err := r.FetchRanges(ctx, loads); done <- err }
+			go fetch()
+			await(t, entered, "leader GET")
+			await(t, joined, "leader join")
+			for range followers {
+				go fetch()
+			}
+			for range followers {
+				await(t, joined, "follower join")
+			}
+			close(release)
+			for range followers + 1 {
+				if err := await(t, done, "read"); !errors.Is(err, tc.err) {
+					t.Errorf("read: %v, want %v", err, tc.err)
+				}
+			}
+			if got := gets.Load(); got != 1 {
+				t.Fatalf("%d followers made %d range GETs, want 1", followers, got)
+			}
+		})
+	}
+}
+
 // TestSharedParentOutlivesItsLeader: a query that joined another query's
 // parent GET does not inherit that query's cancellation.
 func TestSharedParentOutlivesItsLeader(t *testing.T) {
@@ -614,54 +676,66 @@ func TestSharedParentOutlivesItsLeader(t *testing.T) {
 
 // TestSharedParentFollowerRetriesTheLeadersError: the shared read runs
 // under the leader's context, so its error can be the leader's own (a
-// per-request budget); a follower retries once for itself, and the leader
-// keeps its error.
+// cancellation or per-request budget); a follower retries once for itself,
+// and the leader keeps its error.
 func TestSharedParentFollowerRetriesTheLeadersError(t *testing.T) {
-	r := newReader(t, nil, nil, Config{})
-	joined := make(chan struct{}, 4)
-	r.joined = func() {
-		select {
-		case joined <- struct{}{}:
-		default:
-		}
-	}
-	x := Extent{Object: "o", Offset: 0, Length: 4}
-	started, release := make(chan struct{}), make(chan struct{})
-	own := errors.New("the leader's own budget")
-	leader := make(chan error, 1)
-	go func() {
-		_, _, _, leave, err := r.sharedParent(t.Context(), x, 0, func(context.Context) ([]byte, cache.Outcome, error) {
-			close(started)
-			<-release
-			return nil, cache.Load, own
+	for _, tc := range []struct {
+		name string
+		err  error
+	}{
+		{"budget", cache.ErrBudget},
+		{"canceled", context.Canceled},
+		{"deadline", context.DeadlineExceeded},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			ctx, cancel := context.WithTimeout(t.Context(), 5*time.Second)
+			defer cancel()
+			r := newReader(t, nil, nil, Config{})
+			joined := make(chan struct{}, 4)
+			r.joined = func() { joined <- struct{}{} }
+			x := Extent{Object: "o", Offset: 0, Length: 4}
+			started, release := make(chan struct{}), make(chan struct{})
+			own := fmt.Errorf("leader: %w", tc.err)
+			leader := make(chan error, 1)
+			go func() {
+				_, _, _, leave, err := r.sharedParent(ctx, x, 0, func(ctx context.Context) ([]byte, cache.Outcome, error) {
+					close(started)
+					select {
+					case <-release:
+						return nil, cache.Load, own
+					case <-ctx.Done():
+						return nil, cache.Load, ctx.Err()
+					}
+				})
+				if err == nil {
+					leave()
+				}
+				leader <- err
+			}()
+			await(t, started, "leader read")
+			await(t, joined, "leader join")
+			follower := make(chan error, 1)
+			go func() {
+				data, _, _, leave, err := r.sharedParent(ctx, x, 0, func(context.Context) ([]byte, cache.Outcome, error) {
+					return []byte("data"), cache.Load, nil
+				})
+				if err == nil {
+					defer leave()
+				}
+				if err == nil && string(data) != "data" {
+					err = fmt.Errorf("follower read %q", data)
+				}
+				follower <- err
+			}()
+			await(t, joined, "follower join") // the follower joined the leader's flight
+			close(release)
+			if err := await(t, leader, "leader"); !errors.Is(err, tc.err) {
+				t.Fatalf("leader: %v, want its own error", err)
+			}
+			if err := await(t, follower, "follower"); err != nil {
+				t.Fatalf("follower inherited the leader's error: %v", err)
+			}
 		})
-		if err == nil {
-			leave()
-		}
-		leader <- err
-	}()
-	await(t, started, "leader read")
-	await(t, joined, "leader join")
-	follower := make(chan error, 1)
-	go func() {
-		data, _, _, leave, err := r.sharedParent(t.Context(), x, 0, func(context.Context) ([]byte, cache.Outcome, error) {
-			return []byte("data"), cache.Load, nil
-		})
-		if err == nil {
-			defer leave()
-		}
-		if err == nil && string(data) != "data" {
-			err = fmt.Errorf("follower read %q", data)
-		}
-		follower <- err
-	}()
-	await(t, joined, "follower join") // the follower joined the leader's flight
-	close(release)
-	if err := await(t, leader, "leader"); !errors.Is(err, own) {
-		t.Fatalf("leader: %v, want its own error", err)
-	}
-	if err := await(t, follower, "follower"); err != nil {
-		t.Fatalf("follower inherited the leader's error: %v", err)
 	}
 }
 

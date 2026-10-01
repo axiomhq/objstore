@@ -38,6 +38,14 @@ func (p *paced) SupportsKMS() bool {
 	return ok && k.SupportsKMS()
 }
 
+// Close passes through to the wrapped backend's Close, if any (Store.Close).
+func (p *paced) Close() error {
+	if c, ok := p.Backend.(interface{ Close() error }); ok {
+		return c.Close()
+	}
+	return nil
+}
+
 func (p *paced) Put(ctx context.Context, key string, data []byte) error {
 	if err := p.pace.wait(ctx); err != nil {
 		return err

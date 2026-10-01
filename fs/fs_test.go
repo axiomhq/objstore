@@ -791,6 +791,47 @@ func TestFSEnsureBucketRetrySyncsFailedAncestor(t *testing.T) {
 	}
 }
 
+func TestFSDropBucketSyncsParent(t *testing.T) {
+	ctx, cancel := context.WithTimeout(t.Context(), time.Minute)
+	defer cancel()
+	root := t.TempDir()
+	f := New(root, "bucket")
+	if err := f.EnsureBucket(ctx); err != nil {
+		t.Fatal(err)
+	}
+	var dirs []string
+	f.syncFault = func(dir string) error {
+		if _, err := os.Stat(f.root); !errors.Is(err, os.ErrNotExist) {
+			t.Fatalf("bucket still exists at sync: %v", err)
+		}
+		dirs = append(dirs, dir)
+		return nil
+	}
+	if err := f.DropBucket(ctx); err != nil {
+		t.Fatal(err)
+	}
+	if !slices.Equal(dirs, []string{root}) {
+		t.Fatalf("synced directories %v, want [%s]", dirs, root)
+	}
+	// A retry must repay a failed sync even though the bucket is gone.
+	injected := errors.New("directory sync failed")
+	f.syncFault = func(string) error { return injected }
+	if err := f.DropBucket(ctx); !errors.Is(err, injected) {
+		t.Fatalf("DropBucket lost sync error: %v", err)
+	}
+	dirs = nil
+	f.syncFault = func(dir string) error { dirs = append(dirs, dir); return nil }
+	if err := f.DropBucket(ctx); err != nil || !slices.Equal(dirs, []string{root}) {
+		t.Fatalf("retry synced %v: %v", dirs, err)
+	}
+	if err := os.Remove(root); err != nil {
+		t.Fatal(err)
+	}
+	if err := f.DropBucket(ctx); err != nil {
+		t.Fatalf("DropBucket with a missing parent: %v", err)
+	}
+}
+
 func TestFSListPrefixesSkipsVanishedChild(t *testing.T) {
 	for _, replaced := range []bool{false, true} {
 		t.Run(map[bool]string{false: "removed", true: "replaced"}[replaced], func(t *testing.T) {

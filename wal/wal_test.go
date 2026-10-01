@@ -291,6 +291,50 @@ func TestEncodeRefusesOverflowingSize(t *testing.T) {
 	}
 }
 
+func TestEncodeRefusesWeightOverflow(t *testing.T) {
+	records := []weighed{{Bytes("a"), math.MaxUint64}, {Bytes("b"), 1}}
+	if _, err := Encode(Header{}, records); !errors.Is(err, ErrInvalidRecord) {
+		t.Fatalf("Encode overflowing weight: %v, want ErrInvalidRecord", err)
+	}
+	records[1].w = 0
+	data, err := Encode(Header{}, records)
+	if err != nil {
+		t.Fatal(err)
+	}
+	h, _, err := Decode(data)
+	if err != nil || h.Weight != math.MaxUint64 {
+		t.Fatalf("maximum weight: %d, %v", h.Weight, err)
+	}
+}
+
+func TestEncodeRefusesUnsetCommitMillisecond(t *testing.T) {
+	for name, at := range map[string]time.Time{
+		"epoch":     time.UnixMilli(0).UTC(),
+		"sub-ms":    time.Unix(0, 999999).UTC(),
+		"pre-epoch": time.UnixMilli(-1).UTC(),
+	} {
+		t.Run(name, func(t *testing.T) {
+			data, err := Encode(Header{At: at}, rows("a"))
+			if err == nil {
+				h, _, derr := Decode(data)
+				t.Fatalf("Encode accepted unrepresentable At %v: decoded %v, %v", at, h.At, derr)
+			}
+		})
+	}
+	for name, at := range map[string]time.Time{"unset": {}, "first-ms": time.UnixMilli(1).UTC()} {
+		t.Run(name, func(t *testing.T) {
+			data, err := Encode(Header{At: at}, rows("a"))
+			if err != nil {
+				t.Fatal(err)
+			}
+			h, _, err := Decode(data)
+			if err != nil || !h.At.Equal(at) {
+				t.Fatalf("At round trip: %v, %v, want %v", h.At, err, at)
+			}
+		})
+	}
+}
+
 func TestEncodeRefusesUndecodablePage(t *testing.T) {
 	for name, h := range map[string]Header{
 		"oversized-empty": {Nonce: strings.Repeat("n", maxPageBytes)},

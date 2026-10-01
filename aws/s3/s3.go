@@ -51,6 +51,10 @@ type Config struct {
 	Endpoint string
 	// Bucket is the bucket every key lives in.
 	Bucket string
+	// AWS, when non-nil, replaces the SDK's default config loading. It is
+	// copied; credentials, region and HTTP client are used as supplied.
+	// A nil HTTP client uses this backend's bounded, pooled default.
+	AWS *aws.Config
 	// AllowedEndpoints, when set, lists the only endpoints (scheme://host)
 	// New accepts; any other is ErrEndpointDenied. With a list set, the
 	// empty Endpoint (AWS's default) and anything not parsing as
@@ -60,8 +64,9 @@ type Config struct {
 	SSE string
 	// KMSKeyID is the KMS key for SSE "aws:kms"; any other mode rejects it.
 	KMSKeyID string
-	// RequestTimeout bounds one S3 request end to end; 0 = 60 s. A store
-	// whose queue is deeper than that truncates large uploads mid-body
+	// RequestTimeout bounds one S3 request end to end when AWS.HTTPClient is
+	// not supplied; 0 = 60 s. A store whose queue is deeper than that
+	// truncates large uploads mid-body
 	// (MinIO answers 400 IncompleteBody) rather than finishing them.
 	RequestTimeout time.Duration
 }
@@ -91,8 +96,9 @@ func Open(ctx context.Context, cfg Config, ocfg objstore.Config) (*objstore.Stor
 	return objstore.Open(b, ocfg), nil
 }
 
-// New connects to cfg.Bucket. Credentials and region come from the SDK's
-// default chain (environment, shared config, instance role).
+// New connects to cfg.Bucket. Unless cfg.AWS is supplied, credentials and
+// region come from the SDK's default chain (environment, shared config,
+// instance role).
 func New(ctx context.Context, cfg Config) (*Backend, error) {
 	endpoint, bucket, sse, kmsKeyID, timeout := cfg.Endpoint, cfg.Bucket, cfg.SSE, cfg.KMSKeyID, cfg.RequestTimeout
 	if !endpointAllowed(endpoint, cfg.AllowedEndpoints) {
@@ -115,9 +121,18 @@ func New(ctx context.Context, cfg Config) (*Backend, error) {
 		t.MaxIdleConnsPerHost = idleConnsPerHost
 		t.MaxIdleConns = idleConnsPerHost
 	})
-	awsCfg, err := config.LoadDefaultConfig(ctx, config.WithHTTPClient(httpClient))
-	if err != nil {
-		return nil, err
+	var awsCfg aws.Config
+	if cfg.AWS != nil {
+		awsCfg = *cfg.AWS
+		if awsCfg.HTTPClient == nil {
+			awsCfg.HTTPClient = httpClient
+		}
+	} else {
+		var err error
+		awsCfg, err = config.LoadDefaultConfig(ctx, config.WithHTTPClient(httpClient))
+		if err != nil {
+			return nil, err
+		}
 	}
 	client := awss3.NewFromConfig(awsCfg, func(o *awss3.Options) {
 		if endpoint != "" {
@@ -159,10 +174,13 @@ func (s *Backend) SupportsKMS() bool { return true }
 
 // opErr is objstore.OpErr, adding objstore.ErrAccessDenied for a 403 or an
 // SSE-KMS failure S3 reports under a KMS.* code (a disabled,
-// pending-deletion or unreachable key).
+// pending-deletion or unreachable key), and ErrNotFound for a missing bucket.
 func opErr(op, key string, err error) error {
 	if err == nil {
 		return nil
+	}
+	if apiErrorCode(err) == "NoSuchBucket" && !errors.Is(err, objstore.ErrNotFound) {
+		err = fmt.Errorf("%w: %w", objstore.ErrNotFound, err)
 	}
 	var re *awshttp.ResponseError
 	if errors.As(err, &re) && re.HTTPStatusCode() == http.StatusForbidden || strings.HasPrefix(apiErrorCode(err), "KMS.") {

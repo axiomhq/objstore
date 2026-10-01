@@ -238,6 +238,14 @@ func (f *Fault) SupportsKMS() bool {
 	return ok && k.SupportsKMS()
 }
 
+// Close passes through to the wrapped backend's Close, if any (Store.Close).
+func (f *Fault) Close() error {
+	if c, ok := f.b.(interface{ Close() error }); ok {
+		return c.Close()
+	}
+	return nil
+}
+
 // SetShape replaces the transport shape; the zero Shape turns shaping
 // off. Calls already in flight keep the shape they started with.
 func (f *Fault) SetShape(s Shape) {

@@ -339,6 +339,16 @@ func (s *Store) KMS() bool {
 	return ok && k.SupportsKMS()
 }
 
+// Close releases the provider's client, if its backend has one to release
+// (gcs.Backend does); otherwise it does nothing. Stores from WithBackend share
+// the backend: close one of them, once, when all are done.
+func (s *Store) Close() error {
+	if c, ok := s.b.(interface{ Close() error }); ok {
+		return c.Close()
+	}
+	return nil
+}
+
 // CheckConditionalWrites proves the backend honours If-None-Match: a first
 // PutIfAbsent of a fresh _probe/ifnonematch/ key must create it and a second
 // must not. A store that ignores the header would let two log writers both

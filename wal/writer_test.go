@@ -224,7 +224,7 @@ func TestWriterAdoptsLegacyPage(t *testing.T) {
 		t.Fatal(ok, err)
 	}
 	// Exercise legacy BatchPages=0 read-back without changing nonce generation.
-	w := &Writer[Bytes]{store: s, prefix: testPrefix, nextSeq: 1, attemptTimeout: time.Second}
+	w := &Writer[Bytes]{store: s, prefix: testPrefix, nextSeq: 1, attemptTimeout: time.Second, ctx: ctx}
 	b := &batch[Bytes]{records: records, nonce: "legacy"}
 	if err := w.commit(b); err != nil || w.nextSeq != 2 || b.landed != 1 {
 		t.Fatalf("legacy adoption: %v, next seq %d, landed %d", err, w.nextSeq, b.landed)

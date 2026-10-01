@@ -106,3 +106,25 @@ func TestIDNamesTheBucket(t *testing.T) {
 		t.Fatalf("backend without ID: %q, want a fresh ID per Open", a)
 	}
 }
+
+// closer is a backend that records Close.
+type closer struct {
+	objstore.Backend
+	closed int
+}
+
+func (c *closer) Close() error { c.closed++; return nil }
+
+// TestCloseReachesBackend: Close reaches the provider's client through
+// pacing, and is a no-op for a backend without one.
+func TestCloseReachesBackend(t *testing.T) {
+	for _, cfg := range []objstore.Config{{}, {RequestsPerSecond: 100}} {
+		c := &closer{Backend: fs.New(t.TempDir(), "b")}
+		if err := objstore.Open(c, cfg).Close(); err != nil || c.closed != 1 {
+			t.Fatalf("pacing %v: Close = %v, backend closed %d times, want once", cfg.RequestsPerSecond, err, c.closed)
+		}
+	}
+	if err := fs.Open(t.TempDir(), "b", objstore.Config{}).Close(); err != nil {
+		t.Fatalf("Close without a closer: %v", err)
+	}
+}

@@ -198,6 +198,170 @@ func TestShared(t *testing.T) {
 	})
 }
 
+func TestSharedRejectsInvalidMint(t *testing.T) {
+	for _, state := range []string{"fenced", "stolen", "retired", "expired"} {
+		runUnit(t, state, func(t *testing.T) {
+			ctx := context.Background()
+			s := newMemStore()
+			l, err := Acquire(ctx, s, "shared/invalid-mint", "owner-a", time.Minute)
+			if err != nil {
+				t.Fatal(err)
+			}
+			defer l.Release(ctx)
+			var sh Shared
+			entered, unblock, joined := make(chan struct{}), make(chan struct{}), make(chan struct{})
+			resume := sync.OnceFunc(func() { close(unblock) })
+			defer resume()
+			var r *Ref
+			go func() {
+				r, err = sh.Join(func() (*Lease, error) {
+					close(entered)
+					<-unblock
+					return l, nil
+				})
+				close(joined)
+			}()
+			await(t, entered, "mint")
+			switch state {
+			case "fenced":
+				l.Fence()
+			case "stolen":
+				if err := Steal(ctx, s, l.Key(), "owner-b", time.Minute); err != nil {
+					t.Fatal(err)
+				}
+				l.Fence()
+			case "retired":
+				l.Retire()
+			case "expired":
+				l.Expire()
+			}
+			resume()
+			await(t, joined, "Join after invalidation")
+			if r != nil || !errors.Is(err, ErrNotOwner) || sh.Held() {
+				t.Fatalf("Join accepted invalid mint: ref=%v err=%v held=%v", r != nil, err, sh.Held())
+			}
+			await(t, l.Done(), "rejected lease Done")
+			cur, _, err := Load(ctx, s, l.Key())
+			if err != nil {
+				t.Fatal(err)
+			}
+			if state == "stolen" {
+				if cur.Owner != "owner-b" || cur.Expiry.IsZero() {
+					t.Fatalf("rejected mint clobbered its new owner: %+v", cur)
+				}
+				return
+			}
+			if !cur.Expiry.IsZero() {
+				t.Fatalf("rejected mint was not handed back: %+v", cur)
+			}
+			r, err = sh.Join(func() (*Lease, error) { return Acquire(ctx, s, l.Key(), "owner-b", time.Minute) })
+			if err != nil {
+				t.Fatalf("Join after rejected mint: %v", err)
+			}
+			r.Release(ctx)
+		})
+	}
+}
+
+func TestSharedJoinContextCancelsWait(t *testing.T) {
+	for _, busy := range []string{"mint", "release"} {
+		for _, end := range []string{"cancel", "deadline"} {
+			runUnit(t, busy+"/"+end, func(t *testing.T) {
+				ctx := context.Background()
+				base := newMemStore()
+				entered, unblock := make(chan struct{}), make(chan struct{})
+				resume := sync.OnceFunc(func() { close(unblock) })
+				defer resume()
+				var s Store = base
+				if busy == "release" {
+					var once sync.Once
+					s = &stubStore{Store: base, match: func(ctx context.Context, key string, data []byte, etag string) (bool, error) {
+						once.Do(func() { close(entered); <-unblock })
+						return base.PutIfMatch(ctx, key, data, etag)
+					}}
+				}
+				var sh Shared
+				mint := func() (*Lease, error) { return Acquire(ctx, s, "shared/cancel-wait", "owner", time.Minute) }
+				var first *Ref
+				var firstErr error
+				operationDone := make(chan struct{})
+				if busy == "mint" {
+					go func() {
+						first, firstErr = sh.Join(func() (*Lease, error) {
+							close(entered)
+							<-unblock
+							return mint()
+						})
+						close(operationDone)
+					}()
+				} else {
+					r, err := sh.Join(mint)
+					if err != nil {
+						t.Fatal(err)
+					}
+					go func() { r.Release(ctx); close(operationDone) }()
+				}
+				await(t, entered, "busy operation")
+				joinCtx, cancel := context.WithCancel(ctx)
+				wantErr := context.Canceled
+				if end == "deadline" {
+					cancel()
+					joinCtx, cancel = context.WithTimeout(ctx, time.Second)
+					wantErr = context.DeadlineExceeded
+				}
+				defer cancel()
+				var waiting *Ref
+				var waitErr error
+				waitDone := make(chan struct{})
+				go func() {
+					waiting, waitErr = sh.JoinContext(joinCtx, func() (*Lease, error) {
+						t.Error("canceled waiter called mint")
+						return mint()
+					})
+					close(waitDone)
+				}()
+				synctest.Wait()
+				select {
+				case <-waitDone:
+					t.Fatal("JoinContext did not wait for the busy operation")
+				default:
+				}
+				if end == "cancel" {
+					cancel()
+				}
+				await(t, joinCtx.Done(), "context ends")
+				synctest.Wait()
+				select {
+				case <-waitDone:
+					if waiting != nil || !errors.Is(waitErr, wantErr) {
+						t.Errorf("JoinContext: ref=%v err=%v, want %v", waiting != nil, waitErr, wantErr)
+					}
+				default:
+					t.Errorf("JoinContext blocked after %v while %s is still blocked", wantErr, busy)
+				}
+				resume()
+				await(t, operationDone, "busy operation completes")
+				await(t, waitDone, "waiter exits")
+				waiting.Release(ctx)
+				if firstErr != nil {
+					t.Fatalf("blocked mint failed: %v", firstErr)
+				}
+				if first != nil {
+					if err := first.Valid(); err != nil {
+						t.Errorf("blocked mint returned invalid ref: %v", err)
+					}
+					first.Release(ctx)
+				}
+				r, err := sh.Join(mint)
+				if err != nil {
+					t.Fatalf("Join after canceled wait: %v", err)
+				}
+				r.Release(ctx)
+			})
+		}
+	}
+}
+
 // TestSharedReleaseFromFence: The last Ref.Release from inside the
 // fence callback completes; Shared is usable afterwards.
 func TestSharedReleaseFromFence(t *testing.T) {

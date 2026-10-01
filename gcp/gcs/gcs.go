@@ -24,12 +24,15 @@ type Config struct {
 	// ProjectID is needed only by EnsureBucket, to create a missing bucket.
 	ProjectID string
 	// Options are passed to storage.NewClient: endpoint, credentials, or
-	// option.WithoutAuthentication for an emulator.
+	// option.WithoutAuthentication for an emulator. Close also closes idle
+	// connections on an HTTP client supplied through these options.
 	Options []option.ClientOption
 }
 
-// Backend is the Google Cloud Storage backend.
+// Backend is the Google Cloud Storage backend. It owns its storage client;
+// call Close when the backend is no longer needed.
 type Backend struct {
+	client  *storage.Client
 	bucket  *storage.BucketHandle
 	name    string
 	project string
@@ -56,8 +59,12 @@ func New(ctx context.Context, cfg Config) (*Backend, error) {
 	if err != nil {
 		return nil, fmt.Errorf("gcs: %w", err)
 	}
-	return &Backend{bucket: client.Bucket(cfg.Bucket), name: cfg.Bucket, project: cfg.ProjectID}, nil
+	return &Backend{client: client, bucket: client.Bucket(cfg.Bucket), name: cfg.Bucket, project: cfg.ProjectID}, nil
 }
+
+// Close releases the storage client New created. It must not run concurrently
+// with backend operations; the backend must not be used afterwards.
+func (b *Backend) Close() error { return b.client.Close() }
 
 // ID is gs://bucket.
 func (b *Backend) ID() string { return "gs://" + b.name }
@@ -85,10 +92,13 @@ func (g *Backend) SupportsKMS() bool { return true }
 
 // opErr is objstore.OpErr, adding objstore.ErrAccessDenied for a 403: the
 // caller lacks access, or the object's Cloud KMS key is disabled or its
-// grant is gone.
+// grant is gone. Missing buckets also wrap ErrNotFound.
 func opErr(op, key string, err error) error {
 	if httpCode(err) == http.StatusForbidden {
 		err = fmt.Errorf("%w: %w", objstore.ErrAccessDenied, err)
+	}
+	if bucketMissing(err) && !errors.Is(err, objstore.ErrNotFound) {
+		err = fmt.Errorf("%w: %w", objstore.ErrNotFound, err)
 	}
 	return objstore.OpErr(op, key, err)
 }
@@ -169,13 +179,27 @@ func (g *Backend) PutIfMatch(ctx context.Context, key string, data []byte, etag 
 		return false, nil
 	}
 	err := write(ctx, g.bucket.Object(key).If(storage.Conditions{GenerationMatch: gen}), data)
-	if err != nil {
-		if code := httpCode(err); code == http.StatusPreconditionFailed || isNotFound(err) {
-			return false, nil
-		}
-		return false, opErr("put-if-match", key, err)
+	switch {
+	case err == nil:
+		return true, nil
+	case httpCode(err) == http.StatusPreconditionFailed:
+		return false, nil
+	case isNotFound(err):
+		return false, opErr("put-if-match", key, g.bucketGone(ctx, err))
 	}
-	return true, nil
+	return false, opErr("put-if-match", key, err)
+}
+
+// bucketGone tells a missing object from a missing bucket after a 404,
+// which GCS reports alike for both: the bucket's error if a read of the
+// bucket proves it gone, else nil, the object was missing. Only this rare
+// path pays the extra request. Any other answer, such as a 403 for a role
+// that may read objects but not buckets, leaves the object missing.
+func (g *Backend) bucketGone(ctx context.Context, err error) error {
+	if _, aerr := g.bucket.Attrs(ctx); errors.Is(aerr, storage.ErrBucketNotExist) {
+		return fmt.Errorf("%w: %w", aerr, err)
+	}
+	return nil
 }
 
 // readAll drains r and proves the object arrived whole: a truncated body
@@ -395,13 +419,14 @@ func (g *Backend) delete(ctx context.Context, key string) error {
 	if err := ctx.Err(); err != nil {
 		return err
 	}
-	if err := g.bucket.Object(key).Delete(ctx); err != nil && !isNotFound(err) {
-		return err
+	err := g.bucket.Object(key).Delete(ctx)
+	if isNotFound(err) {
+		return g.bucketGone(ctx, err)
 	}
-	return nil
+	return err
 }
 
-// Delete removes key. A missing key is not an error.
+// Delete removes key. A missing key is not an error; a missing bucket is.
 func (g *Backend) Delete(ctx context.Context, key string) error {
 	return opErr("delete", key, g.delete(ctx, key))
 }
@@ -433,7 +458,7 @@ func (g *Backend) EnsureBucket(ctx context.Context) error {
 		return opErr("head-bucket", g.name, err)
 	}
 	if g.project == "" {
-		return opErr("create-bucket", g.name, errors.New("bucket does not exist and Config.ProjectID is empty"))
+		return opErr("create-bucket", g.name, fmt.Errorf("Config.ProjectID is empty: %w", err))
 	}
 	err = g.bucket.Create(ctx, g.project, nil)
 	if httpCode(err) == http.StatusConflict {

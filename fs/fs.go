@@ -691,7 +691,7 @@ func (f *Backend) delete(ctx context.Context, key string, dirs map[string]string
 	unlock, err := f.lockKey(ctx, key)
 	t.Since(objstore.CallLock, start)
 	if err != nil {
-		return err
+		return f.bucketErr(err) // the lock files live in the bucket root
 	}
 	defer unlock()
 	defer t.Since(objstore.CallDelete, time.Now())
@@ -769,19 +769,25 @@ func (f *Backend) EnsureBucket(ctx context.Context) error {
 }
 
 // DropBucket removes the bucket directory and everything in it. A missing
-// bucket is not an error.
+// bucket is not an error. The parent is synced so the removal is durable.
 func (f *Backend) DropBucket(ctx context.Context) error {
 	if err := ctx.Err(); err != nil {
 		return objstore.OpErr("drop-bucket", f.root, err)
 	}
-	err := objstore.OpErr("drop-bucket", f.root, os.RemoveAll(f.root))
+	err := os.RemoveAll(f.root)
 	// The tree is gone: nothing in it is durable any more, and a stale mark
 	// would let a later publish into a recreated bucket skip its walk.
 	f.durable.Range(func(k, _ any) bool {
 		f.durable.Delete(k)
 		return true
 	})
-	return err
+	if err == nil {
+		err = f.syncDir(filepath.Dir(f.root))
+		if errors.Is(err, iofs.ErrNotExist) {
+			err = nil // no parent entry remains to sync
+		}
+	}
+	return objstore.OpErr("drop-bucket", f.root, err)
 }
 
 // GetRange reads exactly length bytes of key at offset; a range past the

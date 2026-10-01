@@ -628,3 +628,21 @@ func TestFaultAmbiguousBypassesShape(t *testing.T) {
 		})
 	}
 }
+
+// closer is a backend that records Close.
+type closer struct {
+	objstore.Backend
+	closed int
+}
+
+func (c *closer) Close() error { c.closed++; return nil }
+
+func TestWrappersForwardClose(t *testing.T) {
+	c := &closer{Backend: fs.New(t.TempDir(), "b")}
+	s := objstore.Open(c, objstore.Config{})
+	faulty, _ := storetest.NewFault(s)
+	keyed, _ := storetest.NewKMS(faulty)
+	if err := keyed.Close(); err != nil || c.closed != 1 {
+		t.Fatalf("Close through KMS and Fault = %v, backend closed %d times, want once", err, c.closed)
+	}
+}

@@ -42,7 +42,7 @@ func TestConformance(t *testing.T) {
 				hc = &http.Client{Transport: notModifiedTransport{hc.Transport}}
 			}
 			hc = &http.Client{Transport: boundedTransport{hc.Transport}}
-			s, err := gcs.Open(ctx, gcs.Config{
+			b, err := gcs.New(ctx, gcs.Config{
 				Bucket:    "conformance",
 				ProjectID: "test",
 				Options: []option.ClientOption{
@@ -50,10 +50,16 @@ func TestConformance(t *testing.T) {
 					option.WithoutAuthentication(),
 					option.WithHTTPClient(hc),
 				},
-			}, objstore.Config{})
+			})
 			if err != nil {
 				t.Fatal(err)
 			}
+			t.Cleanup(func() {
+				if err := b.Close(); err != nil {
+					t.Error(err)
+				}
+			})
+			s := objstore.Open(b, objstore.Config{})
 			if err := s.EnsureBucket(ctx); err != nil {
 				t.Fatal(err)
 			}
@@ -103,13 +109,19 @@ func TestConformanceReal(t *testing.T) {
 	}
 	ctx, cancel := context.WithTimeout(t.Context(), time.Minute)
 	defer cancel()
-	s, err := gcs.Open(ctx, gcs.Config{
+	b, err := gcs.New(ctx, gcs.Config{
 		Bucket:    fmt.Sprintf("objstore-test-%d", time.Now().UnixNano()),
 		ProjectID: project,
-	}, objstore.Config{})
+	})
 	if err != nil {
 		t.Fatal(err)
 	}
+	t.Cleanup(func() {
+		if err := b.Close(); err != nil {
+			t.Error(err)
+		}
+	})
+	s := objstore.Open(b, objstore.Config{})
 	if err := s.EnsureBucket(ctx); err != nil {
 		t.Fatal(err)
 	}
@@ -156,17 +168,23 @@ func TestKMSKeyPerObject(t *testing.T) {
 	server := fakestorage.NewServer(nil)
 	t.Cleanup(server.Stop)
 	tr := &kmsTransport{next: server.HTTPClient().Transport}
-	s, err := gcs.Open(ctx, gcs.Config{
+	b, err := gcs.New(ctx, gcs.Config{
 		Bucket: "kms", ProjectID: "test",
 		Options: []option.ClientOption{
 			option.WithEndpoint(server.URL() + "/storage/v1/"),
 			option.WithoutAuthentication(),
 			option.WithHTTPClient(&http.Client{Transport: boundedTransport{tr}}),
 		},
-	}, objstore.Config{})
+	})
 	if err != nil {
 		t.Fatal(err)
 	}
+	t.Cleanup(func() {
+		if err := b.Close(); err != nil {
+			t.Error(err)
+		}
+	})
+	s := objstore.Open(b, objstore.Config{})
 	if err := s.EnsureBucket(ctx); err != nil {
 		t.Fatal(err)
 	}

@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -56,6 +57,59 @@ func TestReaderFetch(t *testing.T) {
 	}
 	if _, err := r.Fetch(t.Context(), "ns/f/missing"); !errors.Is(err, objstore.ErrNotFound) {
 		t.Fatalf("missing: %v", err)
+	}
+}
+
+func TestFetchFollowersShareDeterministicError(t *testing.T) {
+	for _, tc := range []struct {
+		name string
+		err  error
+	}{
+		{"access-denied", objstore.ErrAccessDenied},
+		{"not-found", objstore.ErrNotFound},
+		{"range", objstore.ErrRange},
+		{"corrupt", ErrCorrupt},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			ctx, cancel := context.WithTimeout(t.Context(), 5*time.Second)
+			defer cancel()
+			const followers = 8
+			entered, release := make(chan struct{}), make(chan struct{})
+			var gets atomic.Int32
+			s := bucket.NewFS(t).WithBackend(func(b objstore.Backend) objstore.Backend {
+				return &readBackend{Backend: b, get: func(ctx context.Context, _ string) ([]byte, error) {
+					if gets.Add(1) == 1 {
+						close(entered)
+					}
+					select {
+					case <-release:
+						return nil, fmt.Errorf("read: %w", tc.err)
+					case <-ctx.Done():
+						return nil, ctx.Err()
+					}
+				}}
+			})
+			objects := cache.New(s, 1<<20, nil, cache.Keys{})
+			t.Cleanup(objects.Close)
+			r := newReader(t, s, objects, Config{})
+			done := make(chan error, followers+1)
+			go func() { _, err := r.Fetch(ctx, "k"); done <- err }()
+			await(t, entered, "leader GET")
+			for range followers {
+				fctx := &waitingContext{Context: ctx, waiting: make(chan struct{})}
+				go func() { _, err := r.Fetch(fctx, "k"); done <- err }()
+				await(t, fctx.waiting, "follower join")
+			}
+			close(release)
+			for range followers + 1 {
+				if err := await(t, done, "read"); !errors.Is(err, tc.err) {
+					t.Errorf("read: %v, want %v", err, tc.err)
+				}
+			}
+			if got := gets.Load(); got != 1 {
+				t.Fatalf("%d followers made %d GETs, want 1", followers, got)
+			}
+		})
 	}
 }
 

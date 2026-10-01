@@ -14,11 +14,22 @@
 - **rangeread**: requests never share a parent read across an `InvalidateNamespace`. `FetchRanges` stops decoding and publishing once its context ends.
 - `DeleteMany` with no keys returns at once instead of waiting for a write slot.
 - **wal**: `Walk` and `WalkParallel` fail with `ErrCorrupt` on a batch larger than a Writer can produce (more than nine pages, or over 512 MiB decoded). `WalkParallel` charges a page for its record descriptors as well as its bytes, and counts a batch being assembled against a separate 512 MiB budget; its documented memory bound says so.
-- **rangeread**: the physical-byte limit holds for bytes a shared read still holds after its waiters are cancelled.
+- **rangeread**: the physical-byte limit holds for bytes a shared read still holds after its waiters are cancelled. Followers of a shared read retry only the leader's cancellation, deadline or `ErrBudget`, not store errors every retry would repeat.
+- **wal**: a Writer keeps each batch's `Weigher` sum within uint64; an Append that would overflow it fails alone with `ErrInvalidRecord`. `Encode` refuses a non-zero `At` in the epoch's first millisecond, which would decode as unset. `Size`, `AppendTo` and `Weight` must not block; `Close`'s bound excludes them.
+- **missing buckets**: every operation on a missing bucket wraps `ErrNotFound` on every backend, now also S3 and GCS (with the provider's error) and `fs` deletes. GCS `PutIfMatch` and `Delete` on a missing bucket no longer report `(false, nil)` and success: after a 404 they read the bucket once to tell a missing bucket from a missing object. `storetest.Conformance` checks it.
+- **fs**: `DropBucket` fsyncs the directory that held the bucket.
+- **cache**: `Disk.ExpireInactive` keeps a namespace's activity, and does not report it expired, while removing its files fails.
+- **lease**: `Shared.Join` refuses a newly minted lease that is no longer valid, and releases it.
 
 ### Added
 
+- `Store.Close` releases the provider's client (GCS); `gcs.Backend.Close`. `storetest.Fault` and `storetest.KMS` pass `Close` through.
+- `s3.Config.AWS` injects an SDK `aws.Config` (credentials, region, HTTP client) instead of loading the default one.
+- `wal.WithContext`: a Writer's store and floor calls carry the context's values, not its cancellation.
+- `cache.DiskConfig` and `cache.OpenDisk`: a disk tier whose sweep of stale directories logs to the given logger.
+- `lease.Shared.JoinContext`: `Join` whose wait for another mint or release ends with the context.
 - `storetest.Fault.SupportsKMS`: a faulty wrapper keeps the wrapped store's KMS capability.
+- `go.opentelemetry.io/otel/sdk` v1.45.0, for its advisory on exporter endpoint URLs in logs.
 
 ### Fixed
 

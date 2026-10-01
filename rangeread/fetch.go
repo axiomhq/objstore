@@ -3,6 +3,7 @@ package rangeread
 import (
 	"bytes"
 	"context"
+	"errors"
 	"fmt"
 	"runtime/debug"
 	"slices"
@@ -345,7 +346,8 @@ type rangeFlight struct {
 // reservation together. The read runs under the leader's context, so its
 // error may be the leader's own (a cancellation, a per-request budget):
 // a follower that gets one retries once, as a fresh
-// shared flight under its own context, rather than inherit it.
+// shared flight under its own context, rather than inherit it. Errors of
+// the read itself are shared without retrying.
 func (r *Reader) sharedParent(ctx context.Context, x Extent, generation uint64, read func(context.Context) ([]byte, cache.Outcome, error)) ([]byte, cache.Outcome, cache.Outcome, func(), error) {
 	return r.sharedParentOnce(ctx, x, generation, read, false)
 }
@@ -393,7 +395,7 @@ func (r *Reader) sharedParentOnce(ctx context.Context, x Extent, generation uint
 		if f.err != nil {
 			err := f.err
 			leave() // release the failed flight before a retry can reserve bytes
-			if !led && !retried && ctx.Err() == nil {
+			if !led && !retried && ctx.Err() == nil && (errors.Is(err, context.Canceled) || errors.Is(err, context.DeadlineExceeded) || errors.Is(err, cache.ErrBudget)) {
 				return r.sharedParentOnce(ctx, x, generation, read, true)
 			}
 			return nil, cache.Load, cache.Load, nil, err

@@ -88,7 +88,7 @@ var (
 	ErrRecordTooLarge = errors.New("wal: record exceeds page size limit")
 	// ErrInvalidRecord refuses a record whose Size is negative (at Enqueue)
 	// or whose AppendTo fails or disagrees with Size (at commit, failing
-	// only the Append that carried it).
+	// only the Append that carried it), or whose weight overflows its page.
 	ErrInvalidRecord = errors.New("wal: invalid record")
 
 	// errRetry is internal: this batch's outcome is unresolved; keep it in
@@ -189,6 +189,7 @@ type batch[R Record] struct {
 type Writer[R Record] struct {
 	store  *objstore.Store
 	prefix string
+	ctx    context.Context // values for store and floor calls, not caller cancellation
 	// onCommit applies a durable batch: its records in append order, and
 	// the sequence of its last page. It must not wait on this writer's flush
 	// goroutine (NewWriter).
@@ -350,7 +351,17 @@ func (w *Writer[R]) SetLogger(l *slog.Logger) {
 // because the loop reads it once when it starts.
 type Option func(*options)
 
-type options struct{ commitInterval time.Duration }
+type options struct {
+	commitInterval time.Duration
+	ctx            context.Context
+}
+
+// WithContext carries ctx's values into every store and floor oracle call.
+// Its cancellation and deadline are ignored: Close governs the writer's
+// lifetime, and SetAttemptTimeout bounds each attempt. ctx must not be nil.
+func WithContext(ctx context.Context) Option {
+	return func(o *options) { o.ctx = context.WithoutCancel(ctx) }
+}
 
 // WithCommitInterval overrides the group-commit cadence (see
 // DefaultCommitInterval). <= 0 keeps the default; other values are clamped
@@ -372,13 +383,13 @@ func WithCommitInterval(d time.Duration) Option {
 // A batch starting at zero or exhausting the sequence space is refused
 // with terminal ErrWriterFailed before any page is written.
 func NewWriter[R Record](s *objstore.Store, prefix string, nextSeq uint64, onCommit func(seq uint64, at time.Time, records []R), opts ...Option) *Writer[R] {
-	o := options{commitInterval: DefaultCommitInterval}
+	o := options{commitInterval: DefaultCommitInterval, ctx: context.Background()}
 	for _, opt := range opts {
 		opt(&o)
 	}
 	w := &Writer[R]{
 		store: s, prefix: prefix, nextSeq: nextSeq, onCommit: onCommit, attemptTimeout: defaultAttemptTimeout,
-		commitInterval: o.commitInterval, unackedByteLimit: maxUnackedBytes,
+		commitInterval: o.commitInterval, unackedByteLimit: maxUnackedBytes, ctx: o.ctx,
 		kick: make(chan struct{}, 1), done: make(chan struct{}), stopped: make(chan struct{}),
 	}
 	go w.loop()
@@ -526,7 +537,8 @@ func reservedEntryBytes(bytes, records int) int {
 // behind it). Each waits at most one commit interval (after the last entry,
 // or after the previous failed attempt: a drain does not retry back to
 // back) and is bounded by the attempt timeout, so Close returns within
-// 3 × (commit interval + attempt timeout) plus onCommit's own time.
+// 3 × (commit interval + attempt timeout), excluding record encoding and
+// onCommit's own time. Neither can be interrupted by the attempt timeout.
 func (w *Writer[R]) Close() {
 	w.mu.Lock()
 	already := w.closed
@@ -737,10 +749,10 @@ func (w *Writer[R]) commit(b *batch[R]) error {
 	// Pace the batch once, before its deadline starts: its pages are one
 	// entry and go out back to back, so a multi-page batch fits one attempt.
 	time.Sleep(time.Until(due))
-	// Background ctx: a batch is shared by many callers; one caller's
+	// A batch is shared by many callers; one caller's
 	// cancellation must not abort everyone's durability. Bounded per ATTEMPT,
 	// so a hung store is an unresolved retry, not a stuck flush goroutine.
-	ctx, cancel := context.WithTimeout(context.Background(), attempt)
+	ctx, cancel := context.WithTimeout(w.ctx, attempt)
 	defer cancel()
 	b.attempts++
 	err := w.putPages(ctx, b, floor)
@@ -846,7 +858,9 @@ func splitBatch[R Record](seq uint64, b *batch[R]) (pages [][]byte, kept []R, er
 		return nil, nil, fmt.Errorf("%w: sequence space exhausted at %d", ErrWriterFailed, seq)
 	}
 	head := Header{Seq: seq, Nonce: b.nonce, At: b.at, BatchPages: 1}
-	header, err := appendHeader(nil, head, len(b.records), weightOf(b.records))
+	// Until pages are cut, an overflowing sum is only a header-size reserve.
+	weight, _ := weightOf(b.records)
+	header, err := appendHeader(nil, head, len(b.records), weight)
 	if err != nil {
 		return nil, nil, err
 	}
@@ -871,10 +885,13 @@ func splitBatch[R Record](seq uint64, b *batch[R]) (pages [][]byte, kept []R, er
 	}
 	dropped := false
 	next := 0
+	var sum uint64 // the kept calls' weight
 	for gi := range groups {
 		g := &groups[gi]
+		recs := b.records[next : next+g.n]
+		next += g.n
 		mark, marks := len(buf), len(ends)
-		for _, r := range b.records[next : next+g.n] {
+		for _, r := range recs {
 			var nb []byte
 			if nb, err = appendRecord(buf, r); err != nil {
 				break
@@ -882,7 +899,18 @@ func splitBatch[R Record](seq uint64, b *batch[R]) (pages [][]byte, kept []R, er
 			buf = nb
 			ends = append(ends, len(buf))
 		}
-		next += g.n
+		if err == nil && len(b.calls) > 0 {
+			// Calls whose weights sum within uint64 overflow no page however
+			// they are cut, so the call that would overflow the sum is refused
+			// here, before any cut, and no cut is ever redone for weight.
+			w, werr := weightOf(recs)
+			if werr != nil || w > math.MaxUint64-sum {
+				g.err = fmt.Errorf("%w: batch weight overflows uint64", ErrInvalidRecord)
+				buf, ends, dropped = buf[:mark], ends[:marks], true
+				continue
+			}
+			sum += w
+		}
 		if err != nil {
 			if len(b.calls) == 0 {
 				return nil, nil, fmt.Errorf("%w: %w", ErrInvalidRecord, err)
@@ -905,22 +933,23 @@ func splitBatch[R Record](seq uint64, b *batch[R]) (pages [][]byte, kept []R, er
 			return nil, kept, nil
 		}
 		records = kept
-		// The record count and weight are in the header, and their varints
-		// may shrink. They never grow, so the new header is written to end
-		// where the old one did and buf starts where it does: no record
-		// byte moves. Only a single page uses this header; a multi-page cut
-		// writes its own.
-		if header, err = appendHeader(header[:0], head, len(kept), weightOf(kept)); err != nil {
-			return nil, nil, err
-		}
-		shift := hdr - len(header)
-		buf = buf[shift:]
-		copy(buf, header)
-		for i := range ends {
-			ends[i] -= shift
-		}
-		hdr = len(header)
 	}
+	// The record count and weight are in the header, and their varints
+	// may shrink. They never grow, so the new header is written to end
+	// where the old one did and buf starts where it does: no record
+	// byte moves. Only a single page uses this header; a multi-page cut
+	// writes its own.
+	weight, weightErr := weightOf(records)
+	if header, err = appendHeader(header[:0], head, len(records), weight); err != nil {
+		return nil, nil, err
+	}
+	shift := hdr - len(header)
+	buf = buf[shift:]
+	copy(buf, header)
+	for i := range ends {
+		ends[i] -= shift
+	}
+	hdr = len(header)
 	limit := b.pageLimit
 	if limit == 0 {
 		limit = maxPageBytes
@@ -941,27 +970,29 @@ func splitBatch[R Record](seq uint64, b *batch[R]) (pages [][]byte, kept []R, er
 			}
 		}
 	}
-	if len(buf) <= limit-4 {
-		return [][]byte{seal(buf)}, kept, nil
-	}
-	// Cut so every page fits beneath the largest header it could carry.
-	// Every record is checked against the budget of the page it lands on,
-	// including the one a cut was just made for: a record too large for
-	// any page fails the batch here, before its first PUT. (Enqueue refuses
-	// such records; this guards standalone callers.)
-	budget := limit - reserve
 	bounds := []int{0} // first record of each page, then len(records)
-	start := hdr
-	for i := range records {
-		if ends[i]-start > budget && i > bounds[len(bounds)-1] {
-			bounds = append(bounds, i)
-			start = ends[i-1]
-		}
-		if ends[i]-start > budget {
-			return nil, kept, ErrRecordTooLarge
+	if len(buf) > limit-4 {
+		// Cut so every page fits beneath the largest header it could carry.
+		// Enqueue refuses records past this budget; guard standalone callers too.
+		budget := limit - reserve
+		start := hdr
+		for i := range records {
+			if ends[i]-start > budget && i > bounds[len(bounds)-1] {
+				bounds = append(bounds, i)
+				start = ends[i-1]
+			}
+			if ends[i]-start > budget {
+				return nil, kept, ErrRecordTooLarge
+			}
 		}
 	}
 	bounds = append(bounds, len(records))
+	if len(bounds) == 2 {
+		if weightErr != nil { // standalone: calls were refused above
+			return nil, nil, weightErr
+		}
+		return [][]byte{seal(buf)}, kept, nil
+	}
 	if uint64(len(bounds)-1) > math.MaxUint64-seq {
 		return nil, kept, fmt.Errorf("%w: sequence space exhausted at %d", ErrWriterFailed, seq)
 	}
@@ -974,7 +1005,11 @@ func splitBatch[R Record](seq uint64, b *batch[R]) (pages [][]byte, kept []R, er
 			from = ends[lo-1]
 		}
 		head.Seq, head.BatchIndex = seq+uint64(i), uint64(i)
-		page, err := appendHeader(make([]byte, 0, reserve+to-from), head, hi-lo, weightOf(records[lo:hi]))
+		weight, err := weightOf(records[lo:hi])
+		if err != nil {
+			return nil, kept, err
+		}
+		page, err := appendHeader(make([]byte, 0, reserve+to-from), head, hi-lo, weight)
 		if err != nil {
 			return nil, nil, err
 		}

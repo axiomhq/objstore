@@ -492,7 +492,7 @@ func TestWalkParallelBoundsOpenBatch(t *testing.T) {
 		err := c.add(h, Key(testPrefix, h.Seq), n, n)
 		var retained int64
 		for _, p := range c.batch {
-			retained += p.Pages[0]
+			retained += p
 		}
 		if retained > bound {
 			t.Fatalf("open batch retains %d charged bytes, bound %d", retained, bound)

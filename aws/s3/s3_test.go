@@ -14,6 +14,8 @@ import (
 	"time"
 
 	"github.com/aws/aws-sdk-go-v2/aws"
+	awshttp "github.com/aws/aws-sdk-go-v2/aws/transport/http"
+	"github.com/aws/aws-sdk-go-v2/config"
 	awss3 "github.com/aws/aws-sdk-go-v2/service/s3"
 	"github.com/aws/smithy-go"
 	smithyendpoints "github.com/aws/smithy-go/endpoints"
@@ -27,14 +29,60 @@ func fakeS3(t *testing.T, handler http.HandlerFunc) *Backend {
 	t.Helper()
 	srv := httptest.NewServer(handler)
 	t.Cleanup(srv.Close)
-	t.Setenv("AWS_ACCESS_KEY_ID", "test")
-	t.Setenv("AWS_SECRET_ACCESS_KEY", "test")
-	t.Setenv("AWS_REGION", "us-east-1")
-	s, err := New(context.Background(), Config{Endpoint: srv.URL, Bucket: "b"})
+	ctx, cancel := context.WithTimeout(t.Context(), time.Minute)
+	defer cancel()
+	s, err := New(ctx, Config{Endpoint: srv.URL, Bucket: "b", AWS: &aws.Config{
+		Region: "us-east-1", HTTPClient: srv.Client(),
+		Credentials: aws.CredentialsProviderFunc(func(context.Context) (aws.Credentials, error) {
+			return aws.Credentials{AccessKeyID: "test", SecretAccessKey: "test"}, nil
+		}),
+	}})
 	if err != nil {
 		t.Fatal(err)
 	}
 	return s
+}
+
+func TestS3InjectedAWSConfig(t *testing.T) {
+	t.Parallel()
+	ctx, cancel := context.WithTimeout(t.Context(), time.Minute)
+	defer cancel()
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if auth := r.Header.Get("Authorization"); !strings.Contains(auth, "Credential=injected/") || !strings.Contains(auth, "/eu-west-1/s3/") {
+			t.Error("request did not use injected credentials and region")
+		}
+		if r.URL.Path != "/b/k" {
+			t.Errorf("path = %q, want /b/k", r.URL.Path)
+		}
+		fmt.Fprint(w, "v")
+	}))
+	t.Cleanup(srv.Close)
+	awsCfg := aws.Config{
+		Region: "eu-west-1", HTTPClient: srv.Client(),
+		Credentials: aws.CredentialsProviderFunc(func(context.Context) (aws.Credentials, error) {
+			return aws.Credentials{AccessKeyID: "injected", SecretAccessKey: "test"}, nil
+		}),
+	}
+	b, err := New(ctx, Config{Endpoint: srv.URL, Bucket: "b", AWS: &awsCfg})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if b.client.Options().HTTPClient != awsCfg.HTTPClient {
+		t.Fatal("injected HTTP client was replaced")
+	}
+	if data, err := b.Get(ctx, "k"); err != nil || string(data) != "v" {
+		t.Fatalf("Get = %q, %v", data, err)
+	}
+	// A nil injected client keeps the backend's bounded transport default.
+	awsCfg.HTTPClient = nil
+	b, err = New(ctx, Config{Endpoint: srv.URL, Bucket: "b", AWS: &awsCfg, RequestTimeout: 7 * time.Second})
+	if err != nil {
+		t.Fatal(err)
+	}
+	client, ok := b.client.Options().HTTPClient.(*awshttp.BuildableClient)
+	if !ok || client.GetTimeout() != 7*time.Second || awsCfg.HTTPClient != nil {
+		t.Fatal("default HTTP client lost timeout or mutated injected config")
+	}
 }
 
 func s3Error(w http.ResponseWriter, status int, code string) {
@@ -535,6 +583,47 @@ func TestS3TranslationsPreserveCause(t *testing.T) {
 	}
 }
 
+func TestS3MissingBucketPreservesCause(t *testing.T) {
+	ctx, cancel := context.WithTimeout(t.Context(), time.Minute)
+	defer cancel()
+	b := fakeS3(t, func(w http.ResponseWriter, _ *http.Request) {
+		s3Error(w, http.StatusNotFound, "NoSuchBucket")
+	})
+	for _, op := range []string{"Get", "GetWithETag", "GetIfChanged", "GetRange", "ListPage", "ListPrefixesPage", "Put", "PutIfAbsent", "PutIfMatch", "Delete", "DeleteMany"} {
+		t.Run(op, func(t *testing.T) {
+			var err error
+			switch op {
+			case "Get":
+				_, err = b.Get(ctx, "k")
+			case "GetWithETag":
+				_, _, err = b.GetWithETag(ctx, "k")
+			case "GetIfChanged":
+				_, _, _, err = b.GetIfChanged(ctx, "k", "tag")
+			case "GetRange":
+				_, err = b.GetRange(ctx, "k", 0, 1)
+			case "ListPage":
+				_, _, err = b.ListPage(ctx, "", "", 10)
+			case "ListPrefixesPage":
+				_, _, err = b.ListPrefixesPage(ctx, "", "", 10)
+			case "Put":
+				err = b.Put(ctx, "k", []byte("v"))
+			case "PutIfAbsent":
+				_, err = b.PutIfAbsent(ctx, "k", []byte("v"))
+			case "PutIfMatch":
+				_, err = b.PutIfMatch(ctx, "k", []byte("v"), "tag")
+			case "Delete":
+				err = b.Delete(ctx, "k")
+			case "DeleteMany":
+				err = b.DeleteMany(ctx, "k")
+			}
+			var provider smithy.APIError
+			if !errors.Is(err, objstore.ErrNotFound) || !errors.As(err, &provider) || provider.ErrorCode() != "NoSuchBucket" {
+				t.Fatalf("lost missing-bucket sentinel or provider cause: %v", err)
+			}
+		})
+	}
+}
+
 func TestS3EnsureBucketLocationConstraint(t *testing.T) {
 	for _, tc := range []struct {
 		region string
@@ -607,11 +696,15 @@ func TestS3EnsureBucketEnvironmentEndpoint(t *testing.T) {
 		w.WriteHeader(http.StatusOK)
 	}))
 	t.Cleanup(srv.Close)
-	t.Setenv("AWS_ACCESS_KEY_ID", "test")
-	t.Setenv("AWS_SECRET_ACCESS_KEY", "test")
 	t.Setenv("AWS_ENDPOINT_URL_S3", srv.URL)
-	t.Setenv("AWS_REGION", "eu-west-1")
-	b, err := New(ctx, Config{Bucket: "b"})
+	awsCfg, err := config.LoadDefaultConfig(ctx, config.WithRegion("eu-west-1"), config.WithHTTPClient(srv.Client()),
+		config.WithCredentialsProvider(aws.CredentialsProviderFunc(func(context.Context) (aws.Credentials, error) {
+			return aws.Credentials{AccessKeyID: "test", SecretAccessKey: "test"}, nil
+		})))
+	if err != nil {
+		t.Fatal(err)
+	}
+	b, err := New(ctx, Config{Bucket: "b", AWS: &awsCfg})
 	if err != nil {
 		t.Fatal(err)
 	}

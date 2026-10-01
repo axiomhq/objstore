@@ -498,4 +498,48 @@ func Conformance(t *testing.T, s *objstore.Store) {
 			t.Fatal("delete-many/b survived")
 		}
 	})
+	// CAS and deletes differ here: GCS treats their 404 as a missing key.
+	t.Run("MissingBucket", func(t *testing.T) {
+		if err := s.DropBucket(ctx); err != nil {
+			t.Fatal(err)
+		}
+		// Restore the bucket so this check does not constrain suite order.
+		defer func() {
+			if err := s.EnsureBucket(ctx); err != nil {
+				t.Error(err)
+			}
+		}()
+		for _, op := range []string{"Get", "GetWithETag", "GetIfChanged", "GetRange", "ListPage", "ListPrefixesPage", "Put", "PutIfAbsent", "PutIfMatch", "Delete", "DeleteMany"} {
+			t.Run(op, func(t *testing.T) {
+				var err error
+				switch op {
+				case "Get":
+					_, err = raw.Get(ctx, "missing/obj")
+				case "GetWithETag":
+					_, _, err = raw.GetWithETag(ctx, "missing/obj")
+				case "GetIfChanged":
+					_, _, _, err = raw.GetIfChanged(ctx, "missing/obj", "")
+				case "GetRange":
+					_, err = raw.GetRange(ctx, "missing/obj", 0, 1)
+				case "ListPage":
+					_, _, err = raw.ListPage(ctx, "missing/", "", 10)
+				case "ListPrefixesPage":
+					_, _, err = raw.ListPrefixesPage(ctx, "missing/", "", 10)
+				case "Put":
+					err = raw.Put(ctx, "missing/obj", []byte("v"))
+				case "PutIfAbsent":
+					_, err = raw.PutIfAbsent(ctx, "missing/obj", []byte("v"))
+				case "PutIfMatch":
+					_, err = raw.PutIfMatch(ctx, "missing/obj", []byte("v"), "1")
+				case "Delete":
+					err = raw.Delete(ctx, "missing/obj")
+				case "DeleteMany":
+					err = raw.DeleteMany(ctx, "missing/a", "missing/b")
+				}
+				if !errors.Is(err, objstore.ErrNotFound) {
+					t.Fatalf("%s on a missing bucket: %v, want ErrNotFound", op, err)
+				}
+			})
+		}
+	})
 }

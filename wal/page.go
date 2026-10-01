@@ -21,7 +21,8 @@ const maxPageBytes = 65 << 20
 var ErrCorrupt = errors.New("wal: corrupt")
 
 // Record is one row as the WAL writes it. The WAL frames and checksums the
-// bytes and never looks inside them.
+// bytes and never looks inside them. Size and AppendTo must not block: the
+// Writer calls them on its flush goroutine, outside the attempt timeout.
 type Record interface {
 	// Size is the exact number of bytes AppendTo appends.
 	Size() int
@@ -32,19 +33,26 @@ type Record interface {
 // Weigher is a Record with a weight of the caller's choosing, a logical
 // size say. A page's header carries the sum over its records (Header.Weight),
 // so a reader can account a page from its header alone (WalkHeaders).
-// Records that are not Weighers weigh zero.
+// Records that are not Weighers weigh zero. A page whose sum overflows
+// uint64 is ErrInvalidRecord. A Writer keeps each batch's sum within uint64:
+// an Append that would overflow it fails alone, with ErrInvalidRecord.
+// Like Size and AppendTo, Weight must not block.
 type Weigher interface {
 	Weight() uint64
 }
 
-func weightOf[R Record](records []R) uint64 {
+func weightOf[R Record](records []R) (uint64, error) {
 	var w uint64
 	for _, r := range records {
 		if x, ok := any(r).(Weigher); ok {
-			w += x.Weight()
+			n := x.Weight()
+			if n > math.MaxUint64-w {
+				return math.MaxUint64, fmt.Errorf("%w: page weight overflows uint64", ErrInvalidRecord)
+			}
+			w += n
 		}
 	}
-	return w
+	return w, nil
 }
 
 // Bytes is a Record that is already encoded.
@@ -59,8 +67,11 @@ func (b Bytes) AppendTo(dst []byte) ([]byte, error) { return append(dst, b...), 
 // Header is what a page says about itself.
 type Header struct {
 	Seq   uint64
-	Nonce string    // the writing batch's identity; resolves ambiguous conditional PUTs
-	At    time.Time // when the batch was first attempted, millisecond precision
+	Nonce string // the writing batch's identity; resolves ambiguous conditional PUTs
+	// At is when the batch was first attempted, millisecond precision.
+	// Zero is unset; otherwise UnixMilli must be positive, since the format
+	// reserves millisecond 0 for unset.
+	At time.Time
 	// BatchPages is the page count of a batch; BatchIndex is this page's
 	// position in it. A single-page entry has BatchPages 0 (Encode's
 	// default) or 1 (what a Writer writes): walks treat the two alike.
@@ -91,7 +102,11 @@ func Encode[R Record](h Header, records []R) ([]byte, error) {
 			return nil, fmt.Errorf("wal: page exceeds size limit")
 		}
 	}
-	b, err := appendHeader(make([]byte, 0, size), h, len(records), weightOf(records))
+	weight, err := weightOf(records)
+	if err != nil {
+		return nil, err
+	}
+	b, err := appendHeader(make([]byte, 0, size), h, len(records), weight)
 	if err != nil {
 		return nil, err
 	}
@@ -118,6 +133,9 @@ func appendHeader(b []byte, h Header, records int, weight uint64) ([]byte, error
 	if !h.At.IsZero() {
 		if h.At.UnixMilli() < 0 {
 			return nil, fmt.Errorf("wal: commit time before the epoch")
+		}
+		if h.At.UnixMilli() == 0 {
+			return nil, fmt.Errorf("wal: commit millisecond 0 is reserved for unset")
 		}
 		at = uint64(h.At.UnixMilli())
 	}

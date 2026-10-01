@@ -27,6 +27,14 @@ func NewKMS(s *objstore.Store) (*objstore.Store, *KMS) {
 
 func (k *KMS) SupportsKMS() bool { return true }
 
+// Close passes through to the wrapped backend's Close, if any (Store.Close).
+func (k *KMS) Close() error {
+	if c, ok := k.Backend.(interface{ Close() error }); ok {
+		return c.Close()
+	}
+	return nil
+}
+
 // KeyOf is the KMS key id object was last written with, "" for none.
 func (k *KMS) KeyOf(object string) string {
 	k.mu.Lock()

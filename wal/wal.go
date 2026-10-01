@@ -121,8 +121,11 @@ func WalkWithGet[T any](ctx context.Context, get func(context.Context, string) (
 // owns it, so pages may decode out of order without changing the order in
 // which entries and markers are visited.
 type coalescer[T any] struct {
-	batch []Entry[T] // the open batch's pages, one Pages element each
-	bytes int64      // decoded budget held outside the parallel permit pool
+	batch []T
+	first Header
+	last  Header
+	key   string
+	bytes int64 // decoded budget held outside the parallel permit pool
 	visit func(Entry[T]) error
 }
 
@@ -131,7 +134,7 @@ func (c *coalescer[T]) add(h Header, key string, body T, bytes int64) error {
 		// A new entry after a batch that never finished: a terminal failure
 		// after some pages landed finished that writer (or it crashed), and
 		// a replacement writer moved on past the partial batch.
-		if err := c.visit(marker(c.batch[len(c.batch)-1], false)); err != nil {
+		if err := c.visit(c.marker(false)); err != nil {
 			return err
 		}
 		c.batch, c.bytes = nil, 0
@@ -142,22 +145,21 @@ func (c *coalescer[T]) add(h Header, key string, body T, bytes int64) error {
 	if h.BatchPages > maxBatchPages || bytes < 0 || bytes > maxBatchBytes-c.bytes {
 		return fmt.Errorf("%w: wal entry %q: batch exceeds writer limits", ErrCorrupt, key)
 	}
-	if h.BatchIndex != uint64(len(c.batch)) || (len(c.batch) > 0 && (h.Nonce != c.batch[0].Nonce || h.BatchPages != c.batch[0].BatchPages)) {
+	if h.BatchIndex != uint64(len(c.batch)) || (len(c.batch) > 0 && (h.Nonce != c.first.Nonce || h.BatchPages != c.first.BatchPages)) {
 		return fmt.Errorf("%w: wal entry %q: invalid batch header", ErrCorrupt, key)
 	}
+	if len(c.batch) == 0 {
+		c.first = h
+	}
 	c.bytes += bytes
-	c.batch = append(c.batch, Entry[T]{Header: h, Key: key, Pages: []T{body}})
+	c.batch = append(c.batch, body)
+	c.last, c.key = h, key
 	if uint64(len(c.batch)) != h.BatchPages {
 		return nil
 	}
-	pages := make([]T, len(c.batch))
-	for i := range c.batch {
-		pages[i] = c.batch[i].Pages[0]
-	}
-	last := c.batch[len(c.batch)-1]
-	last.Pages = pages
+	entry := Entry[T]{Header: c.last, Key: c.key, Pages: c.batch}
 	c.batch, c.bytes = nil, 0
-	return c.visit(last)
+	return c.visit(entry)
 }
 
 func (c *coalescer[T]) finish(incomplete bool) error {
@@ -166,11 +168,11 @@ func (c *coalescer[T]) finish(incomplete bool) error {
 	}
 	// Only a missing page in an unbounded walk marks a partial batch
 	// Incomplete. A bounded range excludes it with a plain marker.
-	return c.visit(marker(c.batch[len(c.batch)-1], incomplete))
+	return c.visit(c.marker(incomplete))
 }
 
-func marker[T any](e Entry[T], incomplete bool) Entry[T] {
-	e.BatchPages, e.BatchIndex, e.Pages = 0, 0, nil
-	e.Incomplete = incomplete
-	return e
+func (c *coalescer[T]) marker(incomplete bool) Entry[T] {
+	h := c.last
+	h.BatchPages, h.BatchIndex = 0, 0
+	return Entry[T]{Header: h, Key: c.key, Incomplete: incomplete}
 }

@@ -3,6 +3,7 @@
 package bucket
 
 import (
+	"cmp"
 	"context"
 	"crypto/rand"
 	"errors"
@@ -11,6 +12,8 @@ import (
 	"strings"
 	"testing"
 	"time"
+
+	"github.com/aws/aws-sdk-go-v2/aws"
 
 	"github.com/axiomhq/objstore"
 	"github.com/axiomhq/objstore/aws/s3"
@@ -48,23 +51,29 @@ func NewFS(t testing.TB) *objstore.Store {
 // NewS3 returns a Store on a fresh bucket objstore-test-<nanos>-<random>
 // at the S3 endpoint, dropped at cleanup. Each of AWS_ACCESS_KEY_ID,
 // AWS_SECRET_ACCESS_KEY and AWS_REGION left unset defaults to MinIO's
-// (minioadmin, minioadmin, us-east-1), set with t.Setenv (so such a test cannot
-// call t.Parallel); set, the environment's credentials (R2, AWS) pass
-// through untouched. Opening and creating the bucket is bounded by a
-// minute.
+// (minioadmin, minioadmin, us-east-1); set, the environment's credentials
+// (R2, AWS) pass through untouched, including AWS_SESSION_TOKEN. No
+// environment variables are changed. Opening and creating the bucket is
+// bounded by a minute.
 func NewS3(t testing.TB, endpoint string) *objstore.Store {
 	t.Helper()
-	for k, v := range map[string]string{"AWS_ACCESS_KEY_ID": "minioadmin", "AWS_SECRET_ACCESS_KEY": "minioadmin", "AWS_REGION": "us-east-1"} {
-		if os.Getenv(k) == "" {
-			t.Setenv(k, v)
-		}
+	creds := aws.Credentials{
+		AccessKeyID:     cmp.Or(os.Getenv("AWS_ACCESS_KEY_ID"), "minioadmin"),
+		SecretAccessKey: cmp.Or(os.Getenv("AWS_SECRET_ACCESS_KEY"), "minioadmin"),
+		SessionToken:    os.Getenv("AWS_SESSION_TOKEN"),
+	}
+	awsCfg := aws.Config{
+		Region: cmp.Or(os.Getenv("AWS_REGION"), "us-east-1"),
+		Credentials: aws.CredentialsProviderFunc(func(context.Context) (aws.Credentials, error) {
+			return creds, nil
+		}),
 	}
 	ctx, cancel := context.WithTimeout(t.Context(), time.Minute)
 	defer cancel()
 	// The random suffix keeps two test binaries started in the same
 	// nanosecond (go test ./... runs packages in parallel) apart.
 	bucket := fmt.Sprintf("objstore-test-%d-%s", time.Now().UnixNano(), strings.ToLower(rand.Text()[:8]))
-	s, err := s3.Open(ctx, s3.Config{Endpoint: endpoint, Bucket: bucket}, objstore.Config{})
+	s, err := s3.Open(ctx, s3.Config{Endpoint: endpoint, Bucket: bucket, AWS: &awsCfg}, objstore.Config{})
 	if err != nil {
 		t.Fatal(err)
 	}
