@@ -14,10 +14,12 @@ import (
 	"testing"
 	"testing/synctest"
 	"time"
+	"unsafe"
 
 	"github.com/axiomhq/objstore"
 	"github.com/axiomhq/objstore/storetest"
 	"github.com/axiomhq/objstore/storetest/bucket"
+	"golang.org/x/sync/semaphore"
 )
 
 // summary is a page as a test decoder sees it: its records (nil for a
@@ -471,5 +473,159 @@ func TestWalkHeadersMatchesWalk(t *testing.T) {
 	ops := f.Ops()
 	if ops[storetest.OpGetRange] < int(seq) || ops[storetest.OpGetRange] > int(seq)+4 || ops[storetest.OpGet] != 2 {
 		t.Fatalf("header walk of %d pages: %v", seq, ops)
+	}
+}
+
+func TestWalkParallelBoundsOpenBatch(t *testing.T) {
+	// Charge through the coalescer seam, without allocating half a GiB.
+	const bound = 4 * int64(maxUnackedBytes)
+	c := coalescer[int64]{visit: func(Entry[int64]) error {
+		t.Fatal("oversized batch was visited")
+		return nil
+	}}
+	for i := range 8 {
+		n := maxInFlightBytes
+		if i == 7 {
+			n++ // the open batch crosses its budget by one byte
+		}
+		h := Header{Seq: uint64(i + 1), BatchPages: 9, BatchIndex: uint64(i)}
+		err := c.add(h, Key(testPrefix, h.Seq), n, n)
+		var retained int64
+		for _, p := range c.batch {
+			retained += p.Pages[0]
+		}
+		if retained > bound {
+			t.Fatalf("open batch retains %d charged bytes, bound %d", retained, bound)
+		}
+		if i < 7 && err != nil {
+			t.Fatalf("page %d within budget: %v", i, err)
+		}
+		if i == 7 && !errors.Is(err, ErrCorrupt) {
+			t.Fatalf("batch past %d charged bytes: %v, want ErrCorrupt", bound, err)
+		}
+	}
+}
+
+func TestWalkParallelRejectsImpossibleBatchPages(t *testing.T) {
+	for _, count := range []uint64{200, ^uint64(0)} {
+		t.Run(fmt.Sprint(count), func(t *testing.T) {
+			data, err := Encode(Header{Seq: 1, BatchPages: count}, rows("one"))
+			if err != nil {
+				t.Fatal(err)
+			}
+			get := func(context.Context, string) ([]byte, error) { return data, nil }
+			for _, workers := range []int{0, 1, 8} {
+				ctx, cancel := context.WithTimeout(t.Context(), 10*time.Second)
+				visits := 0
+				visit := func(entry) error { visits++; return nil }
+				var err error
+				if workers == 0 {
+					err = WalkWithGet(ctx, get, testPrefix, 0, 1, Decode, visit)
+				} else {
+					err = WalkParallelWithGet(ctx, get, testPrefix, 0, 1, workers, Decode, nil, visit)
+				}
+				cancel()
+				if !errors.Is(err, ErrCorrupt) || visits != 0 {
+					t.Errorf("workers=%d: visits=%d, error=%v, want no visits and ErrCorrupt", workers, visits, err)
+				}
+			}
+		})
+	}
+}
+
+func TestWalkParallelChargesRecordDescriptors(t *testing.T) {
+	const records = 1 << 20
+	data, err := appendHeader(nil, Header{Seq: 1}, records, 0)
+	if err != nil {
+		t.Fatal(err)
+	}
+	data = seal(append(data, make([]byte, records)...)) // one length byte per empty record
+	ctx, cancel := context.WithTimeout(t.Context(), 10*time.Second)
+	defer cancel()
+	open := make(chan struct{})
+	close(open)
+	p := parallelPage[[][]byte]{seq: 1, key: Key(testPrefix, 1), gate: open, turn: open, permitted: make(chan struct{})}
+	pool := semaphore.NewWeighted(maxInFlightBytes)
+	var end atomic.Uint64
+	end.Store(^uint64(0))
+	fetchPage(ctx, func(context.Context, string) ([]byte, error) { return data, nil }, pool, &end, 1, Decode, nil, &p)
+	if p.err != nil || len(p.body) != records {
+		t.Fatalf("decode: %d records, error=%v", len(p.body), p.err)
+	}
+	retained := int64(len(data)) + int64(cap(p.body))*int64(unsafe.Sizeof([]byte{}))
+	if p.bytes < retained {
+		t.Fatalf("permit charges %d bytes, Decode retains %d (wire %d, descriptors %d)", p.bytes, retained, len(data), retained-int64(len(data)))
+	}
+	if pool.TryAcquire(maxInFlightBytes - p.bytes + 1) {
+		t.Fatal("charged bytes were not taken from the pool")
+	}
+	t.Logf("permit charges %d bytes, Decode retains %d", p.bytes, retained)
+	pool.Release(p.bytes)
+}
+
+func TestWalkParallelBatchBudgetMatchesWalk(t *testing.T) {
+	for _, tc := range []struct {
+		name    string
+		records int
+		corrupt bool
+	}{
+		{"larger-than-pool", 4 << 20, false},
+		{"larger-than-batch-budget", 8 << 20, true},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			// Header-only decoding exercises large charges without allocating
+			// their bodies, as WalkHeaders does. Each page takes the whole pool.
+			get := func(ctx context.Context, key string) ([]byte, error) {
+				seq, err := SeqFromKey(key)
+				if err != nil {
+					return nil, err
+				}
+				return appendHeader(nil, Header{Seq: seq, Nonce: "batch", BatchPages: 3, BatchIndex: (seq - 1) % 3}, tc.records, 0)
+			}
+			decode := func(b []byte) (Header, Header, error) {
+				h, err := DecodeHeader(b)
+				return h, h, err
+			}
+			var want []Entry[Header]
+			var wantErr error
+			for _, workers := range []int{0, 1, 8} {
+				ctx, cancel := context.WithTimeout(t.Context(), 10*time.Second)
+				var got []Entry[Header]
+				visit := func(e Entry[Header]) error { got = append(got, e); return nil }
+				var err error
+				if workers == 0 {
+					err = WalkWithGet(ctx, get, testPrefix, 0, 6, decode, visit)
+					want, wantErr = got, err
+				} else {
+					err = WalkParallelWithGet(ctx, get, testPrefix, 0, 6, workers, decode, nil, visit)
+				}
+				cancel()
+				if !reflect.DeepEqual(got, want) || errorText(err) != errorText(wantErr) || errors.Is(err, ErrCorrupt) != tc.corrupt {
+					t.Fatalf("workers=%d: visits=%+v, want=%+v; error=%v, want=%v; corrupt=%v", workers, got, want, err, wantErr, tc.corrupt)
+				}
+				if !tc.corrupt && (err != nil || len(got) != 2 || len(got[0].Pages) != 3 || len(got[1].Pages) != 3) {
+					t.Fatalf("workers=%d: batch larger than pool did not finish: visits=%+v, error=%v", workers, got, err)
+				}
+			}
+		})
+	}
+}
+
+func TestWalkParallelBatchBudgetResets(t *testing.T) {
+	var got []Entry[int64]
+	c := coalescer[int64]{visit: func(e Entry[int64]) error { got = append(got, e); return nil }}
+	add := func(seq, index uint64, bytes int64) {
+		t.Helper()
+		h := Header{Seq: seq, BatchPages: 2, BatchIndex: index}
+		if err := c.add(h, Key(testPrefix, seq), bytes, bytes); err != nil {
+			t.Fatal(err)
+		}
+	}
+	add(1, 0, maxBatchBytes) // abandoned: its whole budget must be freed
+	for seq := uint64(2); seq <= 5; seq++ {
+		add(seq, (seq-2)%2, maxBatchBytes/2)
+	}
+	if c.bytes != 0 || len(c.batch) != 0 || len(got) != 3 || got[0].Pages != nil || len(got[1].Pages) != 2 || len(got[2].Pages) != 2 {
+		t.Fatalf("batch budget not reset: charge=%d, open=%d, visits=%+v", c.bytes, len(c.batch), got)
 	}
 }

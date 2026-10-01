@@ -7,6 +7,7 @@ import (
 	"hash/crc32"
 	"math"
 	"time"
+	"unsafe"
 )
 
 const pageMagic = "OWAL\x01"
@@ -246,32 +247,53 @@ func DecodeHeader(prefix []byte) (Header, error) {
 	return h, nil
 }
 
+// pageMemoryBytes covers wire bytes, the nonce copy and Decode's record
+// descriptors. Non-WAL decoders keep the four-times-wire budget.
+func pageMemoryBytes(data []byte) int64 {
+	n := int64(len(data))
+	r := pageReader{data: data}
+	h, _, ok := r.headerFields()
+	if !ok {
+		return 4 * n
+	}
+	return max(4*n, 2*n+int64(h.Records)*int64(unsafe.Sizeof([]byte{})))
+}
+
 // header reads the magic and header fields; false if they are malformed
 // or run past r's data.
 func (r *pageReader) header() (Header, bool) {
+	h, nonce, ok := r.headerFields()
+	if ok {
+		h.Nonce = string(nonce)
+	}
+	return h, ok
+}
+
+// headerFields leaves the nonce aliased, so budgeting needs no allocation.
+func (r *pageReader) headerFields() (Header, []byte, bool) {
 	var h Header
 	if len(r.data) < len(pageMagic) || string(r.data[:len(pageMagic)]) != pageMagic {
-		return Header{}, false
+		return Header{}, nil, false
 	}
 	r.data = r.data[len(pageMagic):]
 	h.Seq = r.number()
-	h.Nonce = string(r.blob())
+	nonce := r.blob()
 	if at := r.number(); at > math.MaxInt64 {
-		return Header{}, false
+		return Header{}, nil, false
 	} else if at != 0 {
 		h.At = time.UnixMilli(int64(at)).UTC()
 	}
 	h.BatchPages, h.BatchIndex = r.number(), r.number()
 	if !validBatch(h.BatchPages, h.BatchIndex) {
-		return Header{}, false
+		return Header{}, nil, false
 	}
 	n := r.number()
 	h.Weight = r.number()
 	if r.err || n > maxPageBytes {
-		return Header{}, false
+		return Header{}, nil, false
 	}
 	h.Records = int(n)
-	return h, true
+	return h, nonce, true
 }
 
 func validBatch(pages, index uint64) bool {

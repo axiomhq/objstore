@@ -6,18 +6,18 @@ import (
 	"sync"
 	"sync/atomic"
 	"testing"
+	"testing/synctest"
 	"time"
 
 	"github.com/axiomhq/objstore/storetest"
-	"github.com/axiomhq/objstore/storetest/bucket"
 )
 
 func TestShared(t *testing.T) {
 	ctx := context.Background()
 	const ttl = time.Minute
 
-	t.Run("RefCount", func(t *testing.T) {
-		s := bucket.New(t)
+	runUnit(t, "RefCount", func(t *testing.T) {
+		s := newMemStore()
 		var sh Shared
 		minted := 0
 		mint := func() (*Lease, error) {
@@ -66,8 +66,8 @@ func TestShared(t *testing.T) {
 		none.Release(ctx)
 	})
 
-	t.Run("ConcurrentJoinMintsOnce", func(t *testing.T) {
-		s := bucket.New(t)
+	runUnit(t, "ConcurrentJoinMintsOnce", func(t *testing.T) {
+		s := newMemStore()
 		var sh Shared
 		var minted atomic.Int32
 		mint := func() (*Lease, error) {
@@ -100,8 +100,8 @@ func TestShared(t *testing.T) {
 	// A mint stuck on the store must not hold Shared's mutex. Held
 	// answers at once; a concurrent Join waits for the mint and, when it
 	// fails, mints its own.
-	t.Run("HungMintDoesNotBlockShared", func(t *testing.T) {
-		s, f := bucket.NewFaulty(t)
+	runUnit(t, "HungMintDoesNotBlockShared", func(t *testing.T) {
+		s, f := storetest.Faulty(t, newMemStore())
 		f.Set(storetest.Plan{Op: storetest.OpPutIfAbsent, N: 1, Mode: storetest.Hang, Key: "shared/hang"})
 		var sh Shared
 		var minted atomic.Int32
@@ -125,7 +125,10 @@ func TestShared(t *testing.T) {
 			})
 			firstErr <- err
 		}()
-		waitFor(t, func() bool { return f.Fired() != 0 })
+		synctest.Wait()
+		if f.Fired() != 1 {
+			t.Fatal("mint did not reach the hung PUT")
+		}
 		held := make(chan bool, 1)
 		go func() { held <- sh.Held() }()
 		select {
@@ -144,10 +147,11 @@ func TestShared(t *testing.T) {
 			}
 			second <- r
 		}()
+		synctest.Wait()
 		select {
 		case <-second:
 			t.Fatal("second Join did not wait for the in-flight mint")
-		case <-time.After(50 * time.Millisecond):
+		default:
 		}
 		close(release)
 		if err := await(t, firstErr, "hung mint"); !errors.Is(err, context.Canceled) {
@@ -162,8 +166,8 @@ func TestShared(t *testing.T) {
 
 	// The last Ref.Release hands back outside the mutex: Held answers
 	// while the handover is stuck on the store.
-	t.Run("ReleaseOutsideLock", func(t *testing.T) {
-		s, f := bucket.NewFaulty(t)
+	runUnit(t, "ReleaseOutsideLock", func(t *testing.T) {
+		s, f := storetest.Faulty(t, newMemStore())
 		var sh Shared
 		r, err := sh.Join(func() (*Lease, error) { return Acquire(ctx, s, "shared/rel", "owner-a", ttl) })
 		if err != nil {
@@ -175,7 +179,10 @@ func TestShared(t *testing.T) {
 			r.Release(ctx)
 			close(done)
 		}()
-		waitFor(t, func() bool { return f.Fired() != 0 })
+		synctest.Wait()
+		if f.Fired() != 1 {
+			t.Fatal("release did not reach the paused PUT")
+		}
 		held := make(chan bool, 1)
 		go func() { held <- sh.Held() }()
 		select {
@@ -194,58 +201,62 @@ func TestShared(t *testing.T) {
 // TestSharedReleaseFromFence: The last Ref.Release from inside the
 // fence callback completes; Shared is usable afterwards.
 func TestSharedReleaseFromFence(t *testing.T) {
-	ctx := context.Background()
-	const ttl = 200 * time.Millisecond
-	s := bucket.New(t)
-	var sh Shared
-	mint := func() (*Lease, error) { return Acquire(ctx, s, "shared/fence", "owner-a", ttl) }
-	r, err := sh.Join(mint)
-	if err != nil {
-		t.Fatal(err)
-	}
-	done := make(chan struct{})
-	r.Lease().Start(func() { r.Release(ctx); close(done) })
-	if err := Steal(ctx, s, "shared/fence", "owner-b", ttl); err != nil {
-		t.Fatal(err)
-	}
-	select {
-	case <-done:
-	case <-time.After(10 * time.Second):
-		t.Fatal("Ref.Release from the fence callback hung")
-	}
-	if sh.Held() {
-		t.Fatal("lease still held after its last Release")
-	}
-	joined := make(chan error, 1)
-	go func() {
-		_, err := sh.Join(func() (*Lease, error) { return nil, errors.New("mint") })
-		joined <- err
-	}()
-	select {
-	case <-joined:
-	case <-time.After(5 * time.Second):
-		t.Fatal("Join blocked: Shared stuck busy")
-	}
+	synctest.Test(t, func(t *testing.T) {
+		ctx := context.Background()
+		const ttl = 200 * time.Millisecond
+		s := newMemStore()
+		var sh Shared
+		mint := func() (*Lease, error) { return Acquire(ctx, s, "shared/fence", "owner-a", ttl) }
+		r, err := sh.Join(mint)
+		if err != nil {
+			t.Fatal(err)
+		}
+		done := make(chan struct{})
+		r.Lease().Start(func() { r.Release(ctx); close(done) })
+		if err := Steal(ctx, s, "shared/fence", "owner-b", ttl); err != nil {
+			t.Fatal(err)
+		}
+		select {
+		case <-done:
+		case <-time.After(10 * time.Second):
+			t.Fatal("Ref.Release from the fence callback hung")
+		}
+		if sh.Held() {
+			t.Fatal("lease still held after its last Release")
+		}
+		joined := make(chan error, 1)
+		go func() {
+			_, err := sh.Join(func() (*Lease, error) { return nil, errors.New("mint") })
+			joined <- err
+		}()
+		select {
+		case <-joined:
+		case <-time.After(5 * time.Second):
+			t.Fatal("Join blocked: Shared stuck busy")
+		}
+	})
 }
 
 // TestSharedMintPanic: A panicking mint does not leave Shared busy.
 func TestSharedMintPanic(t *testing.T) {
-	var sh Shared
-	func() {
-		defer func() { _ = recover() }()
-		sh.Join(func() (*Lease, error) { panic("mint") }) //nolint:errcheck // panics
-	}()
-	joined := make(chan error, 1)
-	go func() {
-		_, err := sh.Join(func() (*Lease, error) { return nil, errors.New("mint") })
-		joined <- err
-	}()
-	select {
-	case err := <-joined:
-		if err == nil || err.Error() != "mint" {
-			t.Fatalf("second Join: %v", err)
+	synctest.Test(t, func(t *testing.T) {
+		var sh Shared
+		func() {
+			defer func() { _ = recover() }()
+			sh.Join(func() (*Lease, error) { panic("mint") }) //nolint:errcheck // panics
+		}()
+		joined := make(chan error, 1)
+		go func() {
+			_, err := sh.Join(func() (*Lease, error) { return nil, errors.New("mint") })
+			joined <- err
+		}()
+		select {
+		case err := <-joined:
+			if err == nil || err.Error() != "mint" {
+				t.Fatalf("second Join: %v", err)
+			}
+		case <-time.After(5 * time.Second):
+			t.Fatal("Join blocked after a panicking mint")
 		}
-	case <-time.After(5 * time.Second):
-		t.Fatal("Join blocked after a panicking mint")
-	}
+	})
 }

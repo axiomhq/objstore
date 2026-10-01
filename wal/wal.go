@@ -13,6 +13,14 @@ import (
 // seqDigits is the width of a key's sequence: uint64 max has 20 digits.
 const seqDigits = 20
 
+// A Writer reserves a header per record within maxUnackedBytes. Four
+// times that covers page bytes and decoded record descriptors alike.
+const maxBatchBytes int64 = 4 * maxUnackedBytes
+
+// splitBatch fills pages greedily: each adjacent pair's framed records
+// exceed maxEntryBytes-entryHeaderReserve, even with an indivisible record.
+var maxBatchPages = uint64(2*maxUnackedBytes/(maxEntryBytes-entryHeaderReserve) + 1)
+
 // Key is the object key of page seq under prefix. The sequence is
 // zero-padded to 20 digits (uint64 max), so lexical order is numeric order.
 func Key(prefix string, seq uint64) string {
@@ -63,7 +71,8 @@ type Entry[T any] struct {
 // Walk visits committed entries with Seq in (after, through] in ascending
 // order, reading and decoding ONE page at a time. through == 0 follows the
 // live log to its first missing page; a bounded walk that meets a missing
-// page inside (after, through] fails with ErrCorrupt.
+// page inside (after, through] fails with ErrCorrupt. A batch beyond the
+// Writer's page-count or decoded byte budget also fails with ErrCorrupt.
 //
 // No listing: the sequence numbers are the catalog. A miss at N proves the
 // log ends there, because a writer claims sequentially and advances only on
@@ -93,6 +102,7 @@ func WalkWithGet[T any](ctx context.Context, get func(context.Context, string) (
 		if err != nil {
 			return fmt.Errorf("read wal entry %q: %w", k, err)
 		}
+		memory := pageMemoryBytes(data)
 		h, body, err := decode(data)
 		if err != nil {
 			return fmt.Errorf("corrupt wal entry %q: %w", k, err)
@@ -100,7 +110,7 @@ func WalkWithGet[T any](ctx context.Context, get func(context.Context, string) (
 		if h.Seq != seq {
 			return fmt.Errorf("%w: wal entry %q: sequence %d disagrees with key %d", ErrCorrupt, k, h.Seq, seq)
 		}
-		if err := c.add(h, k, body); err != nil {
+		if err := c.add(h, k, body, memory); err != nil {
 			return err
 		}
 	}
@@ -112,10 +122,11 @@ func WalkWithGet[T any](ctx context.Context, get func(context.Context, string) (
 // which entries and markers are visited.
 type coalescer[T any] struct {
 	batch []Entry[T] // the open batch's pages, one Pages element each
+	bytes int64      // decoded budget held outside the parallel permit pool
 	visit func(Entry[T]) error
 }
 
-func (c *coalescer[T]) add(h Header, key string, body T) error {
+func (c *coalescer[T]) add(h Header, key string, body T, bytes int64) error {
 	if len(c.batch) != 0 && h.BatchIndex == 0 {
 		// A new entry after a batch that never finished: a terminal failure
 		// after some pages landed finished that writer (or it crashed), and
@@ -123,14 +134,18 @@ func (c *coalescer[T]) add(h Header, key string, body T) error {
 		if err := c.visit(marker(c.batch[len(c.batch)-1], false)); err != nil {
 			return err
 		}
-		c.batch = nil
+		c.batch, c.bytes = nil, 0
 	}
 	if h.BatchPages <= 1 { // 0 (Encode) and 1 (Writer) both mean a single page
 		return c.visit(Entry[T]{Header: h, Key: key, Pages: []T{body}})
 	}
+	if h.BatchPages > maxBatchPages || bytes < 0 || bytes > maxBatchBytes-c.bytes {
+		return fmt.Errorf("%w: wal entry %q: batch exceeds writer limits", ErrCorrupt, key)
+	}
 	if h.BatchIndex != uint64(len(c.batch)) || (len(c.batch) > 0 && (h.Nonce != c.batch[0].Nonce || h.BatchPages != c.batch[0].BatchPages)) {
 		return fmt.Errorf("%w: wal entry %q: invalid batch header", ErrCorrupt, key)
 	}
+	c.bytes += bytes
 	c.batch = append(c.batch, Entry[T]{Header: h, Key: key, Pages: []T{body}})
 	if uint64(len(c.batch)) != h.BatchPages {
 		return nil
@@ -141,7 +156,7 @@ func (c *coalescer[T]) add(h Header, key string, body T) error {
 	}
 	last := c.batch[len(c.batch)-1]
 	last.Pages = pages
-	c.batch = nil
+	c.batch, c.bytes = nil, 0
 	return c.visit(last)
 }
 

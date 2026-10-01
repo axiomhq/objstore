@@ -2,12 +2,12 @@ package rangeread
 
 import (
 	"context"
+	"sync"
 
 	"github.com/axiomhq/objstore"
 	"github.com/axiomhq/objstore/cache"
 	"golang.org/x/sync/errgroup"
 	"golang.org/x/sync/semaphore"
-	"golang.org/x/sync/singleflight"
 )
 
 // Reader reads immutable objects by byte range on top of the object cache:
@@ -21,10 +21,11 @@ type Reader struct {
 	objects *cache.Cache
 	config  Config              // normalized by New
 	memory  *semaphore.Weighted // config.MaxInFlightBytes across the process
-	// parents shares one GET among concurrent identical coalesced parent
-	// ranges (FetchRanges), without caching the parent.
-	parents singleflight.Group
-	joined  func() // test hook: called once a parent read has joined or led its flight
+	// flights shares uncached parents and keeps their physical reservations
+	// through production and every consumer's copy.
+	flightMu sync.Mutex
+	flights  map[string]*rangeFlight
+	joined   func() // test hook: called once a parent read has joined or led its flight
 }
 
 // New returns a Reader on s through objects. Zero fields of cfg take their

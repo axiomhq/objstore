@@ -7,6 +7,7 @@ import (
 	"fmt"
 	"sync/atomic"
 	"testing"
+	"testing/synctest"
 	"time"
 
 	"github.com/axiomhq/objstore"
@@ -36,10 +37,177 @@ func (b *readBackend) GetRange(ctx context.Context, key string, off, n int64) ([
 	return b.Backend.GetRange(ctx, key, off, n)
 }
 
+func TestCancelledRangeWaiterKeepsProducerReservation(t *testing.T) {
+	for _, transient := range []bool{true, false} {
+		name := "parent"
+		if !transient {
+			name = "cached-child"
+		}
+		t.Run(name, func(t *testing.T) {
+			synctest.Test(t, func(t *testing.T) {
+				ctx, deadline := context.WithTimeout(t.Context(), 5*time.Second)
+				defer deadline()
+				ctx, cancel := context.WithCancel(ctx)
+				defer cancel()
+				const limit = 1024
+				const length = 512
+				entered, release := make(chan struct{}), make(chan struct{})
+				s := bucket.NewFS(t).WithBackend(func(b objstore.Backend) objstore.Backend {
+					return &readBackend{Backend: b, getRange: func(context.Context, string, int64, int64) ([]byte, error) {
+						data := make([]byte, length)
+						close(entered)
+						<-release // cancellation cannot free a buffer the backend still holds
+						return data, nil
+					}}
+				})
+				objects := cache.New(s, 1<<20, nil, cache.Keys{})
+				t.Cleanup(objects.Close)
+				r := newReader(t, s, objects, Config{MaxRangeBytes: limit, MaxInFlightBytes: limit})
+				load := Load{Extent: Extent{Object: "o", Length: length}, Key: "child", Transient: transient}
+				done := make(chan error, 1)
+				go func() { _, err := r.FetchRanges(ctx, []Load{load}); done <- err }()
+				<-entered
+				cancel()
+				if err := <-done; !errors.Is(err, context.Canceled) {
+					t.Errorf("waiter: %v, want context.Canceled", err)
+				}
+				synctest.Wait()
+				var free int64
+				for r.memory.TryAcquire(1) {
+					free++
+				}
+				if free > 0 {
+					r.memory.Release(free)
+				}
+				if free != limit-length {
+					t.Errorf("free physical bytes = %d, want %d while producer holds %d bytes", free, limit-length, length)
+				}
+				if got := objects.GateInUse.Load(); got != 1 {
+					t.Errorf("GET slots in use = %d, want 1", got)
+				}
+				close(release)
+				synctest.Wait()
+				if !r.memory.TryAcquire(limit) {
+					t.Fatal("physical reservation survived the producer and its consumers")
+				}
+				r.memory.Release(limit)
+			})
+		})
+	}
+}
+
+func TestSharedParentReservationCoversConsumers(t *testing.T) {
+	synctest.Test(t, func(t *testing.T) {
+		ctx, cancel := context.WithTimeout(t.Context(), 5*time.Second)
+		defer cancel()
+		const limit = 1024
+		r := newReader(t, nil, nil, Config{MaxRangeBytes: limit, MaxInFlightBytes: limit})
+		x := Extent{Object: "o", Length: limit}
+		joined := make(chan struct{}, 2)
+		r.joined = func() { joined <- struct{}{} }
+		entered, finish := make(chan struct{}), make(chan struct{})
+		read := func(context.Context) ([]byte, cache.Outcome, error) {
+			close(entered)
+			<-finish
+			return make([]byte, limit), cache.Load, nil
+		}
+		type consumer struct {
+			data    []byte
+			release func()
+			err     error
+		}
+		results := make(chan consumer, 2)
+		fetch := func() {
+			data, _, _, release, err := r.sharedParent(ctx, x, 0, read)
+			results <- consumer{data, release, err}
+		}
+		go fetch()
+		<-entered
+		<-joined
+		go fetch()
+		<-joined // even a full-size flight admits a follower without reserving twice
+		close(finish)
+		first, last := <-results, <-results
+		if first.err != nil || last.err != nil {
+			t.Fatalf("consumers: %v, %v", first.err, last.err)
+		}
+		if &first.data[0] != &last.data[0] {
+			t.Fatal("consumers did not share the physical buffer")
+		}
+		synctest.Wait()
+		if r.memory.TryAcquire(1) {
+			r.memory.Release(1)
+			t.Error("producer completion freed bytes still used by consumers")
+		}
+		first.release()
+		if r.memory.TryAcquire(1) {
+			r.memory.Release(1)
+			t.Error("first consumer freed bytes still used by the last consumer")
+		}
+		copy(make([]byte, limit), last.data)
+		last.release()
+		if !r.memory.TryAcquire(limit) {
+			t.Fatal("last consumer did not free the physical reservation")
+		}
+		r.memory.Release(limit)
+	})
+}
+
+func TestCachedChildCopiesUnderProducerReservation(t *testing.T) {
+	for _, decoded := range []bool{false, true} {
+		name := "stored"
+		if decoded {
+			name = "decoded"
+		}
+		t.Run(name, func(t *testing.T) {
+			ctx, cancel := context.WithTimeout(t.Context(), 5*time.Second)
+			defer cancel()
+			const limit = 1024
+			physical := bytes.Repeat([]byte("x"), 512)
+			s := bucket.NewFS(t).WithBackend(func(b objstore.Backend) objstore.Backend {
+				return &readBackend{Backend: b, getRange: func(context.Context, string, int64, int64) ([]byte, error) {
+					return physical, nil
+				}}
+			})
+			objects := cache.New(s, 1<<20, nil, cache.Keys{})
+			t.Cleanup(objects.Close)
+			r := newReader(t, s, objects, Config{MaxRangeBytes: limit, MaxInFlightBytes: limit})
+			load := Load{Extent: Extent{Object: "o", Length: int64(len(physical))}, Key: "child"}
+			if decoded {
+				load.Decode = func(child []byte) ([]byte, error) {
+					if &child[0] == &physical[0] {
+						t.Error("decoder still uses the physical read buffer")
+					}
+					if r.memory.TryAcquire(limit) {
+						r.memory.Release(limit)
+						t.Error("decoder ran without the producer's reservation")
+					}
+					return child, nil
+				}
+			}
+			gotCtx, err := r.FetchRanges(ctx, []Load{load})
+			if err != nil {
+				t.Fatal(err)
+			}
+			child, ok := cache.Scoped(gotCtx, load.Key)
+			if !ok || !bytes.Equal(child, physical) {
+				t.Fatal("scope missed the child")
+			}
+			if &child[0] == &physical[0] {
+				t.Fatal("scope retained the unreserved physical read buffer")
+			}
+			if !r.memory.TryAcquire(limit) {
+				t.Fatal("owned child kept the physical reservation")
+			}
+			r.memory.Release(limit)
+		})
+	}
+}
+
 func TestParentFlightKeyDoesNotAliasObjectGeneration(t *testing.T) {
 	ctx, cancel := context.WithTimeout(t.Context(), 5*time.Second)
 	defer cancel()
-	var r Reader
+	r := newReader(t, nil, nil, Config{})
 	joined := make(chan struct{}, 2)
 	r.joined = func() { joined <- struct{}{} }
 	entered, release := make(chan struct{}), make(chan struct{})
@@ -49,7 +217,7 @@ func TestParentFlightKeyDoesNotAliasObjectGeneration(t *testing.T) {
 	}
 	leader := make(chan error, 1)
 	go func() {
-		_, _, _, err := r.sharedParent(ctx, x, 1, func(ctx context.Context) ([]byte, cache.Outcome, error) {
+		_, _, _, leave, err := r.sharedParent(ctx, x, 1, func(ctx context.Context) ([]byte, cache.Outcome, error) {
 			close(entered)
 			select {
 			case <-release:
@@ -58,6 +226,9 @@ func TestParentFlightKeyDoesNotAliasObjectGeneration(t *testing.T) {
 				return nil, cache.Load, ctx.Err()
 			}
 		})
+		if err == nil {
+			leave()
+		}
 		leader <- err
 	}()
 	select {
@@ -72,9 +243,12 @@ func TestParentFlightKeyDoesNotAliasObjectGeneration(t *testing.T) {
 	}
 	follower := make(chan error, 1)
 	go func() {
-		b, _, _, err := r.sharedParent(ctx, x, 0, func(context.Context) ([]byte, cache.Outcome, error) {
+		b, _, _, leave, err := r.sharedParent(ctx, x, 0, func(context.Context) ([]byte, cache.Outcome, error) {
 			return []byte("TWO"), cache.Load, nil
 		})
+		if err == nil {
+			defer leave()
+		}
 		if err == nil && string(b) != "TWO" {
 			err = fmt.Errorf("object %q at generation 0 read %q, want TWO", x.Object, b)
 		}
@@ -443,7 +617,7 @@ func TestSharedParentOutlivesItsLeader(t *testing.T) {
 // per-request budget); a follower retries once for itself, and the leader
 // keeps its error.
 func TestSharedParentFollowerRetriesTheLeadersError(t *testing.T) {
-	var r Reader
+	r := newReader(t, nil, nil, Config{})
 	joined := make(chan struct{}, 4)
 	r.joined = func() {
 		select {
@@ -456,20 +630,26 @@ func TestSharedParentFollowerRetriesTheLeadersError(t *testing.T) {
 	own := errors.New("the leader's own budget")
 	leader := make(chan error, 1)
 	go func() {
-		_, _, _, err := r.sharedParent(t.Context(), x, 0, func(context.Context) ([]byte, cache.Outcome, error) {
+		_, _, _, leave, err := r.sharedParent(t.Context(), x, 0, func(context.Context) ([]byte, cache.Outcome, error) {
 			close(started)
 			<-release
 			return nil, cache.Load, own
 		})
+		if err == nil {
+			leave()
+		}
 		leader <- err
 	}()
 	await(t, started, "leader read")
 	await(t, joined, "leader join")
 	follower := make(chan error, 1)
 	go func() {
-		data, _, _, err := r.sharedParent(t.Context(), x, 0, func(context.Context) ([]byte, cache.Outcome, error) {
+		data, _, _, leave, err := r.sharedParent(t.Context(), x, 0, func(context.Context) ([]byte, cache.Outcome, error) {
 			return []byte("data"), cache.Load, nil
 		})
+		if err == nil {
+			defer leave()
+		}
 		if err == nil && string(data) != "data" {
 			err = fmt.Errorf("follower read %q", data)
 		}

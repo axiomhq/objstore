@@ -3,20 +3,20 @@ package lease
 import (
 	"bytes"
 	"context"
+	"crypto/sha256"
 	"encoding/json"
 	"errors"
 	"fmt"
 	"log/slog"
-	"os"
-	"runtime"
+	"slices"
 	"strings"
 	"sync"
 	"sync/atomic"
 	"testing"
+	"testing/synctest"
 	"time"
 
 	"github.com/axiomhq/objstore"
-	"github.com/axiomhq/objstore/fs"
 
 	"github.com/axiomhq/objstore/storetest"
 	"github.com/axiomhq/objstore/storetest/bucket"
@@ -24,10 +24,31 @@ import (
 
 func TestLease(t *testing.T) {
 	ctx := context.Background()
-	ttl := testTTL(300 * time.Millisecond)
+	const ttl = 300 * time.Millisecond
 
-	t.Run("AcquireRenewExpireTakeover", func(t *testing.T) {
-		s := bucket.New(t)
+	runUnit(t, "LocalExpiry", func(t *testing.T) {
+		l := New(newMemStore(), "expiry/lease", "owner", ttl)
+		if err := l.Take(ctx); err != nil {
+			t.Fatal(err)
+		}
+		defer l.Release(ctx)
+		start := time.Now()
+		// Go 1.26 omits monotonic fields in bubbles; Before uses the fake wall clock.
+		time.Sleep(ttl - time.Nanosecond)
+		if err := l.Valid(); err != nil {
+			t.Fatalf("lease expired before its deadline: %v", err)
+		}
+		time.Sleep(time.Nanosecond)
+		if elapsed := time.Since(start); elapsed != ttl {
+			t.Fatalf("elapsed = %v, want %v", elapsed, ttl)
+		}
+		if err := l.Valid(); !errors.Is(err, ErrNotOwner) {
+			t.Fatalf("lease valid at its deadline: %v", err)
+		}
+	})
+
+	runUnit(t, "AcquireRenewExpireTakeover", func(t *testing.T) {
+		s := newMemStore()
 		// First acquire: PutIfAbsent, nothing there yet.
 		a, err := Acquire(ctx, s, "a/lease", "owner-a", ttl)
 		if err != nil {
@@ -43,6 +64,7 @@ func TestLease(t *testing.T) {
 			t.Fatalf("second acquire against a live lease: %v, want ErrNotOwner", err)
 		}
 		time.Sleep(2 * ttl)
+		synctest.Wait()
 		if err := a.Valid(); err != nil {
 			t.Fatalf("lease lapsed despite renewal: %v", err)
 		}
@@ -72,8 +94,8 @@ func TestLease(t *testing.T) {
 	// Ambiguous CAS: the PUT lands and the answer is lost. The nonce
 	// read-back is what turns that into a held lease instead of a spurious
 	// ErrNotOwner.
-	t.Run("AmbiguousTakeover", func(t *testing.T) {
-		s, f := bucket.NewFaulty(t)
+	runUnit(t, "AmbiguousTakeover", func(t *testing.T) {
+		s, f := storetest.Faulty(t, newMemStore())
 		b, err := Acquire(ctx, s, "amb/lease", "owner-b", ttl)
 		if err != nil {
 			t.Fatal(err)
@@ -92,8 +114,8 @@ func TestLease(t *testing.T) {
 		c.Release(ctx)
 	})
 
-	t.Run("AmbiguousFirstAcquire", func(t *testing.T) {
-		s, f := bucket.NewFaulty(t)
+	runUnit(t, "AmbiguousFirstAcquire", func(t *testing.T) {
+		s, f := storetest.Faulty(t, newMemStore())
 		f.Set(storetest.Plan{Op: storetest.OpPutIfAbsent, N: 1, Mode: storetest.Ambiguous, Key: "fresh/lease"})
 		fr, err := Acquire(ctx, s, "fresh/lease", "owner-a", ttl)
 		if f.Fired() != 1 {
@@ -108,8 +130,8 @@ func TestLease(t *testing.T) {
 
 	// The fence, from the renewal side: a lease stolen while its owner is
 	// renewing must fence that owner on its next renewal.
-	t.Run("StolenFences", func(t *testing.T) {
-		s := bucket.New(t)
+	runUnit(t, "StolenFences", func(t *testing.T) {
+		s := newMemStore()
 		var logs lockedBuffer
 		fenced := make(chan struct{})
 		d, err := Acquire(ctx, s, "b/lease", "owner-d", ttl)
@@ -140,8 +162,8 @@ func TestLease(t *testing.T) {
 		}
 	})
 
-	t.Run("RenewalAttributesALateLandingWrite", func(t *testing.T) {
-		s := bucket.New(t)
+	runUnit(t, "RenewalAttributesALateLandingWrite", func(t *testing.T) {
+		s := newMemStore()
 		ttl := 2 * time.Second
 		l := New(s, "a/lease", "owner-a", ttl)
 		if err := l.Take(ctx); err != nil {
@@ -174,8 +196,8 @@ func TestLease(t *testing.T) {
 	// The first acquisition landed but both its answer and the
 	// read-back were lost. A retried Take must adopt our own record, not
 	// wait 1.5 TTL for it as if somebody else held it.
-	t.Run("RetriedTakeAfterUnresolvedAcquire", func(t *testing.T) {
-		ls := &lossy{Store: bucket.New(t)}
+	runUnit(t, "RetriedTakeAfterUnresolvedAcquire", func(t *testing.T) {
+		ls := &lossy{Store: newMemStore()}
 		ls.loseNextPut()
 		l := New(ls, "retry/lease", "owner-a", time.Minute)
 		if err := l.Take(ctx); err == nil || errors.Is(err, ErrNotOwner) {
@@ -193,10 +215,10 @@ func TestLease(t *testing.T) {
 		}
 	})
 
-	t.Run("TakeoverHonorsClockSkewMargin", func(t *testing.T) {
+	runUnit(t, "TakeoverHonorsClockSkewMargin", func(t *testing.T) {
 		ctx, cancel := context.WithTimeout(t.Context(), 10*time.Second)
 		defer cancel()
-		s := bucket.New(t)
+		s := newMemStore()
 		const ttl = time.Minute
 		// Drive the holder by hand: Retire would invalidate it, not merely
 		// freeze renewal while the test changes the two clock readings.
@@ -231,8 +253,8 @@ func TestLease(t *testing.T) {
 
 	// A lease driven by Take has no renewer; Retire and Release must
 	// still end it instead of waiting forever on done.
-	t.Run("NewTakeRelease", func(t *testing.T) {
-		s := bucket.New(t)
+	runUnit(t, "NewTakeRelease", func(t *testing.T) {
+		s := newMemStore()
 		l := New(s, "take/lease", "owner-a", time.Minute)
 		if err := l.Take(ctx); err != nil {
 			t.Fatal(err)
@@ -261,8 +283,8 @@ func TestLease(t *testing.T) {
 		l.Retire() // idempotent
 	})
 
-	t.Run("AcquireTwice", func(t *testing.T) {
-		s := bucket.New(t)
+	runUnit(t, "AcquireTwice", func(t *testing.T) {
+		s := newMemStore()
 		l := New(s, "twice/lease", "owner-a", time.Minute)
 		if err := l.Acquire(ctx); err != nil {
 			t.Fatal(err)
@@ -285,8 +307,8 @@ func TestLease(t *testing.T) {
 		}
 	})
 
-	t.Run("ReleaseHonorsContext", func(t *testing.T) {
-		s := bucket.New(t)
+	runUnit(t, "ReleaseHonorsContext", func(t *testing.T) {
+		s := newMemStore()
 		l, err := Acquire(ctx, s, "ctx/lease", "owner-a", time.Minute)
 		if err != nil {
 			t.Fatal(err)
@@ -317,10 +339,10 @@ func TestLease(t *testing.T) {
 // any other error leaves a lease whose CAS succeeded alone.
 func TestCheckHeadOnRenewal(t *testing.T) {
 	ctx := context.Background()
-	ttl := testTTL(200 * time.Millisecond)
+	const ttl = 200 * time.Millisecond
 
-	t.Run("NotCalledOnInitialTake", func(t *testing.T) {
-		s := bucket.New(t)
+	runUnit(t, "NotCalledOnInitialTake", func(t *testing.T) {
+		s := newMemStore()
 		l := New(s, "probe/initial", "owner", time.Minute)
 		calls := 0
 		l.CheckHeadOnRenewal(func(context.Context) error { calls++; return nil })
@@ -338,8 +360,8 @@ func TestCheckHeadOnRenewal(t *testing.T) {
 		l.Release(ctx)
 	})
 
-	t.Run("NotOwnerFences", func(t *testing.T) {
-		s := bucket.New(t)
+	runUnit(t, "NotOwnerFences", func(t *testing.T) {
+		s := newMemStore()
 		l, err := Acquire(ctx, s, "probe/fence", "owner", ttl)
 		if err != nil {
 			t.Fatal(err)
@@ -355,8 +377,8 @@ func TestCheckHeadOnRenewal(t *testing.T) {
 		l.Release(ctx)
 	})
 
-	t.Run("OtherErrorDoesNotFence", func(t *testing.T) {
-		s := bucket.New(t)
+	runUnit(t, "OtherErrorDoesNotFence", func(t *testing.T) {
+		s := newMemStore()
 		l, err := Acquire(ctx, s, "probe/soft", "owner", ttl)
 		if err != nil {
 			t.Fatal(err)
@@ -392,29 +414,56 @@ func TestCheckHeadOnRenewal(t *testing.T) {
 // TestSetLoggerRace: SetLogger while the renewer logs. -race is the
 // assertion.
 func TestSetLoggerRace(t *testing.T) {
-	ctx := context.Background()
-	s, f := bucket.NewFaulty(t)
-	ttl := testTTL(100 * time.Millisecond)
-	l, err := Acquire(ctx, s, "log/lease", "owner", ttl)
-	if err != nil {
-		t.Fatal(err)
-	}
-	// Every renewal fails, so the renewer logs on every tick until it fences.
-	f.SetShape(storetest.Shape{ErrorRate: 1})
-	var logs lockedBuffer
-	for range 50 {
-		l.SetLogger(slog.New(slog.NewTextHandler(&logs, nil)))
-		time.Sleep(ttl / 20)
-	}
-	// No Start: the fence owes Start its callback, so only the renewer's
-	// exit is awaited here, and Done after the Release gives it up.
-	await(t, l.done, "renewer exit after failing renewals")
-	f.SetShape(storetest.Shape{})
-	if !strings.Contains(logs.String(), "lease renewal failed") {
-		t.Fatalf("no renewal failure logged:\n%s", logs.String())
-	}
-	l.Release(ctx)
-	await(t, l.Done(), "Done after Release")
+	synctest.Test(t, func(t *testing.T) {
+		ctx := context.Background()
+		s, f := storetest.Faulty(t, newMemStore())
+		const ttl = 100 * time.Millisecond
+		l, err := Acquire(ctx, s, "log/lease", "owner", ttl)
+		if err != nil {
+			t.Fatal(err)
+		}
+		// Every renewal fails, so the renewer logs on every tick until it fences.
+		f.SetShape(storetest.Shape{ErrorRate: 1})
+		var logs lockedBuffer
+		entered, resume := make(chan struct{}), make(chan struct{})
+		l.SetLogger(slog.New(slog.NewTextHandler(&pausedLog{logs: &logs, entered: entered, resume: resume}, nil)))
+		await(t, entered, "renewal logging")
+		// Race the renewer's lookup too: the handler's entry alone orders its first lookup.
+		lookedUp := make(chan struct{})
+		go func() {
+			for range 50 {
+				_ = l.logger()
+			}
+			close(lookedUp)
+		}()
+		// Replace the logger while the old handler is still writing, not between ticks.
+		for range 50 {
+			l.SetLogger(slog.New(slog.NewTextHandler(&logs, nil)))
+		}
+		await(t, lookedUp, "concurrent logger lookup")
+		close(resume)
+		// No Start: the fence owes Start its callback, so only the renewer's
+		// exit is awaited here, and Done after the Release gives it up.
+		await(t, l.done, "renewer exit after failing renewals")
+		f.SetShape(storetest.Shape{})
+		if !strings.Contains(logs.String(), "lease renewal failed") {
+			t.Fatalf("no renewal failure logged:\n%s", logs.String())
+		}
+		l.Release(ctx)
+		await(t, l.Done(), "Done after Release")
+	})
+}
+
+type pausedLog struct {
+	logs    *lockedBuffer
+	entered chan struct{}
+	resume  chan struct{}
+}
+
+func (w *pausedLog) Write(p []byte) (int, error) {
+	close(w.entered)
+	<-w.resume
+	return w.logs.Write(p)
 }
 
 // plant CASes body in at key over whatever is there.
@@ -494,74 +543,94 @@ func (b *lockedBuffer) String() string {
 // handover still lands on the renewal's nonce, so the next holder takes
 // over at once.
 func TestReleaseDuringRenewal(t *testing.T) {
-	ctx := context.Background()
-	const ttl = 2 * time.Second // renew every 500ms, 1s per attempt
-	s, f := bucket.NewFaulty(t)
-	l, err := Acquire(ctx, s, "rel/lease", "owner-a", ttl)
-	if err != nil {
-		t.Fatal(err)
-	}
-	var logs lockedBuffer
-	l.SetLogger(slog.New(slog.NewTextHandler(&logs, nil)))
-	var fenced atomic.Bool
-	l.Start(func() { fenced.Store(true) })
-	f.Set(storetest.Plan{Op: storetest.OpPutIfMatch, N: 1, Mode: storetest.Pause, Key: "rel/lease"})
-	waitFor(t, func() bool { return f.Fired() == 1 })
-	released := make(chan struct{})
-	go func() { l.Release(ctx); close(released) }()
-	waitFor(t, l.stopped)
-	f.Resume()
-	await(t, released, "Release")
-	await(t, l.Done(), "Done after Release") // a callback would have returned by now
-	if fenced.Load() || strings.Contains(logs.String(), "lease fenced") {
-		t.Fatalf("Release fenced the lease: callback=%v logs:\n%s", fenced.Load(), logs.String())
-	}
-	if err := l.Valid(); !errors.Is(err, ErrNotOwner) || !strings.Contains(err.Error(), "released") {
-		t.Fatalf("released lease: %v", err)
-	}
-	if cur, _, err := Load(ctx, s, "rel/lease"); err != nil || !cur.Expiry.IsZero() {
-		t.Fatalf("handover skipped after a renewal landed: %+v %v\n%s", cur, err, logs.String())
-	}
-	b, err := Acquire(ctx, s, "rel/lease", "owner-b", ttl)
-	if err != nil {
-		t.Fatalf("next holder could not take over at once: %v", err)
-	}
-	b.Release(ctx)
+	synctest.Test(t, func(t *testing.T) {
+		ctx := context.Background()
+		const ttl = 2 * time.Second // renew every 500ms, 1s per attempt
+		base := newMemStore()
+		entered, resume := make(chan struct{}), make(chan struct{})
+		s := &stubStore{Store: base, match: func(ctx context.Context, key string, data []byte, etag string) (bool, error) {
+			// A renewal already dispatched can land even after cancellation.
+			close(entered)
+			<-resume
+			return base.PutIfMatch(context.WithoutCancel(ctx), key, data, etag)
+		}}
+		l, err := Acquire(ctx, s, "rel/lease", "owner-a", ttl)
+		if err != nil {
+			t.Fatal(err)
+		}
+		var logs lockedBuffer
+		l.SetLogger(slog.New(slog.NewTextHandler(&logs, nil)))
+		var fenced atomic.Bool
+		l.Start(func() { fenced.Store(true) })
+		await(t, entered, "renewal PUT")
+		released := make(chan struct{})
+		go func() { l.Release(ctx); close(released) }()
+		await(t, l.stop, "Release retirement")
+		synctest.Wait()
+		// The renewer is paused; the handover must use the normal store.
+		s.match = nil
+		close(resume)
+		await(t, released, "Release")
+		await(t, l.Done(), "Done after Release") // a callback would have returned by now
+		if fenced.Load() || strings.Contains(logs.String(), "lease fenced") {
+			t.Fatalf("Release fenced the lease: callback=%v logs:\n%s", fenced.Load(), logs.String())
+		}
+		if err := l.Valid(); !errors.Is(err, ErrNotOwner) || !strings.Contains(err.Error(), "released") {
+			t.Fatalf("released lease: %v", err)
+		}
+		if cur, _, err := Load(ctx, s, "rel/lease"); err != nil || !cur.Expiry.IsZero() {
+			t.Fatalf("handover skipped after a renewal landed: %+v %v\n%s", cur, err, logs.String())
+		}
+		b, err := Acquire(ctx, s, "rel/lease", "owner-b", ttl)
+		if err != nil {
+			t.Fatalf("next holder could not take over at once: %v", err)
+		}
+		b.Release(ctx)
+	})
 }
 
 // TestReleaseDuringFirstAcquire: A Release racing the first
 // acquisition makes Acquire fail, not succeed on a retired handle, and
 // still hands the landed write back.
 func TestReleaseDuringFirstAcquire(t *testing.T) {
-	ctx := context.Background()
-	s, f := bucket.NewFaulty(t)
-	l := New(s, "rel/first", "owner-a", time.Minute)
-	f.Set(storetest.Plan{Op: storetest.OpPutIfAbsent, N: 1, Mode: storetest.Pause, Key: "rel/first"})
-	acquired := make(chan error, 1)
-	go func() { acquired <- l.Acquire(ctx) }()
-	waitFor(t, func() bool { return f.Fired() == 1 })
-	released := make(chan struct{})
-	go func() { l.Release(ctx); close(released) }()
-	waitFor(t, l.stopped)
-	f.Resume()
-	if err := await(t, acquired, "Acquire"); !errors.Is(err, ErrNotOwner) {
-		t.Fatalf("Acquire racing Release: %v, want ErrNotOwner", err)
-	}
-	await(t, released, "Release")
-	if err := l.Valid(); !errors.Is(err, ErrNotOwner) {
-		t.Fatalf("released lease still valid: %v", err)
-	}
-	if cur, _, err := Load(ctx, s, "rel/first"); err != nil || !cur.Expiry.IsZero() {
-		t.Fatalf("handover skipped: %+v %v", cur, err)
-	}
+	synctest.Test(t, func(t *testing.T) {
+		ctx := context.Background()
+		base := newMemStore()
+		entered, resume := make(chan struct{}), make(chan struct{})
+		s := &stubStore{Store: base, absent: func(ctx context.Context, key string, data []byte) (bool, error) {
+			close(entered)
+			<-resume
+			return base.PutIfAbsent(context.WithoutCancel(ctx), key, data)
+		}}
+		l := New(s, "rel/first", "owner-a", time.Minute)
+		acquired := make(chan error, 1)
+		go func() { acquired <- l.Acquire(ctx) }()
+		await(t, entered, "acquisition PUT")
+		released := make(chan struct{})
+		go func() { l.Release(ctx); close(released) }()
+		await(t, l.stop, "Release retirement")
+		close(resume)
+		if err := await(t, acquired, "Acquire"); !errors.Is(err, ErrNotOwner) {
+			t.Fatalf("Acquire racing Release: %v, want ErrNotOwner", err)
+		}
+		await(t, released, "Release")
+		if err := l.Valid(); !errors.Is(err, ErrNotOwner) {
+			t.Fatalf("released lease still valid: %v", err)
+		}
+		if cur, _, err := Load(ctx, s, "rel/first"); err != nil || !cur.Expiry.IsZero() {
+			t.Fatalf("handover skipped: %+v %v", cur, err)
+		}
+	})
 }
 
 func TestTakeAfterRetire(t *testing.T) {
-	l := New(bucket.New(t), "retired/lease", "owner-a", time.Minute)
-	l.Retire()
-	if err := l.Take(context.Background()); !errors.Is(err, ErrNotOwner) {
-		t.Fatalf("Take on a retired lease: %v", err)
-	}
+	synctest.Test(t, func(t *testing.T) {
+		l := New(newMemStore(), "retired/lease", "owner-a", time.Minute)
+		l.Retire()
+		if err := l.Take(context.Background()); !errors.Is(err, ErrNotOwner) {
+			t.Fatalf("Take on a retired lease: %v", err)
+		}
+	})
 }
 
 // await receives from ch, failing the test after 10s.
@@ -579,169 +648,220 @@ func await[T any](t *testing.T, ch <-chan T, what string) T {
 // TestFenceCallbackDone: Done waits for a running fence callback;
 // Release does not.
 func TestFenceCallbackDone(t *testing.T) {
-	ctx := context.Background()
-	const ttl = 200 * time.Millisecond
-	s := bucket.New(t)
-	l, err := Acquire(ctx, s, "fence/slow", "owner-a", ttl)
-	if err != nil {
-		t.Fatal(err)
-	}
-	entered, unblock := make(chan struct{}), make(chan struct{})
-	l.Start(func() { close(entered); <-unblock })
-	if err := Steal(ctx, s, "fence/slow", "owner-b", ttl); err != nil {
-		t.Fatal(err)
-	}
-	await(t, entered, "fence callback")
-	released := make(chan struct{})
-	go func() { l.Release(ctx); close(released) }()
-	await(t, released, "Release while the callback runs")
-	select {
-	case <-l.Done():
-		t.Fatal("Done closed while the fence callback was still running")
-	case <-time.After(20 * time.Millisecond):
-	}
-	close(unblock)
-	await(t, l.Done(), "Done after the callback returned")
-	l.Fence() // after Done: no callback, no panic
+	synctest.Test(t, func(t *testing.T) {
+		ctx := context.Background()
+		const ttl = 200 * time.Millisecond
+		s := newMemStore()
+		l, err := Acquire(ctx, s, "fence/slow", "owner-a", ttl)
+		if err != nil {
+			t.Fatal(err)
+		}
+		entered, unblock := make(chan struct{}), make(chan struct{})
+		l.Start(func() { close(entered); <-unblock })
+		if err := Steal(ctx, s, "fence/slow", "owner-b", ttl); err != nil {
+			t.Fatal(err)
+		}
+		await(t, entered, "fence callback")
+		released := make(chan struct{})
+		go func() { l.Release(ctx); close(released) }()
+		await(t, released, "Release while the callback runs")
+		synctest.Wait()
+		select {
+		case <-l.Done():
+			t.Fatal("Done closed while the fence callback was still running")
+		default:
+		}
+		close(unblock)
+		await(t, l.Done(), "Done after the callback returned")
+		l.Fence() // after Done: no callback, no panic
+	})
 }
 
 // TestDoneCoversStartCallback: the renewer fences and exits before Start;
 // Start runs the callback itself, and Done waits for it to return.
 func TestDoneCoversStartCallback(t *testing.T) {
-	ctx := context.Background()
-	const ttl = 200 * time.Millisecond
-	s := bucket.New(t)
-	l, err := Acquire(ctx, s, "fence/early", "owner-a", ttl)
-	if err != nil {
-		t.Fatal(err)
-	}
-	if err := Steal(ctx, s, "fence/early", "owner-b", ttl); err != nil {
-		t.Fatal(err)
-	}
-	await(t, l.done, "renewer exit after the steal")
-	select {
-	case <-l.Done():
-		t.Fatal("Done closed with the fence callback still owed to Start")
-	case <-time.After(20 * time.Millisecond):
-	}
-	entered, unblock, returned := make(chan struct{}), make(chan struct{}), make(chan struct{})
-	go func() {
-		l.Start(func() { close(entered); <-unblock })
-		close(returned)
-	}()
-	await(t, entered, "Start's own callback")
-	select {
-	case <-l.Done():
-		t.Fatal("Done closed while Start's callback was still running")
-	case <-time.After(20 * time.Millisecond):
-	}
-	close(unblock)
-	await(t, returned, "Start")
-	await(t, l.Done(), "Done after Start's callback returned")
+	synctest.Test(t, func(t *testing.T) {
+		ctx := context.Background()
+		const ttl = 200 * time.Millisecond
+		s := newMemStore()
+		l, err := Acquire(ctx, s, "fence/early", "owner-a", ttl)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if err := Steal(ctx, s, "fence/early", "owner-b", ttl); err != nil {
+			t.Fatal(err)
+		}
+		await(t, l.done, "renewer exit after the steal")
+		synctest.Wait()
+		select {
+		case <-l.Done():
+			t.Fatal("Done closed with the fence callback still owed to Start")
+		default:
+		}
+		entered, unblock, returned := make(chan struct{}), make(chan struct{}), make(chan struct{})
+		go func() {
+			l.Start(func() { close(entered); <-unblock })
+			close(returned)
+		}()
+		await(t, entered, "Start's own callback")
+		synctest.Wait()
+		select {
+		case <-l.Done():
+			t.Fatal("Done closed while Start's callback was still running")
+		default:
+		}
+		close(unblock)
+		await(t, returned, "Start")
+		await(t, l.Done(), "Done after Start's callback returned")
+	})
 }
 
 // TestReleaseGivesUpOwedCallback: fenced before Start, then released:
 // Done closes, and a late Start runs nothing.
 func TestReleaseGivesUpOwedCallback(t *testing.T) {
-	ctx := context.Background()
-	l := New(bucket.New(t), "fence/owed", "owner-a", time.Minute)
-	if err := l.Take(ctx); err != nil {
-		t.Fatal(err)
-	}
-	l.Fence()
-	select {
-	case <-l.Done():
-		t.Fatal("Done closed with the fence callback still owed to Start")
-	default:
-	}
-	l.Release(ctx)
-	await(t, l.Done(), "Done after Release")
-	l.Start(func() { t.Error("Start ran a callback Release gave up") })
+	synctest.Test(t, func(t *testing.T) {
+		ctx := context.Background()
+		l := New(newMemStore(), "fence/owed", "owner-a", time.Minute)
+		if err := l.Take(ctx); err != nil {
+			t.Fatal(err)
+		}
+		l.Fence()
+		select {
+		case <-l.Done():
+			t.Fatal("Done closed with the fence callback still owed to Start")
+		default:
+		}
+		l.Release(ctx)
+		await(t, l.Done(), "Done after Release")
+		l.Start(func() { t.Error("Start ran a callback Release gave up") })
+	})
 }
 
 // TestFenceAfterRelease: a Fence on a released lease runs no callback.
 func TestFenceAfterRelease(t *testing.T) {
-	ctx := context.Background()
-	l := New(bucket.New(t), "fence/released", "owner-a", time.Minute)
-	if err := l.Take(ctx); err != nil {
-		t.Fatal(err)
-	}
-	l.Start(func() { t.Error("a Fence after Release ran the callback") })
-	if !l.join() { // stands in for a running callback: keeps Done open
-		t.Fatal("join on a live lease")
-	}
-	l.Release(ctx)
-	l.Fence()
-	l.leave()
-	await(t, l.Done(), "Done after Release") // a callback would have returned by now
+	synctest.Test(t, func(t *testing.T) {
+		ctx := context.Background()
+		l := New(newMemStore(), "fence/released", "owner-a", time.Minute)
+		if err := l.Take(ctx); err != nil {
+			t.Fatal(err)
+		}
+		l.Start(func() { t.Error("a Fence after Release ran the callback") })
+		if !l.join() { // stands in for a running callback: keeps Done open
+			t.Fatal("join on a live lease")
+		}
+		l.Release(ctx)
+		l.Fence()
+		l.leave()
+		await(t, l.Done(), "Done after Release") // a callback would have returned by now
+	})
 }
 
 // TestReleaseAfterUnresolvedAcquire: The first write landed but its
 // answer and read-back were lost; Release still hands it back.
 func TestReleaseAfterUnresolvedAcquire(t *testing.T) {
-	ctx := context.Background()
-	ls := &lossy{Store: bucket.New(t)}
-	ls.loseNextPut()
-	l := New(ls, "unres/lease", "owner-a", time.Minute)
-	if err := l.Take(ctx); err == nil || errors.Is(err, ErrNotOwner) {
-		t.Fatalf("first Take: %v, want an unresolved outcome", err)
-	}
-	l.Release(ctx)
-	if cur, _, err := Load(ctx, ls, "unres/lease"); err != nil || !cur.Expiry.IsZero() {
-		t.Fatalf("release did not hand back the unresolved write: %+v %v", cur, err)
-	}
+	synctest.Test(t, func(t *testing.T) {
+		ctx := context.Background()
+		ls := &lossy{Store: newMemStore()}
+		ls.loseNextPut()
+		l := New(ls, "unres/lease", "owner-a", time.Minute)
+		if err := l.Take(ctx); err == nil || errors.Is(err, ErrNotOwner) {
+			t.Fatalf("first Take: %v, want an unresolved outcome", err)
+		}
+		l.Release(ctx)
+		if cur, _, err := Load(ctx, ls, "unres/lease"); err != nil || !cur.Expiry.IsZero() {
+			t.Fatalf("release did not hand back the unresolved write: %+v %v", cur, err)
+		}
+	})
 }
 
 // TestReleasePrefersDone: With the renewer already gone, a dead ctx
 // is a failed handover, not "renewal still finishing".
 func TestReleasePrefersDone(t *testing.T) {
-	ctx := context.Background()
-	l := New(bucket.New(t), "done/lease", "owner-a", time.Minute)
-	if err := l.Take(ctx); err != nil {
-		t.Fatal(err)
-	}
-	var logs lockedBuffer
-	l.SetLogger(slog.New(slog.NewTextHandler(&logs, nil)))
-	dead, cancel := context.WithCancel(ctx)
-	cancel()
-	for range 20 {
-		l.Release(dead)
-	}
-	if strings.Contains(logs.String(), "still finishing") {
-		t.Fatalf("Release picked ctx over a closed done:\n%s", logs.String())
-	}
+	synctest.Test(t, func(t *testing.T) {
+		ctx := context.Background()
+		l := New(newMemStore(), "done/lease", "owner-a", time.Minute)
+		if err := l.Take(ctx); err != nil {
+			t.Fatal(err)
+		}
+		var logs lockedBuffer
+		l.SetLogger(slog.New(slog.NewTextHandler(&logs, nil)))
+		dead, cancel := context.WithCancel(ctx)
+		cancel()
+		for range 20 {
+			l.Release(dead)
+		}
+		if strings.Contains(logs.String(), "still finishing") {
+			t.Fatalf("Release picked ctx over a closed done:\n%s", logs.String())
+		}
+	})
 }
 
 func TestStealAfterRetire(t *testing.T) {
-	l := New(bucket.New(t), "steal/retired", "owner-a", time.Minute)
-	l.Retire()
-	if err := l.Steal(context.Background()); !errors.Is(err, ErrNotOwner) {
-		t.Fatalf("Steal on a retired lease: %v", err)
-	}
-}
-
-// waitFor polls cond for up to 10s.
-func waitFor(t *testing.T, cond func() bool) {
-	t.Helper()
-	for deadline := time.Now().Add(10 * time.Second); !cond(); time.Sleep(time.Millisecond) {
-		if time.Now().After(deadline) {
-			t.Fatal("condition never held")
+	synctest.Test(t, func(t *testing.T) {
+		l := New(newMemStore(), "steal/retired", "owner-a", time.Minute)
+		l.Retire()
+		if err := l.Steal(context.Background()); !errors.Is(err, ErrNotOwner) {
+			t.Fatalf("Steal on a retired lease: %v", err)
 		}
-	}
+	})
 }
 
-// testTTL is base on the file backend and 2 s on a real S3 endpoint: every
-// wait in these tests is a multiple of the TTL, and a renewal gets TTL/2
-// per attempt, which must clear the store's tail latency (a dev MinIO's
-// p99 small PUT was 144 ms, its max 1.5 s).
-func testTTL(base time.Duration) time.Duration {
-	if os.Getenv("OBJSTORE_TEST_S3") != "" || runtime.GOOS == "darwin" {
-		// A real S3 endpoint, and the macOS runner's fsync, both have tail
-		// latencies that a renewal at base/4 with base/2 to spare cannot
-		// clear.
-		return 2 * time.Second
+func runUnit(t *testing.T, name string, f func(*testing.T)) {
+	t.Helper()
+	t.Run(name, func(t *testing.T) { synctest.Test(t, f) })
+}
+
+// memStore implements only the lease operations; no flock or external I/O in a bubble.
+type memStore struct {
+	objstore.Backend
+	mu      sync.Mutex
+	objects map[string][]byte
+}
+
+func newMemStore() *objstore.Store {
+	return objstore.Open(&memStore{objects: make(map[string][]byte)}, objstore.Config{})
+}
+
+func memETag(data []byte) string { return fmt.Sprintf("%x", sha256.Sum256(data)) }
+
+func (s *memStore) GetWithETag(ctx context.Context, key string) ([]byte, string, error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if err := ctx.Err(); err != nil {
+		return nil, "", err
 	}
-	return base
+	data, ok := s.objects[key]
+	if !ok {
+		return nil, "", objstore.ErrNotFound
+	}
+	return slices.Clone(data), memETag(data), nil
+}
+
+func (s *memStore) PutIfAbsent(ctx context.Context, key string, data []byte) (bool, error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if err := ctx.Err(); err != nil {
+		return false, err
+	}
+	if _, ok := s.objects[key]; ok {
+		return false, nil
+	}
+	s.objects[key] = slices.Clone(data)
+	return true, nil
+}
+
+func (s *memStore) PutIfMatch(ctx context.Context, key string, data []byte, etag string) (bool, error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if err := ctx.Err(); err != nil {
+		return false, err
+	}
+	cur, ok := s.objects[key]
+	if !ok || memETag(cur) != etag {
+		return false, nil
+	}
+	s.objects[key] = slices.Clone(data)
+	return true, nil
 }
 
 // expireStored zeroes l's local deadline and the stored expiry, keeping the
@@ -780,6 +900,54 @@ func TestBeforeRequiresBothClocks(t *testing.T) {
 	}
 }
 
+// Real backend coverage: wait for completed renewals, not a guessed sleep.
+func TestBackendRenewalAndFence(t *testing.T) {
+	ctx, cancel := context.WithTimeout(t.Context(), 30*time.Second)
+	defer cancel()
+	s := bucket.New(t)
+	const ttl = 4 * time.Second // Leave room for S3 and fsync tail latency.
+	l, err := Acquire(ctx, s, "backend/lease", "owner-a", ttl)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer l.Release(ctx)
+	initial, _, err := Load(ctx, s, l.Key())
+	if err != nil {
+		t.Fatal(err)
+	}
+	renewed, fenced := make(chan struct{}), make(chan struct{})
+	var once sync.Once
+	l.CheckHeadOnRenewal(func(context.Context) error { once.Do(func() { close(renewed) }); return nil })
+	l.Start(func() { close(fenced) })
+	receiveWithin(t, ctx, renewed, "backend renewal")
+	cur, _, err := Load(ctx, s, l.Key())
+	if err != nil || cur.Nonce == initial.Nonce || !cur.Expiry.After(initial.Expiry) {
+		t.Fatalf("renewal did not advance the stored lease: initial=%+v current=%+v err=%v", initial, cur, err)
+	}
+	if err := l.Valid(); err != nil {
+		t.Fatalf("renewed backend lease invalid: %v", err)
+	}
+	if other, err := Acquire(ctx, s, l.Key(), "owner-b", ttl); !errors.Is(err, ErrNotOwner) {
+		if other != nil {
+			other.Release(ctx)
+		}
+		t.Fatalf("takeover of renewed backend lease: %v, want ErrNotOwner", err)
+	}
+	if err := Steal(ctx, s, l.Key(), "owner-b", ttl); err != nil {
+		t.Fatal(err)
+	}
+	receiveWithin(t, ctx, fenced, "backend fence")
+	receiveWithin(t, ctx, l.Done(), "backend Done")
+	if err := l.Valid(); !errors.Is(err, ErrNotOwner) {
+		t.Fatalf("stolen backend lease still valid: %v", err)
+	}
+	l.Release(ctx)
+	if cur, _, err := Load(ctx, s, l.Key()); err != nil || cur.Owner != "owner-b" {
+		t.Fatalf("fenced release clobbered backend owner: %+v %v", cur, err)
+	}
+}
+
+// The following backend tests exercise real conditional writes with roomy TTLs.
 func TestReleaseIsImmediateHandover(t *testing.T) {
 	ctx := context.Background()
 	s := bucket.New(t)
@@ -819,57 +987,67 @@ func TestAcquireCannotReplaceLiveSameOwner(t *testing.T) {
 }
 
 func TestRenewalCannotReacquireAfterPausedRead(t *testing.T) {
-	ctx := context.Background()
-	s, fault := bucket.NewFaulty(t)
-	// A handle with no renewer, so the test drives Take by hand.
-	a := New(s, "gap/lease", "first", time.Minute)
-	if err := a.Take(ctx); err != nil {
-		t.Fatal(err)
-	}
-	defer a.Release(context.Background())
-	fault.Set(storetest.Plan{Op: storetest.OpGet, Key: a.Key(), N: 1, Mode: storetest.Pause})
-	defer fault.Resume()
-	done := make(chan error, 1)
-	go func() { done <- a.Take(ctx) }()
-	waitFor(t, func() bool { return fault.Fired() > 0 })
-	expireStored(t, a)
-	b, err := Acquire(ctx, s, "gap/lease", "second", time.Minute)
-	if err != nil {
-		t.Fatal(err)
-	}
-	b.Release(context.Background())
-	fault.Resume()
-	if err := <-done; !errors.Is(err, ErrNotOwner) {
-		t.Fatalf("paused renewal reacquired an abandoned handle: %v", err)
-	}
-	if err := a.Valid(); !errors.Is(err, ErrNotOwner) {
-		t.Fatalf("abandoned handle may serve after another owner released: %v", err)
-	}
+	synctest.Test(t, func(t *testing.T) {
+		ctx := context.Background()
+		s, fault := storetest.Faulty(t, newMemStore())
+		// A handle with no renewer, so the test drives Take by hand.
+		a := New(s, "gap/lease", "first", time.Minute)
+		if err := a.Take(ctx); err != nil {
+			t.Fatal(err)
+		}
+		defer a.Release(context.Background())
+		fault.Set(storetest.Plan{Op: storetest.OpGet, Key: a.Key(), N: 1, Mode: storetest.Pause})
+		defer fault.Resume()
+		done := make(chan error, 1)
+		go func() { done <- a.Take(ctx) }()
+		synctest.Wait()
+		if fault.Fired() != 1 {
+			t.Fatal("renewal did not reach the paused read")
+		}
+		expireStored(t, a)
+		b, err := Acquire(ctx, s, "gap/lease", "second", time.Minute)
+		if err != nil {
+			t.Fatal(err)
+		}
+		b.Release(context.Background())
+		fault.Resume()
+		if err := <-done; !errors.Is(err, ErrNotOwner) {
+			t.Fatalf("paused renewal reacquired an abandoned handle: %v", err)
+		}
+		if err := a.Valid(); !errors.Is(err, ErrNotOwner) {
+			t.Fatalf("abandoned handle may serve after another owner released: %v", err)
+		}
+	})
 }
 
 func TestLateRenewalDoesNotExtendAnElapsedInterval(t *testing.T) {
-	ctx := context.Background()
-	s, fault := bucket.NewFaulty(t)
-	a := New(s, "late/lease", "first", time.Minute)
-	if err := a.Take(ctx); err != nil {
-		t.Fatal(err)
-	}
-	defer a.Release(context.Background())
-	fault.Set(storetest.Plan{Op: storetest.OpPutIfMatch, Key: a.Key(), N: 1, Mode: storetest.Pause})
-	defer fault.Resume()
-	done := make(chan error, 1)
-	go func() { done <- a.Take(ctx) }()
-	waitFor(t, func() bool { return fault.Fired() > 0 })
-	// The CAS can land successfully, but cannot retroactively cover the gap
-	// between the old local deadline and the delayed response.
-	a.Expire()
-	fault.Resume()
-	if err := <-done; !errors.Is(err, ErrNotOwner) {
-		t.Fatalf("late CAS revived an expired acquisition: %v", err)
-	}
-	if err := a.Valid(); !errors.Is(err, ErrNotOwner) {
-		t.Fatalf("late renewal made stale state serviceable: %v", err)
-	}
+	synctest.Test(t, func(t *testing.T) {
+		ctx := context.Background()
+		s, fault := storetest.Faulty(t, newMemStore())
+		a := New(s, "late/lease", "first", time.Minute)
+		if err := a.Take(ctx); err != nil {
+			t.Fatal(err)
+		}
+		defer a.Release(context.Background())
+		fault.Set(storetest.Plan{Op: storetest.OpPutIfMatch, Key: a.Key(), N: 1, Mode: storetest.Pause})
+		defer fault.Resume()
+		done := make(chan error, 1)
+		go func() { done <- a.Take(ctx) }()
+		synctest.Wait()
+		if fault.Fired() != 1 {
+			t.Fatal("renewal did not reach the paused CAS")
+		}
+		// The CAS can land successfully, but cannot retroactively cover the gap
+		// between the old local deadline and the delayed response.
+		a.Expire()
+		fault.Resume()
+		if err := <-done; !errors.Is(err, ErrNotOwner) {
+			t.Fatalf("late CAS revived an expired acquisition: %v", err)
+		}
+		if err := a.Valid(); !errors.Is(err, ErrNotOwner) {
+			t.Fatalf("late renewal made stale state serviceable: %v", err)
+		}
+	})
 }
 
 func TestReleaseCannotExpireNewAcquisitionWithSameOwner(t *testing.T) {
@@ -978,17 +1156,6 @@ func boundedContext(t *testing.T) context.Context {
 	return ctx
 }
 
-func fsBucket(t *testing.T, ctx context.Context) *objstore.Store {
-	t.Helper()
-	s := fs.Open(t.TempDir(), "b", objstore.Config{})
-	if err := s.EnsureBucket(ctx); errors.Is(err, errors.ErrUnsupported) {
-		t.Skip(err) // no flock: Windows, Solaris, AIX
-	} else if err != nil {
-		t.Fatal(err)
-	}
-	return s
-}
-
 func receiveWithin[T any](t *testing.T, ctx context.Context, ch <-chan T, what string) T {
 	t.Helper()
 	select {
@@ -1001,10 +1168,10 @@ func receiveWithin[T any](t *testing.T, ctx context.Context, ch <-chan T, what s
 }
 
 func TestWritePreservesPutAndReadErrors(t *testing.T) {
-	ctx := boundedContext(t)
 	putErr, readErr := errors.New("PUT failed"), errors.New("read-back failed")
 	for _, conditional := range []bool{false, true} {
-		t.Run(fmt.Sprint(conditional), func(t *testing.T) {
+		runUnit(t, fmt.Sprint(conditional), func(t *testing.T) {
+			ctx := boundedContext(t)
 			s := &stubStore{
 				get:    func(context.Context, string) ([]byte, string, error) { return nil, "", readErr },
 				absent: func(context.Context, string, []byte) (bool, error) { return false, putErr },
@@ -1027,30 +1194,32 @@ func TestWritePreservesPutAndReadErrors(t *testing.T) {
 }
 
 func TestRenewalPreservesAcquisitionValues(t *testing.T) {
-	ctx := boundedContext(t)
-	base := fsBucket(t, ctx)
-	keys := make(chan string, 8)
-	s := &stubStore{Store: base, match: func(ctx context.Context, key string, data []byte, etag string) (bool, error) {
-		keys <- objstore.KMSKey(ctx)
-		return base.PutIfMatch(ctx, key, data, etag)
-	}}
-	acquireCtx, cancel := context.WithCancel(objstore.WithKMSKey(ctx, "caller-key"))
-	l, err := Acquire(acquireCtx, s, "values/lease", "owner", 2*time.Second)
-	if err != nil {
-		cancel()
-		t.Fatal(err)
-	}
-	t.Cleanup(l.Retire)
-	l.Start(nil)
-	cancel() // The renewer keeps values, not the request's cancellation.
-	if got := receiveWithin(t, ctx, keys, "renewal PUT"); got != "caller-key" {
-		t.Fatalf("renewal KMS key = %q, want caller-key", got)
-	}
+	synctest.Test(t, func(t *testing.T) {
+		ctx := boundedContext(t)
+		base := newMemStore()
+		keys := make(chan string, 8)
+		s := &stubStore{Store: base, match: func(ctx context.Context, key string, data []byte, etag string) (bool, error) {
+			keys <- objstore.KMSKey(ctx)
+			return base.PutIfMatch(ctx, key, data, etag)
+		}}
+		acquireCtx, cancel := context.WithCancel(objstore.WithKMSKey(ctx, "caller-key"))
+		l, err := Acquire(acquireCtx, s, "values/lease", "owner", 2*time.Second)
+		if err != nil {
+			cancel()
+			t.Fatal(err)
+		}
+		t.Cleanup(l.Retire)
+		l.Start(nil)
+		cancel() // The renewer keeps values, not the request's cancellation.
+		if got := receiveWithin(t, ctx, keys, "renewal PUT"); got != "caller-key" {
+			t.Fatalf("renewal KMS key = %q, want caller-key", got)
+		}
+	})
 }
 
 func TestRetirementCancelsAcquire(t *testing.T) {
 	for _, release := range []bool{false, true} {
-		t.Run(fmt.Sprint(release), func(t *testing.T) {
+		runUnit(t, fmt.Sprint(release), func(t *testing.T) {
 			ctx := boundedContext(t)
 			entered := make(chan struct{})
 			s := &stubStore{
@@ -1086,130 +1255,142 @@ func TestRetirementCancelsAcquire(t *testing.T) {
 }
 
 func TestReleaseBoundsWaitForAcquire(t *testing.T) {
-	ctx := boundedContext(t)
-	entered, unblock := make(chan struct{}), make(chan struct{})
-	acquired := make(chan error, 1)
-	t.Cleanup(func() {
-		close(unblock)
-		cleanupCtx, cancel := context.WithTimeout(context.WithoutCancel(ctx), time.Second)
+	synctest.Test(t, func(t *testing.T) {
+		ctx := boundedContext(t)
+		entered, unblock := make(chan struct{}), make(chan struct{})
+		acquired := make(chan error, 1)
+		t.Cleanup(func() {
+			close(unblock)
+			cleanupCtx, cancel := context.WithTimeout(context.WithoutCancel(ctx), time.Second)
+			defer cancel()
+			receiveWithin(t, cleanupCtx, acquired, "Acquire after backend unblocks")
+		})
+		s := &stubStore{get: func(ctx context.Context, _ string) ([]byte, string, error) {
+			close(entered)
+			// Model a backend slow to notice cancellation, but always unblock at cleanup.
+			select {
+			case <-unblock:
+			case <-ctx.Done():
+				<-unblock
+			}
+			return nil, "", context.Canceled
+		}}
+		l := New(s, "bound/lease", "owner", 100*time.Millisecond)
+		go func() { acquired <- l.Acquire(ctx) }()
+		receiveWithin(t, ctx, entered, "acquisition read")
+		released := make(chan struct{})
+		go func() { l.Release(ctx); close(released) }()
+		bounded, cancel := context.WithTimeout(ctx, time.Second)
 		defer cancel()
-		receiveWithin(t, cleanupCtx, acquired, "Acquire after backend unblocks")
+		receiveWithin(t, bounded, released, "TTL-bounded Release")
 	})
-	s := &stubStore{get: func(ctx context.Context, _ string) ([]byte, string, error) {
-		close(entered)
-		// Model a backend slow to notice cancellation, but always unblock at cleanup.
-		select {
-		case <-unblock:
-		case <-ctx.Done():
-			<-unblock
-		}
-		return nil, "", context.Canceled
-	}}
-	l := New(s, "bound/lease", "owner", 100*time.Millisecond)
-	go func() { acquired <- l.Acquire(ctx) }()
-	receiveWithin(t, ctx, entered, "acquisition read")
-	released := make(chan struct{})
-	go func() { l.Release(ctx); close(released) }()
-	bounded, cancel := context.WithTimeout(ctx, time.Second)
-	defer cancel()
-	receiveWithin(t, bounded, released, "TTL-bounded Release")
 }
 
 func TestRetirementCancelsRenewal(t *testing.T) {
-	ctx := boundedContext(t)
-	base := fsBucket(t, ctx)
-	entered := make(chan struct{})
-	s := &stubStore{Store: base, match: func(ctx context.Context, _ string, _ []byte, _ string) (bool, error) {
-		close(entered)
-		<-ctx.Done()
-		return false, ctx.Err()
-	}}
-	l, err := Acquire(ctx, s, "renew-cancel/lease", "owner", 2*time.Second)
-	if err != nil {
-		t.Fatal(err)
-	}
-	t.Cleanup(l.Retire)
-	l.Start(nil)
-	receiveWithin(t, ctx, entered, "renewal PUT")
-	retired := make(chan struct{})
-	go func() { l.Retire(); close(retired) }()
-	bounded, cancel := context.WithTimeout(ctx, 200*time.Millisecond)
-	defer cancel()
-	receiveWithin(t, bounded, retired, "cancelled renewal")
+	synctest.Test(t, func(t *testing.T) {
+		ctx := boundedContext(t)
+		base := newMemStore()
+		entered := make(chan struct{})
+		s := &stubStore{Store: base, match: func(ctx context.Context, _ string, _ []byte, _ string) (bool, error) {
+			close(entered)
+			<-ctx.Done()
+			return false, ctx.Err()
+		}}
+		l, err := Acquire(ctx, s, "renew-cancel/lease", "owner", 2*time.Second)
+		if err != nil {
+			t.Fatal(err)
+		}
+		t.Cleanup(l.Retire)
+		l.Start(nil)
+		receiveWithin(t, ctx, entered, "renewal PUT")
+		retired := make(chan struct{})
+		go func() { l.Retire(); close(retired) }()
+		bounded, cancel := context.WithTimeout(ctx, 200*time.Millisecond)
+		defer cancel()
+		receiveWithin(t, bounded, retired, "cancelled renewal")
+	})
 }
 
 func TestPendingPrunesExpiredAttempts(t *testing.T) {
-	l := New(nil, "pending/lease", "owner", time.Minute)
-	now := time.Now()
-	for i := range 10000 {
-		l.notePending(fmt.Sprint(i), now.Add(-2*l.ttl))
-	}
-	l.notePending("grace", now.Add(-l.ttl-l.ttl/4)) // Still within the takeover grace, but cannot be adopted.
-	l.notePending("live", now)
-	l.notePending("new", now)
-	if len(l.pending) != 2 {
-		t.Fatalf("retained %d pending nonces, want only 2 live attempts", len(l.pending))
-	}
-	if _, ok := l.pendingStart("live"); !ok {
-		t.Fatal("forgot an attempt still eligible for adoption")
-	}
+	synctest.Test(t, func(t *testing.T) {
+		l := New(nil, "pending/lease", "owner", time.Minute)
+		now := time.Now()
+		for i := range 10000 {
+			l.notePending(fmt.Sprint(i), now.Add(-2*l.ttl))
+		}
+		l.notePending("grace", now.Add(-l.ttl-l.ttl/4)) // Still within the takeover grace, but cannot be adopted.
+		l.notePending("live", now)
+		l.notePending("new", now)
+		if len(l.pending) != 2 {
+			t.Fatalf("retained %d pending nonces, want only 2 live attempts", len(l.pending))
+		}
+		if _, ok := l.pendingStart("live"); !ok {
+			t.Fatal("forgot an attempt still eligible for adoption")
+		}
+	})
 }
 
 func TestValidRejectsRetiredLease(t *testing.T) {
-	ctx := boundedContext(t)
-	l := New(fsBucket(t, ctx), "retired-valid/lease", "owner", time.Minute)
-	if err := l.Take(ctx); err != nil {
-		t.Fatal(err)
-	}
-	l.Retire()
-	receiveWithin(t, ctx, l.Done(), "Done after Retire")
-	if err := l.Valid(); !errors.Is(err, ErrNotOwner) {
-		t.Fatalf("retired lease valid after Done: %v", err)
-	}
+	synctest.Test(t, func(t *testing.T) {
+		ctx := boundedContext(t)
+		l := New(newMemStore(), "retired-valid/lease", "owner", time.Minute)
+		if err := l.Take(ctx); err != nil {
+			t.Fatal(err)
+		}
+		l.Retire()
+		receiveWithin(t, ctx, l.Done(), "Done after Retire")
+		if err := l.Valid(); !errors.Is(err, ErrNotOwner) {
+			t.Fatalf("retired lease valid after Done: %v", err)
+		}
+	})
 }
 
 func TestSharedRejectsRetiredLease(t *testing.T) {
-	ctx := boundedContext(t)
-	l := New(fsBucket(t, ctx), "shared-retired/lease", "owner", time.Minute)
-	if err := l.Take(ctx); err != nil {
-		t.Fatal(err)
-	}
-	var sh Shared
-	r, err := sh.Join(func() (*Lease, error) { return l, nil })
-	if err != nil {
-		t.Fatal(err)
-	}
-	t.Cleanup(func() { r.Release(ctx) })
-	l.Retire()
-	if _, err := sh.Join(func() (*Lease, error) { t.Fatal("mint called for retired lease"); return nil, nil }); !errors.Is(err, ErrNotOwner) {
-		t.Fatalf("joined retired lease: %v", err)
-	}
+	synctest.Test(t, func(t *testing.T) {
+		ctx := boundedContext(t)
+		l := New(newMemStore(), "shared-retired/lease", "owner", time.Minute)
+		if err := l.Take(ctx); err != nil {
+			t.Fatal(err)
+		}
+		var sh Shared
+		r, err := sh.Join(func() (*Lease, error) { return l, nil })
+		if err != nil {
+			t.Fatal(err)
+		}
+		t.Cleanup(func() { r.Release(ctx) })
+		l.Retire()
+		if _, err := sh.Join(func() (*Lease, error) { t.Fatal("mint called for retired lease"); return nil, nil }); !errors.Is(err, ErrNotOwner) {
+			t.Fatalf("joined retired lease: %v", err)
+		}
+	})
 }
 
 func TestReleasedRefIsNotValid(t *testing.T) {
-	ctx := boundedContext(t)
-	l := New(fsBucket(t, ctx), "ref-valid/lease", "owner", time.Minute)
-	if err := l.Take(ctx); err != nil {
-		t.Fatal(err)
-	}
-	var sh Shared
-	mint := func() (*Lease, error) { return l, nil }
-	r1, err := sh.Join(mint)
-	if err != nil {
-		t.Fatal(err)
-	}
-	r2, err := sh.Join(mint)
-	if err != nil {
-		t.Fatal(err)
-	}
-	t.Cleanup(func() { r2.Release(ctx) })
-	r1.Release(ctx)
-	if err := r1.Valid(); !errors.Is(err, ErrNotOwner) {
-		t.Fatalf("released ref valid while another holds the lease: %v", err)
-	}
-	if err := r2.Valid(); err != nil {
-		t.Fatalf("remaining ref lost its lease: %v", err)
-	}
+	synctest.Test(t, func(t *testing.T) {
+		ctx := boundedContext(t)
+		l := New(newMemStore(), "ref-valid/lease", "owner", time.Minute)
+		if err := l.Take(ctx); err != nil {
+			t.Fatal(err)
+		}
+		var sh Shared
+		mint := func() (*Lease, error) { return l, nil }
+		r1, err := sh.Join(mint)
+		if err != nil {
+			t.Fatal(err)
+		}
+		r2, err := sh.Join(mint)
+		if err != nil {
+			t.Fatal(err)
+		}
+		t.Cleanup(func() { r2.Release(ctx) })
+		r1.Release(ctx)
+		if err := r1.Valid(); !errors.Is(err, ErrNotOwner) {
+			t.Fatalf("released ref valid while another holds the lease: %v", err)
+		}
+		if err := r2.Valid(); err != nil {
+			t.Fatalf("remaining ref lost its lease: %v", err)
+		}
+	})
 }
 
 func TestZeroRefIsNotValid(t *testing.T) {

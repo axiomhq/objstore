@@ -203,10 +203,6 @@ func (r *Reader) FetchRanges(ctx context.Context, loads []Load) (context.Context
 	for i, plan := range plans {
 		child := planChild[i]
 		g.Go(func() error {
-			if err := r.memory.Acquire(gctx, plan.Length); err != nil {
-				return err
-			}
-			defer r.memory.Release(plan.Length)
 			// read reports who answered: the store (Load), or the memory or
 			// disk tier holding the object its bytes were cut from.
 			read := func(ctx context.Context) ([]byte, cache.Outcome, error) {
@@ -237,15 +233,27 @@ func (r *Reader) FetchRanges(ctx context.Context, loads []Load) (context.Context
 			}
 			var data []byte
 			var src, counted cache.Outcome
+			var release func()
 			var err error
 			if child >= 0 {
 				load := pending[child]
 				data, src, err = r.objects.FetchCachedRange(gctx, load.Key, int(plan.Length), func(ctx context.Context) ([]byte, error) {
-					stored, _, err := read(ctx)
-					if err != nil || load.Decode == nil {
-						return stored, err
+					if err := r.memory.Acquire(ctx, plan.Length); err != nil {
+						return nil, err
 					}
-					return load.Decode(stored)
+					defer r.memory.Release(plan.Length)
+					stored, _, err := read(ctx)
+					if err != nil {
+						return nil, err
+					}
+					// Copy under the producer's reservation. The cache and
+					// scope own the child, never the physical read buffer.
+					data := make([]byte, len(stored))
+					copy(data, stored)
+					if load.Decode == nil {
+						return data, nil
+					}
+					return load.Decode(data)
 				})
 				if err == nil {
 					charge(child, src)
@@ -255,7 +263,7 @@ func (r *Reader) FetchRanges(ctx context.Context, loads []Load) (context.Context
 				// retaining it beside them halves the room the children
 				// have. Concurrent cold reads planning the
 				// same parent still share its one GET.
-				data, src, counted, err = r.sharedParent(gctx, plan.Extent, parentGens[plan.Object], read)
+				data, src, counted, release, err = r.sharedParent(gctx, plan.Extent, parentGens[plan.Object], read)
 			}
 			if err != nil {
 				return err
@@ -264,6 +272,7 @@ func (r *Reader) FetchRanges(ctx context.Context, loads []Load) (context.Context
 				assembled[child] = data
 				return nil
 			}
+			defer release()
 			for _, j := range children[i] {
 				load := pending[j]
 				lo, hi := max(plan.Offset, load.Offset), min(plan.Offset+plan.Length, load.Offset+load.Length)
@@ -318,55 +327,114 @@ func (r *Reader) FetchRanges(ctx context.Context, loads []Load) (context.Context
 	return cache.WithResults(ctx, results), nil
 }
 
-type parentRead struct {
-	data []byte
-	src  cache.Outcome
+type rangeFlight struct {
+	done     chan struct{}
+	data     []byte
+	src      cache.Outcome
+	err      error
+	length   int64
+	refs     int // producer and consumers; guarded by flightMu
+	reserved bool
 }
 
 // sharedParent runs read once for concurrent identical coalesced parents
 // and hands every waiter the same bytes, which callers only copy out of,
 // with who answered the read and the outcome this caller counts: its own
 // read's, or a memory hit for a waiter on another's.
-// Nothing is retained after the last waiter. The read runs under the
-// leader's context, so its error may be the leader's own (a cancellation, a
-// per-request budget): a follower that gets one retries once, as a fresh
+// Call release after copying: the producer and every consumer own the
+// reservation together. The read runs under the leader's context, so its
+// error may be the leader's own (a cancellation, a per-request budget):
+// a follower that gets one retries once, as a fresh
 // shared flight under its own context, rather than inherit it.
-func (r *Reader) sharedParent(ctx context.Context, x Extent, generation uint64, read func(context.Context) ([]byte, cache.Outcome, error)) (data []byte, src, counted cache.Outcome, err error) {
+func (r *Reader) sharedParent(ctx context.Context, x Extent, generation uint64, read func(context.Context) ([]byte, cache.Outcome, error)) ([]byte, cache.Outcome, cache.Outcome, func(), error) {
 	return r.sharedParentOnce(ctx, x, generation, read, false)
 }
 
-func (r *Reader) sharedParentOnce(ctx context.Context, x Extent, generation uint64, read func(context.Context) ([]byte, cache.Outcome, error), retried bool) (data []byte, src, counted cache.Outcome, err error) {
+func (r *Reader) releaseFlightLocked(f *rangeFlight) {
+	if f.refs--; f.refs == 0 {
+		f.data = nil
+		if f.reserved {
+			r.memory.Release(f.length)
+			f.reserved = false
+		}
+	}
+}
+
+func (r *Reader) sharedParentOnce(ctx context.Context, x Extent, generation uint64, read func(context.Context) ([]byte, cache.Outcome, error), retried bool) ([]byte, cache.Outcome, cache.Outcome, func(), error) {
+	if err := ctx.Err(); err != nil {
+		return nil, cache.Load, cache.Load, nil, err
+	}
 	key := strconv.FormatUint(generation, 10) + "\x00" + x.Object + "\x00" + strconv.FormatInt(x.Offset, 10) + "+" + strconv.FormatInt(x.Length, 10)
-	var led atomic.Bool
-	ch := r.parents.DoChan(key, func() (v any, err error) {
-		led.Store(true)
-		// DoChan re-raises a panic on its own goroutine, where nothing can
-		// recover it: every waiter gets it as an error instead.
-		defer func() {
-			if p := recover(); p != nil {
-				v, err = nil, fmt.Errorf("rangeread: parent %s: panic: %v\n%s", key, p, debug.Stack())
-			}
-		}()
-		data, src, err := read(ctx)
-		return parentRead{data, src}, err
-	})
+	r.flightMu.Lock()
+	if r.flights == nil {
+		r.flights = make(map[string]*rangeFlight)
+	}
+	f := r.flights[key]
+	led := f == nil
+	if led {
+		f = &rangeFlight{done: make(chan struct{}), length: x.Length, refs: 1}
+		r.flights[key] = f
+	}
+	f.refs++
+	r.flightMu.Unlock()
+	leave := func() {
+		r.flightMu.Lock()
+		defer r.flightMu.Unlock()
+		r.releaseFlightLocked(f)
+	}
+	if led {
+		go r.produceRange(ctx, key, f, read)
+	}
 	if r.joined != nil {
 		r.joined() // the flight is registered: a test's rendezvous
 	}
 	select {
-	case res := <-ch:
-		if res.Err != nil {
-			if !led.Load() && !retried && ctx.Err() == nil {
+	case <-f.done:
+		if f.err != nil {
+			err := f.err
+			leave() // release the failed flight before a retry can reserve bytes
+			if !led && !retried && ctx.Err() == nil {
 				return r.sharedParentOnce(ctx, x, generation, read, true)
 			}
-			return nil, cache.Load, cache.Load, res.Err
+			return nil, cache.Load, cache.Load, nil, err
 		}
-		got := res.Val.(parentRead)
-		if !led.Load() {
-			return got.data, got.src, cache.MemoryHit, nil
+		counted := f.src
+		if !led {
+			counted = cache.MemoryHit
 		}
-		return got.data, got.src, got.src, nil
+		return f.data, f.src, counted, leave, nil
 	case <-ctx.Done():
-		return nil, cache.Load, cache.Load, ctx.Err()
+		leave()
+		return nil, cache.Load, cache.Load, nil, ctx.Err()
 	}
+}
+
+func (r *Reader) produceRange(ctx context.Context, key string, f *rangeFlight, read func(context.Context) ([]byte, cache.Outcome, error)) {
+	var data []byte
+	var src cache.Outcome
+	var err error
+	defer func() {
+		r.flightMu.Lock()
+		defer r.flightMu.Unlock()
+		f.data, f.src, f.err = data, src, err
+		if r.flights[key] == f {
+			delete(r.flights, key)
+		}
+		close(f.done)
+		r.releaseFlightLocked(f)
+	}()
+	func() {
+		defer func() {
+			if p := recover(); p != nil {
+				data, err = nil, fmt.Errorf("rangeread: parent %s: panic: %v\n%s", key, p, debug.Stack())
+			}
+		}()
+		if err = r.memory.Acquire(ctx, f.length); err != nil {
+			return
+		}
+		r.flightMu.Lock()
+		f.reserved = true
+		r.flightMu.Unlock()
+		data, src, err = read(ctx)
+	}()
 }

@@ -22,6 +22,7 @@ type parallelPage[T any] struct {
 	err    error
 	eof    bool
 	bytes  int64
+	memory int64 // decoded budget, before capping the pool permit
 	// gate closes when the page `workers` positions earlier holds its
 	// byte permit (or has none to take): only then may this page's GET
 	// start, so at most workers fetched pages wait for a permit.
@@ -39,16 +40,27 @@ type parallelPage[T any] struct {
 // header and key. It must only mutate the supplied body and synchronize any
 // state shared with visit.
 //
-// Memory is bounded in two parts. Each fetched page waits, in sequence
-// order, for a byte permit of four times its wire size (its decode's
-// budget) from a 64 MiB pool, and keeps it until visited; a page whose
-// permit would exceed the pool takes all of it and proceeds alone, so the
-// pool holds at most max(64 MiB, 4× the largest page). A page's GET starts
-// only once the page `workers` positions earlier holds its permit, so at
-// most `workers` fetched pages hold raw bytes outside the pool. With pages
-// at most maxPageBytes (65 MiB) on the wire, what a walk retains is at most
-// max(64 MiB, 4× the largest page) + workers × 65 MiB, and a slow consumer
-// holds the walk there. Up to workers GETs are in flight.
+// Page storage is bounded in three parts. A page of W wire bytes and N
+// records is charged D = max(4W, 2W + N×S), where S is a []byte descriptor
+// (24 bytes on 64-bit). This covers Decode's wire bytes, nonce copy and
+// record descriptors. Custom decode and prep must keep their combined
+// storage, including raw bytes and temporary allocations, within D; a
+// non-WAL header gets only the 4W budget.
+//
+// Each fetched page takes its permit in sequence order from a 64 MiB pool.
+// A page charged more than the pool takes all of it and decodes alone, so
+// the pool holds at most max(64 MiB, largest D). On coalescing, the charge
+// transfers to a separate 512 MiB batch budget before the permit is freed:
+// even a batch larger than the pool can finish. A Writer's 128 MiB unacked
+// bound and greedy page cuts bound a batch to that budget and at most nine
+// pages; both walks reject larger batches with ErrCorrupt.
+//
+// A GET starts once the page `workers` positions earlier holds its permit,
+// so at most workers fetched pages hold raw bytes outside the pool. With
+// pages at most maxPageBytes (65 MiB) on the wire, retained page storage is
+// at most max(64 MiB, largest D) + 512 MiB + workers × 65 MiB. This excludes
+// bookkeeping, GET internals and storage a caller keeps after visit. A slow
+// consumer holds the walk there. Up to workers GETs are in flight.
 //
 // An unbounded walk issues at most workers not-found GETs past the end of
 // the log: a page skips its GET when the page `workers` positions earlier
@@ -148,7 +160,7 @@ func WalkParallelWithGet[T any](ctx context.Context, get func(context.Context, s
 		if p.eof {
 			return batches.finish(true)
 		}
-		if err := batches.add(p.header, p.key, p.body); err != nil {
+		if err := batches.add(p.header, p.key, p.body, p.memory); err != nil {
 			return err
 		}
 		bytes.Release(p.bytes)
@@ -195,9 +207,9 @@ func fetchPage[T any](ctx context.Context, get func(context.Context, string) ([]
 	case err != nil:
 		p.err = fmt.Errorf("read wal entry %q: %w", p.key, err)
 	default:
-		// The permit is for the decoded page, which may be several times
-		// its wire bytes.
-		n := min(4*int64(len(data)), maxInFlightBytes)
+		// Count record descriptors before decode can allocate them.
+		p.memory = pageMemoryBytes(data)
+		n := min(p.memory, maxInFlightBytes)
 		if err := bytes.Acquire(ctx, n); err != nil {
 			p.err = err
 		} else {

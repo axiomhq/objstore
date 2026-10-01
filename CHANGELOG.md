@@ -13,6 +13,8 @@
 - **cache**: `Disk.Wipe` waits for fills already writing and refuses new ones until then. `Resident.Put` refuses entries of size zero or less. A follower of a shared load that got the leader's `ErrBudget` retries once under its own context.
 - **rangeread**: requests never share a parent read across an `InvalidateNamespace`. `FetchRanges` stops decoding and publishing once its context ends.
 - `DeleteMany` with no keys returns at once instead of waiting for a write slot.
+- **wal**: `Walk` and `WalkParallel` fail with `ErrCorrupt` on a batch larger than a Writer can produce (more than nine pages, or over 512 MiB decoded). `WalkParallel` charges a page for its record descriptors as well as its bytes, and counts a batch being assembled against a separate 512 MiB budget; its documented memory bound says so.
+- **rangeread**: the physical-byte limit holds for bytes a shared read still holds after its waiters are cancelled.
 
 ### Added
 
