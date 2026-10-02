@@ -39,9 +39,7 @@ func TestWriterRateLimitsEntries(t *testing.T) {
 	want := map[string]bool{}
 	stop := time.Now().Add(1500 * time.Millisecond)
 	for caller := range 8 {
-		wg.Add(1)
-		go func() {
-			defer wg.Done()
+		wg.Go(func() {
 			for i := 0; time.Now().Before(stop); i++ {
 				id := fmt.Sprintf("%d-%d", caller, i)
 				if err := w.Append(ctx, rows(id)); err != nil {
@@ -52,7 +50,7 @@ func TestWriterRateLimitsEntries(t *testing.T) {
 				want[id] = true
 				mu.Unlock()
 			}
-		}()
+		})
 	}
 	wg.Wait()
 	if n := f.Ops()[storetest.OpPutIfAbsent]; n > 7 {

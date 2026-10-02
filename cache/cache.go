@@ -436,11 +436,7 @@ func Decoded[T any](c *ByteCache, key string) (T, bool) {
 	if !ok {
 		return zero, false
 	}
-	v := e.decoded
-	if v == nil {
-		return zero, false
-	}
-	t, ok := v.(T)
+	t, ok := e.decoded.(T)
 	if ok {
 		s.touch(e)
 	}

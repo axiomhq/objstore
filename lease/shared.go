@@ -47,8 +47,10 @@ func (s *Shared) wait(ctx context.Context) error {
 	return ctx.Err()
 }
 
-// idle clears busy and wakes waiters. Called with s.mu held.
+// idle clears busy and wakes waiters.
 func (s *Shared) idle() {
+	s.mu.Lock()
+	defer s.mu.Unlock()
 	close(s.busy)
 	s.busy = nil
 }
@@ -83,11 +85,7 @@ func (s *Shared) JoinContext(ctx context.Context, mint func() (*Lease, error)) (
 	s.busy = make(chan struct{})
 	s.mu.Unlock()
 	// Deferred, so a panicking mint does not leave s busy forever.
-	defer func() {
-		s.mu.Lock()
-		s.idle()
-		s.mu.Unlock()
-	}()
+	defer s.idle()
 
 	l, err := mint()
 	if err != nil {
@@ -158,10 +156,6 @@ func (r *Ref) Release(ctx context.Context) {
 	s.held, s.busy = nil, make(chan struct{})
 	s.mu.Unlock()
 	// Deferred, as in Join, so a panicking Release does not leave s busy.
-	defer func() {
-		s.mu.Lock()
-		s.idle()
-		s.mu.Unlock()
-	}()
+	defer s.idle()
 	r.l.Release(ctx)
 }

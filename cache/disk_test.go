@@ -85,7 +85,16 @@ func TestWipeAccountsForInFlightFill(t *testing.T) {
 					if err := os.Chmod(path, 0500); err != nil {
 						t.Fatal(err)
 					}
-					t.Cleanup(func() { _ = os.Chmod(path, 0700) })
+					t.Cleanup(func() {
+						_ = os.Chmod(path, 0700)
+						c.Close()
+						if _, err := os.Stat(c.home); !os.IsNotExist(err) {
+							t.Errorf("Close left failed Wipe's directory: %v", err)
+						}
+						if got := c.Stats().UsedBytes; got != 0 {
+							t.Errorf("charge after Close = %d, want 0", got)
+						}
+					})
 				}
 				close(releaseRemoval)
 				err := receive(t, ctx, wipe)
@@ -98,6 +107,9 @@ func TestWipeAccountsForInFlightFill(t *testing.T) {
 					}
 					if err := c.PutChecked("ns/b/two", []byte("two")); !errors.Is(err, ErrWarmCache) {
 						t.Errorf("fill after failed Wipe = %v, want ErrWarmCache", err)
+					}
+					if _, closed := c.PinState(); !closed {
+						t.Error("failed Wipe left fills enabled")
 					}
 				} else if err != nil {
 					t.Fatal(err)
@@ -160,67 +172,8 @@ func TestWipeDrainsFills(t *testing.T) {
 	}
 }
 
-func TestWipeRemovalFailureKeepsCharge(t *testing.T) {
-	if runtime.GOOS == "windows" || os.Geteuid() == 0 {
-		t.Skip("requires Unix directory permissions without root privileges")
-	}
-	c, err := NewDisk(t.TempDir(), diskBlock)
-	if err != nil {
-		t.Fatal(err)
-	}
-	t.Cleanup(c.Close)
-	c.Put("ns/a/one", []byte("one"))
-	// Rename still works, but the detached directory's file cannot be removed.
-	locked := filepath.Join(c.dir, "locked")
-	if err := os.Mkdir(locked, 0700); err != nil {
-		t.Fatal(err)
-	}
-	e := c.items["ns/a/one"].Value.(*diskEntry)
-	path := filepath.Join(locked, filepath.Base(e.path))
-	if err := os.Rename(e.path, path); err != nil {
-		t.Fatal(err)
-	}
-	e.path = path
-	if err := os.Chmod(locked, 0500); err != nil {
-		t.Fatal(err)
-	}
-	t.Cleanup(func() {
-		_ = filepath.WalkDir(c.home, func(path string, e fs.DirEntry, err error) error {
-			if err == nil && e.IsDir() {
-				return os.Chmod(path, 0700)
-			}
-			return err
-		})
-		c.Close()
-		if _, err := os.Stat(c.home); !os.IsNotExist(err) {
-			t.Errorf("Close left failed Wipe's directory: %v", err)
-		}
-		if got := c.Stats().UsedBytes; got != 0 {
-			t.Errorf("charge after Close = %d, want 0", got)
-		}
-	})
-	if err := c.Wipe(); err == nil {
-		t.Fatal("Wipe removed an unwritable directory")
-	} else {
-		t.Logf("Wipe: %v", err)
-	}
-	if got := c.Stats().UsedBytes; got != diskBlock {
-		t.Errorf("failed Wipe charge = %d, want %d", got, diskBlock)
-	}
-	if err := c.PutChecked("ns/b/two", []byte("two")); !errors.Is(err, ErrWarmCache) {
-		t.Errorf("fill after failed Wipe = %v, want ErrWarmCache", err)
-	}
-	if _, closed := c.PinState(); !closed {
-		t.Error("failed Wipe left fills enabled")
-	}
-}
-
 func TestDiskActivityBoundedByResidentNamespaces(t *testing.T) {
-	c, err := NewDisk(t.TempDir(), 2*diskBlock)
-	if err != nil {
-		t.Fatal(err)
-	}
-	defer c.Close()
+	c := newDisk(t, 2*diskBlock)
 	c.Put("ns/shared/one", []byte("one"))
 	c.Put("ns/shared/two", []byte("two"))
 	c.Put("ns/other/one", []byte("one"))
@@ -242,11 +195,7 @@ func TestDiskActivityBoundedByResidentNamespaces(t *testing.T) {
 }
 
 func TestDiskCachePinCapacityAndEviction(t *testing.T) {
-	c, err := NewDisk(t.TempDir(), 8192, 4096)
-	if err != nil {
-		t.Fatal(err)
-	}
-	defer c.Close()
+	c := newDisk(t, 8192, 4096)
 	c.Put("ns/a/one", []byte("one"))
 	if err := c.Pin("a", map[string]int64{"ns/a/one": 4096}); err != nil {
 		t.Fatal(err)
@@ -266,11 +215,7 @@ func TestDiskCachePinCapacityAndEviction(t *testing.T) {
 }
 
 func TestDiskCacheLossIsAMissAndPinSurvivesRewarm(t *testing.T) {
-	c, err := NewDisk(t.TempDir(), 8192, 8192)
-	if err != nil {
-		t.Fatal(err)
-	}
-	defer c.Close()
+	c := newDisk(t, 8192, 8192)
 	c.Put("ns/a/one", []byte("one"))
 	if err := c.Pin("a", map[string]int64{"ns/a/one": 4096}); err != nil {
 		t.Fatal(err)
@@ -290,11 +235,7 @@ func TestDiskCacheLossIsAMissAndPinSurvivesRewarm(t *testing.T) {
 }
 
 func TestPinnedCacheHitRatioUnderPressure(t *testing.T) {
-	c, err := NewDisk(t.TempDir(), 12<<10, 4<<10)
-	if err != nil {
-		t.Fatal(err)
-	}
-	defer c.Close()
+	c := newDisk(t, 12<<10, 4<<10)
 	c.Put("ns/pinned/object", make([]byte, 1024))
 	if err := c.Pin("pinned", map[string]int64{"ns/pinned/object": 4096}); err != nil {
 		t.Fatal(err)
@@ -314,11 +255,7 @@ func TestPinnedCacheHitRatioUnderPressure(t *testing.T) {
 // name is refused whatever the byte headroom, re-pinning a pinned name does not count twice, and unpinning
 // frees a slot.
 func TestDiskCachePinCountCap(t *testing.T) {
-	c, err := NewDisk(t.TempDir(), 1<<20, 1<<20)
-	if err != nil {
-		t.Fatal(err)
-	}
-	defer c.Close()
+	c := newDisk(t, 1<<20, 1<<20)
 	name := func(i int) string { return "ns" + strconv.Itoa(i) }
 	for i := range MaxPinnedNamespaces {
 		if err := c.Pin(name(i), map[string]int64{name(i) + "/obj": 1}); err != nil {
@@ -349,17 +286,11 @@ func TestDiskCachePinCountCap(t *testing.T) {
 // Every hit must still return the key's exact bytes, and the accounting
 // must end consistent with the files on disk.
 func TestDiskConcurrentGetPutUnderEviction(t *testing.T) {
-	c, err := NewDisk(t.TempDir(), 16*4096)
-	if err != nil {
-		t.Fatal(err)
-	}
-	defer c.Close()
+	c := newDisk(t, 16*4096)
 	value := func(i int) []byte { return bytes.Repeat([]byte{byte(i)}, 3000+i) }
 	var wg sync.WaitGroup
 	for w := range 8 {
-		wg.Add(1)
-		go func() {
-			defer wg.Done()
+		wg.Go(func() {
 			for n := range 400 {
 				i := (w*7 + n) % 40
 				key := "ns/x/k" + strconv.Itoa(i)
@@ -372,7 +303,7 @@ func TestDiskConcurrentGetPutUnderEviction(t *testing.T) {
 					return
 				}
 			}
-		}()
+		})
 	}
 	wg.Wait()
 	st := c.Stats()
@@ -390,11 +321,7 @@ func TestDiskConcurrentGetPutUnderEviction(t *testing.T) {
 // damaged block inside it is a miss that drops the entry, and a range past
 // the object is a miss that keeps it.
 func TestDiskGetRangeVerifiesOnlyItsBlocks(t *testing.T) {
-	c, err := NewDisk(t.TempDir(), 1<<20)
-	if err != nil {
-		t.Fatal(err)
-	}
-	defer c.Close()
+	c := newDisk(t, 1<<20)
 	obj := make([]byte, 5*diskBlock+100)
 	for i := range obj {
 		obj[i] = byte(i * 7)
@@ -434,17 +361,11 @@ func TestDiskGetRangeVerifiesOnlyItsBlocks(t *testing.T) {
 // hold more bytes on disk than the cap, and the reservation is released.
 func TestDiskPutReservesBeforeWriting(t *testing.T) {
 	const cap = 8 * diskBlock
-	c, err := NewDisk(t.TempDir(), cap)
-	if err != nil {
-		t.Fatal(err)
-	}
-	defer c.Close()
+	c := newDisk(t, cap)
 	var wg sync.WaitGroup
 	stop := make(chan struct{})
 	var over sync.Once
-	wg.Add(1)
-	go func() { // sample the directory while the writers run
-		defer wg.Done()
+	wg.Go(func() { // sample the directory while the writers run
 		for {
 			select {
 			case <-stop:
@@ -462,16 +383,14 @@ func TestDiskPutReservesBeforeWriting(t *testing.T) {
 				over.Do(func() { t.Errorf("%d bytes on disk over the %d cap", total, cap) })
 			}
 		}
-	}()
+	})
 	var writers sync.WaitGroup
 	for w := range 8 {
-		writers.Add(1)
-		go func() {
-			defer writers.Done()
+		writers.Go(func() {
 			for i := range 50 {
 				c.Put("ns/x/k"+strconv.Itoa(w*50+i), make([]byte, 3*diskBlock))
 			}
-		}()
+		})
 	}
 	writers.Wait()
 	close(stop)

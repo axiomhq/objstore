@@ -4,7 +4,6 @@ import (
 	"os"
 	"testing"
 
-	"github.com/axiomhq/objstore"
 	"github.com/axiomhq/objstore/storetest"
 	"github.com/axiomhq/objstore/storetest/bucket"
 )
@@ -16,7 +15,7 @@ func TestConformance(t *testing.T) {
 	if endpoint == "" {
 		t.Skip("OBJSTORE_TEST_S3 not set")
 	}
-	storetest.Conformance(t, openBucket(t, endpoint))
+	storetest.Conformance(t, bucket.NewS3(t, endpoint))
 }
 
 // TestR2 runs the shared suite against Cloudflare R2; it skips without
@@ -28,14 +27,5 @@ func TestR2(t *testing.T) {
 	if endpoint == "" {
 		t.Skip("OBJSTORE_TEST_R2_ENDPOINT not set")
 	}
-	storetest.Conformance(t, openBucket(t, endpoint))
-}
-
-// openBucket returns a Store on a fresh bucket objstore-test-<nanos>-<random>
-// at endpoint, dropped at cleanup. Unset AWS_ACCESS_KEY_ID,
-// AWS_SECRET_ACCESS_KEY and AWS_REGION default to MinIO's (minioadmin,
-// minioadmin, us-east-1); set, they pass through untouched.
-func openBucket(t *testing.T, endpoint string) *objstore.Store {
-	t.Helper()
-	return bucket.NewS3(t, endpoint)
+	storetest.Conformance(t, bucket.NewS3(t, endpoint))
 }

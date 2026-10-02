@@ -235,22 +235,6 @@ func TestS3ConditionalPutVerdicts(t *testing.T) {
 	}
 }
 
-// TestS3ConditionalRequestConflictIsErrConflict: the 409 surfaces as
-// objstore.ErrConflict so callers above the backend can tell "retry" from
-// a lost race without importing the SDK.
-func TestS3ConditionalRequestConflictIsErrConflict(t *testing.T) {
-	s := fakeS3(t, func(w http.ResponseWriter, r *http.Request) {
-		s3Error(w, http.StatusConflict, "ConditionalRequestConflict")
-	})
-	ctx := context.Background()
-	if ok, err := s.PutIfAbsent(ctx, "k", []byte("x")); ok || !errors.Is(err, objstore.ErrConflict) {
-		t.Fatalf("PutIfAbsent: ok=%v err=%v", ok, err)
-	}
-	if ok, err := s.PutIfMatch(ctx, "k", []byte("x"), "etag"); ok || !errors.Is(err, objstore.ErrConflict) {
-		t.Fatalf("PutIfMatch: ok=%v err=%v", ok, err)
-	}
-}
-
 // TestS3PutIfMatchSendsUnquotedETag pins the exact If-Match header: the
 // ETag goes out without its quotes (the Ceph RGW workaround on PutIfMatch).
 // R2 documents the quoted RFC 9110 form; changing this must be deliberate

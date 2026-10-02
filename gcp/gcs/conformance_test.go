@@ -42,7 +42,7 @@ func TestConformance(t *testing.T) {
 				hc = &http.Client{Transport: notModifiedTransport{hc.Transport}}
 			}
 			hc = &http.Client{Transport: boundedTransport{hc.Transport}}
-			b, err := gcs.New(ctx, gcs.Config{
+			b := newBackend(t, ctx, gcs.Config{
 				Bucket:    "conformance",
 				ProjectID: "test",
 				Options: []option.ClientOption{
@@ -50,14 +50,6 @@ func TestConformance(t *testing.T) {
 					option.WithoutAuthentication(),
 					option.WithHTTPClient(hc),
 				},
-			})
-			if err != nil {
-				t.Fatal(err)
-			}
-			t.Cleanup(func() {
-				if err := b.Close(); err != nil {
-					t.Error(err)
-				}
 			})
 			s := objstore.Open(b, objstore.Config{})
 			if err := s.EnsureBucket(ctx); err != nil {
@@ -109,17 +101,9 @@ func TestConformanceReal(t *testing.T) {
 	}
 	ctx, cancel := context.WithTimeout(t.Context(), time.Minute)
 	defer cancel()
-	b, err := gcs.New(ctx, gcs.Config{
+	b := newBackend(t, ctx, gcs.Config{
 		Bucket:    fmt.Sprintf("objstore-test-%d", time.Now().UnixNano()),
 		ProjectID: project,
-	})
-	if err != nil {
-		t.Fatal(err)
-	}
-	t.Cleanup(func() {
-		if err := b.Close(); err != nil {
-			t.Error(err)
-		}
 	})
 	s := objstore.Open(b, objstore.Config{})
 	if err := s.EnsureBucket(ctx); err != nil {
@@ -168,21 +152,13 @@ func TestKMSKeyPerObject(t *testing.T) {
 	server := fakestorage.NewServer(nil)
 	t.Cleanup(server.Stop)
 	tr := &kmsTransport{next: server.HTTPClient().Transport}
-	b, err := gcs.New(ctx, gcs.Config{
+	b := newBackend(t, ctx, gcs.Config{
 		Bucket: "kms", ProjectID: "test",
 		Options: []option.ClientOption{
 			option.WithEndpoint(server.URL() + "/storage/v1/"),
 			option.WithoutAuthentication(),
 			option.WithHTTPClient(&http.Client{Transport: boundedTransport{tr}}),
 		},
-	})
-	if err != nil {
-		t.Fatal(err)
-	}
-	t.Cleanup(func() {
-		if err := b.Close(); err != nil {
-			t.Error(err)
-		}
 	})
 	s := objstore.Open(b, objstore.Config{})
 	if err := s.EnsureBucket(ctx); err != nil {

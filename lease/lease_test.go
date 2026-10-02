@@ -3,6 +3,7 @@ package lease
 import (
 	"bytes"
 	"context"
+	"crypto/rand"
 	"crypto/sha256"
 	"encoding/json"
 	"errors"
@@ -172,7 +173,7 @@ func TestLease(t *testing.T) {
 		// The lost attempt: its bytes reach the store, its start is noted as
 		// pending, and nothing else about it is known to the process.
 		start := time.Now()
-		late := Body{Owner: "owner-a", Nonce: mint(), Expiry: start.Add(ttl)}
+		late := Body{Owner: "owner-a", Nonce: rand.Text(), Expiry: start.Add(ttl)}
 		plant(t, s, "a/lease", late)
 		l.notePending(late.Nonce, start)
 		if err := l.Take(ctx); err != nil {
@@ -186,7 +187,7 @@ func TestLease(t *testing.T) {
 		}
 		// A record in our name with a nonce we never wrote is not ours: the
 		// conservative answer is still ErrNotOwner.
-		plant(t, s, "a/lease", Body{Owner: "owner-a", Nonce: mint(), Expiry: time.Now().Add(ttl)})
+		plant(t, s, "a/lease", Body{Owner: "owner-a", Nonce: rand.Text(), Expiry: time.Now().Add(ttl)})
 		if err := l.Take(ctx); !errors.Is(err, ErrNotOwner) {
 			t.Fatalf("a nonce this process never wrote must not be adopted: %v", err)
 		}

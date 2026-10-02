@@ -8,7 +8,6 @@ import (
 	"log/slog"
 	"reflect"
 	"slices"
-	"sort"
 	"strings"
 	"sync"
 	"testing"
@@ -42,13 +41,11 @@ func TestWriterCoalescesAndCommits(t *testing.T) {
 	const n = 10
 	var wg sync.WaitGroup
 	for i := range n {
-		wg.Add(1)
-		go func() {
-			defer wg.Done()
+		wg.Go(func() {
 			if err := w.Append(ctx, rows(fmt.Sprintf("row-%d", i))); err != nil {
 				t.Error(err)
 			}
-		}()
+		})
 	}
 	wg.Wait()
 
@@ -719,11 +716,9 @@ func TestCommitIntervalCoalescesIntoOnePage(t *testing.T) {
 	var wg sync.WaitGroup
 	errs := make([]error, 2)
 	for i, id := range []string{"a", "b"} {
-		wg.Add(1)
-		go func() {
-			defer wg.Done()
+		wg.Go(func() {
 			errs[i] = w.Append(ctx, rows(id))
-		}()
+		})
 	}
 	wg.Wait()
 	elapsed := time.Since(start)
@@ -742,7 +737,7 @@ func TestCommitIntervalCoalescesIntoOnePage(t *testing.T) {
 	if gotCommits != 1 {
 		t.Fatalf("%d commits for two concurrent appends, want 1 (records %v)", gotCommits, gotRecords)
 	}
-	sort.Strings(gotRecords)
+	slices.Sort(gotRecords)
 	if !reflect.DeepEqual(gotRecords, []string{"a", "b"}) {
 		t.Fatalf("one commit carried %v, want both records", gotRecords)
 	}

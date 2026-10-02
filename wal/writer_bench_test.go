@@ -6,7 +6,7 @@ import (
 	"fmt"
 	"math/rand/v2"
 	"os"
-	"sort"
+	"slices"
 	"strconv"
 	"sync"
 	"sync/atomic"
@@ -68,9 +68,7 @@ func appendLoop(b *testing.B, w *Writer[Bytes], callers int, next func(caller in
 	b.ResetTimer()
 	start := time.Now()
 	for caller := range callers {
-		wg.Add(1)
-		go func() {
-			defer wg.Done()
+		wg.Go(func() {
 			var own []time.Duration
 			count := 0
 			for remaining.Add(-1) >= 0 {
@@ -95,7 +93,7 @@ func appendLoop(b *testing.B, w *Writer[Bytes], callers int, next func(caller in
 			latencies = append(latencies, own...)
 			written += count
 			mu.Unlock()
-		}()
+		})
 	}
 	wg.Wait()
 	elapsed = time.Since(start)
@@ -103,7 +101,7 @@ func appendLoop(b *testing.B, w *Writer[Bytes], callers int, next func(caller in
 	if len(latencies) == 0 {
 		b.Fatal("no completed appends")
 	}
-	sort.Slice(latencies, func(i, j int) bool { return latencies[i] < latencies[j] })
+	slices.Sort(latencies)
 	return written, latencies, elapsed
 }
 
@@ -195,7 +193,7 @@ func BenchmarkWALGroupCommitUncontended(b *testing.B) {
 				samples = append(samples, time.Since(start))
 			}
 			b.StopTimer()
-			sort.Slice(samples, func(i, j int) bool { return samples[i] < samples[j] })
+			slices.Sort(samples)
 			reportLatencies(b, samples)
 		})
 	}
@@ -242,9 +240,7 @@ func benchmarkCommitUnderBulkLoad(b *testing.B, callers, bulk int) {
 		object[i] = byte(i * 7)
 	}
 	for f := range bulk {
-		bg.Add(1)
-		go func() {
-			defer bg.Done()
+		bg.Go(func() {
 			for n := 0; ; n++ {
 				select {
 				case <-stop:
@@ -259,7 +255,7 @@ func benchmarkCommitUnderBulkLoad(b *testing.B, callers, bulk int) {
 				bulkBytes.Add(int64(len(object)))
 				_ = s.Delete(ctx, key)
 			}
-		}()
+		})
 	}
 	rngs := make([]*rand.Rand, callers)
 	counts := make([]int, callers)

@@ -298,9 +298,7 @@ func (r testRecord) AppendTo(dst []byte) ([]byte, error) {
 
 // wedge holds the writer's next PUT until the returned release is called,
 // so that what is enqueued meanwhile forms one batch behind it.
-func wedge(t *testing.T, w interface {
-	Enqueue(context.Context, []testRecord) (<-chan error, error)
-}, f *storetest.Fault) (receipt <-chan error, release func()) {
+func wedge(t *testing.T, w *Writer[testRecord], f *storetest.Fault) (receipt <-chan error, release func()) {
 	t.Helper()
 	f.Set(storetest.Plan{Op: storetest.OpPutIfAbsent, N: 1, Mode: storetest.Pause})
 	receipt, err := w.Enqueue(context.Background(), []testRecord{{b: "wedge"}})

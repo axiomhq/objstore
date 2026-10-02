@@ -4,7 +4,6 @@ import (
 	"context"
 	"errors"
 	"fmt"
-	"io"
 	"net/http"
 	"net/http/httptest"
 	"sync/atomic"
@@ -17,6 +16,20 @@ import (
 	"google.golang.org/api/googleapi"
 	"google.golang.org/api/option"
 )
+
+func newBackend(t *testing.T, ctx context.Context, cfg gcs.Config) *gcs.Backend {
+	t.Helper()
+	b, err := gcs.New(ctx, cfg)
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() {
+		if err := b.Close(); err != nil {
+			t.Error(err)
+		}
+	})
+	return b
+}
 
 func TestGCSCloseReleasesClient(t *testing.T) {
 	ctx, cancel := context.WithTimeout(t.Context(), time.Minute)
@@ -32,14 +45,10 @@ func TestGCSCloseReleasesClient(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	closer, ok := any(b).(io.Closer)
-	if !ok {
-		t.Fatal("Backend has no Close; its storage client cannot be released")
-	}
 	if _, err := b.Get(ctx, "k"); !errors.Is(err, objstore.ErrNotFound) {
 		t.Fatal(err)
 	}
-	if err := closer.Close(); err != nil {
+	if err := b.Close(); err != nil {
 		t.Fatal(err)
 	}
 	if tr.closed.Load() != 1 {
@@ -70,17 +79,10 @@ func TestGCSMissingBucketPreservesCause(t *testing.T) {
 				fmt.Fprint(w, `{"error":{"code":404,"message":"bucket does not exist"}}`)
 			}))
 			t.Cleanup(srv.Close)
-			b, err := gcs.New(ctx, gcs.Config{Bucket: "b", Options: []option.ClientOption{
+			b := newBackend(t, ctx, gcs.Config{Bucket: "b", Options: []option.ClientOption{
 				option.WithEndpoint(srv.URL + "/storage/v1/"), option.WithoutAuthentication(), option.WithHTTPClient(srv.Client()),
 			}})
-			if err != nil {
-				t.Fatal(err)
-			}
-			t.Cleanup(func() {
-				if err := b.Close(); err != nil {
-					t.Error(err)
-				}
-			})
+			var err error
 			switch op {
 			case "Get":
 				_, err = b.Get(ctx, "k")
@@ -128,17 +130,10 @@ func TestGCSTranslationsPreserveCause(t *testing.T) {
 				}
 			}))
 			t.Cleanup(srv.Close)
-			b, err := gcs.New(ctx, gcs.Config{Bucket: "b", Options: []option.ClientOption{
+			b := newBackend(t, ctx, gcs.Config{Bucket: "b", Options: []option.ClientOption{
 				option.WithEndpoint(srv.URL + "/storage/v1/"), option.WithoutAuthentication(), option.WithHTTPClient(srv.Client()),
 			}})
-			if err != nil {
-				t.Fatal(err)
-			}
-			t.Cleanup(func() {
-				if err := b.Close(); err != nil {
-					t.Error(err)
-				}
-			})
+			var err error
 			switch op {
 			case "Get":
 				_, err = b.Get(ctx, "k")
@@ -174,17 +169,9 @@ func TestGCSGetRangeRejectsWrongOffset(t *testing.T) {
 		fmt.Fprint(w, "01")
 	}))
 	t.Cleanup(srv.Close)
-	b, err := gcs.New(ctx, gcs.Config{Bucket: "b", Options: []option.ClientOption{
+	b := newBackend(t, ctx, gcs.Config{Bucket: "b", Options: []option.ClientOption{
 		option.WithEndpoint(srv.URL + "/storage/v1/"), option.WithoutAuthentication(), option.WithHTTPClient(srv.Client()),
 	}})
-	if err != nil {
-		t.Fatal(err)
-	}
-	t.Cleanup(func() {
-		if err := b.Close(); err != nil {
-			t.Error(err)
-		}
-	})
 	if data, err := b.GetRange(ctx, "k", 4, 2); !errors.Is(err, objstore.ErrRange) || data != nil {
 		t.Fatalf("wrong-offset response accepted: %q %v", data, err)
 	}

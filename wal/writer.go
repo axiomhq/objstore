@@ -471,9 +471,13 @@ func (w *Writer[R]) Enqueue(ctx context.Context, records []R) (<-chan error, err
 	// Include the incoming records and a header reserve per record, the
 	// maximum number of pages they could need. Pending and flight are separate.
 	// Refuse promptly even when the store has stopped acknowledging writes.
-	if n := len(w.pending) + w.inflightRecordsLocked(); (w.maxUnacked > 0 && len(records) > w.maxUnacked-n) || reservedEntryBytes(w.pendingBytes, len(w.pending))+w.inflightBytesLocked() > w.unackedByteLimit-reservedEntryBytes(bytes, len(records)) {
+	n, reserved := len(w.pending), reservedEntryBytes(w.pendingBytes, len(w.pending))
+	if w.inflight != nil {
+		n += len(w.inflight.records)
+		reserved += w.inflight.bytes
+	}
+	if (w.maxUnacked > 0 && len(records) > w.maxUnacked-n) || reserved > w.unackedByteLimit-reservedEntryBytes(bytes, len(records)) {
 		w.rejected++
-		reserved := reservedEntryBytes(w.pendingBytes, len(w.pending)) + w.inflightBytesLocked()
 		w.mu.Unlock()
 		return nil, fmt.Errorf("%w: %d records, %d encoded bytes reserved", ErrOverloaded, n, reserved)
 	}
@@ -497,22 +501,6 @@ func (w *Writer[R]) Enqueue(ctx context.Context, records []R) (<-chan error, err
 // holds w.mu.
 func (w *Writer[R]) failedLocked() error {
 	return fmt.Errorf("%w (cause: %v)", ErrWriterFailed, w.terminal)
-}
-
-// inflightRecordsLocked is the size of the batch mid-commit, if any.
-// Caller holds w.mu.
-func (w *Writer[R]) inflightRecordsLocked() int {
-	if w.inflight == nil {
-		return 0
-	}
-	return len(w.inflight.records)
-}
-
-func (w *Writer[R]) inflightBytesLocked() int {
-	if w.inflight == nil {
-		return 0
-	}
-	return w.inflight.bytes
 }
 
 // reservedEntryBytes bounds encoded size even if every record forces a page

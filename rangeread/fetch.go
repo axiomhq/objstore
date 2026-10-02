@@ -264,7 +264,7 @@ func (r *Reader) FetchRanges(ctx context.Context, loads []Load) (context.Context
 				// retaining it beside them halves the room the children
 				// have. Concurrent cold reads planning the
 				// same parent still share its one GET.
-				data, src, counted, release, err = r.sharedParent(gctx, plan.Extent, parentGens[plan.Object], read)
+				data, src, counted, release, err = r.sharedParentOnce(gctx, plan.Extent, parentGens[plan.Object], read, false)
 			}
 			if err != nil {
 				return err
@@ -338,20 +338,6 @@ type rangeFlight struct {
 	reserved bool
 }
 
-// sharedParent runs read once for concurrent identical coalesced parents
-// and hands every waiter the same bytes, which callers only copy out of,
-// with who answered the read and the outcome this caller counts: its own
-// read's, or a memory hit for a waiter on another's.
-// Call release after copying: the producer and every consumer own the
-// reservation together. The read runs under the leader's context, so its
-// error may be the leader's own (a cancellation, a per-request budget):
-// a follower that gets one retries once, as a fresh
-// shared flight under its own context, rather than inherit it. Errors of
-// the read itself are shared without retrying.
-func (r *Reader) sharedParent(ctx context.Context, x Extent, generation uint64, read func(context.Context) ([]byte, cache.Outcome, error)) ([]byte, cache.Outcome, cache.Outcome, func(), error) {
-	return r.sharedParentOnce(ctx, x, generation, read, false)
-}
-
 func (r *Reader) releaseFlightLocked(f *rangeFlight) {
 	if f.refs--; f.refs == 0 {
 		f.data = nil
@@ -362,6 +348,16 @@ func (r *Reader) releaseFlightLocked(f *rangeFlight) {
 	}
 }
 
+// sharedParentOnce runs read once for concurrent identical coalesced parents
+// and hands every waiter the same bytes, which callers only copy out of,
+// with who answered the read and the outcome this caller counts: its own
+// read's, or a memory hit for a waiter on another's.
+// Call release after copying: the producer and every consumer own the
+// reservation together. The read runs under the leader's context, so its
+// error may be the leader's own (a cancellation, a per-request budget):
+// a follower that gets one retries once, as a fresh
+// shared flight under its own context, rather than inherit it. Errors of
+// the read itself are shared without retrying.
 func (r *Reader) sharedParentOnce(ctx context.Context, x Extent, generation uint64, read func(context.Context) ([]byte, cache.Outcome, error), retried bool) ([]byte, cache.Outcome, cache.Outcome, func(), error) {
 	if err := ctx.Err(); err != nil {
 		return nil, cache.Load, cache.Load, nil, err

@@ -7,17 +7,12 @@ import (
 	"slices"
 	"testing"
 
-	"github.com/axiomhq/objstore"
-	"github.com/axiomhq/objstore/fs"
 	"github.com/axiomhq/objstore/storetest"
+	"github.com/axiomhq/objstore/storetest/bucket"
 )
 
 func TestConformance(t *testing.T) {
-	s := fs.Open(t.TempDir(), "bucket", objstore.Config{})
-	if err := s.EnsureBucket(context.Background()); err != nil {
-		t.Fatal(err)
-	}
-	storetest.Conformance(t, s)
+	storetest.Conformance(t, bucket.NewFS(t))
 }
 
 // TestFSRejectsTraversal: keys become filesystem paths — a trust boundary
@@ -25,10 +20,7 @@ func TestConformance(t *testing.T) {
 // backend internals, traversal and empty elements are rejected, and other
 // nested dot names remain available to namespace keys.
 func TestFSRejectsTraversal(t *testing.T) {
-	s := fs.Open(t.TempDir(), "bucket", objstore.Config{})
-	if err := s.EnsureBucket(context.Background()); err != nil {
-		t.Fatal(err)
-	}
+	s := bucket.NewFS(t)
 	for _, key := range []string{"../evil", "a/../../evil", "a/./b", "/abs", "", "a//b", "a/", ".lock", ".tmp-1", "a/.lock", "a/.tmp-1"} {
 		if err := s.Put(context.Background(), key, []byte("x")); err == nil {
 			t.Fatalf("traversal key %q accepted", key)

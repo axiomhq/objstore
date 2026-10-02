@@ -95,9 +95,7 @@ func WalkParallelWithGet[T any](ctx context.Context, get func(context.Context, s
 	defer wg.Wait()
 	defer cancel()
 
-	wg.Add(1 + workers)
-	go func() {
-		defer wg.Done()
+	wg.Go(func() {
 		defer close(work)
 		defer close(order)
 		open := make(chan struct{})
@@ -122,15 +120,14 @@ func WalkParallelWithGet[T any](ctx context.Context, get func(context.Context, s
 			order <- p
 			work <- p
 		}
-	}()
+	})
 	for range workers {
-		go func() {
-			defer wg.Done()
+		wg.Go(func() {
 			for p := range work {
 				fetchPage(ctx, get, bytes, &end, through, decode, prep, p)
 				close(p.ready)
 			}
-		}()
+		})
 	}
 
 	batches := coalescer[T]{visit: visit}

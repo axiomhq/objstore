@@ -50,11 +50,8 @@ func OwnerID() string {
 	if err != nil {
 		host = "unknown"
 	}
-	return fmt.Sprintf("%s/%d/%s", host, os.Getpid(), mint()[:8])
+	return fmt.Sprintf("%s/%d/%s", host, os.Getpid(), rand.Text()[:8])
 }
-
-// mint returns a fresh nonce for one write attempt.
-func mint() string { return rand.Text() }
 
 // Lease is one key's token held by this process. Several independent
 // leases (say, one for writing and one for compacting) are just several
@@ -308,7 +305,9 @@ func (l *Lease) Take(ctx context.Context) error {
 			case initial:
 				// Ours, but landed too late to count: an expired record
 				// like any other, taken over below once it is free.
-				l.dropPending(cur.Nonce)
+				l.mu.Lock()
+				delete(l.pending, cur.Nonce)
+				l.mu.Unlock()
 			default:
 				return err
 			}
@@ -348,7 +347,7 @@ func (l *Lease) write(ctx context.Context, etag string) error {
 	// Timed from BEFORE the PUT: our local stop must never fall later than
 	// the expiry a taker reads out of the object.
 	start := time.Now()
-	body := Body{Owner: l.owner, Nonce: mint(), Expiry: start.Add(l.ttl)}
+	body := Body{Owner: l.owner, Nonce: rand.Text(), Expiry: start.Add(l.ttl)}
 	data, err := json.Marshal(body)
 	if err != nil {
 		return err
@@ -405,13 +404,6 @@ func (l *Lease) notePending(nonce string, start time.Time) {
 		}
 	}
 	l.pending[nonce] = start
-}
-
-// dropPending forgets one lost-answer attempt.
-func (l *Lease) dropPending(nonce string) {
-	l.mu.Lock()
-	delete(l.pending, nonce)
-	l.mu.Unlock()
 }
 
 // pendingStart is when the lost-answer attempt with this nonce began.

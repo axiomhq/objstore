@@ -445,9 +445,7 @@ func Conformance(t *testing.T, s *objstore.Store) {
 			start := make(chan struct{})
 			winners := make(chan string, 16)
 			for i := range 16 {
-				wg.Add(1)
-				go func() {
-					defer wg.Done()
+				wg.Go(func() {
 					<-start
 					value := string(rune('a' + i))
 					var ok bool
@@ -468,7 +466,7 @@ func Conformance(t *testing.T, s *objstore.Store) {
 					if ok {
 						winners <- value
 					}
-				}()
+				})
 			}
 			close(start)
 			wg.Wait()

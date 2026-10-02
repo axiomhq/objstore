@@ -6,6 +6,7 @@ import (
 	"errors"
 	"fmt"
 	"log/slog"
+	"maps"
 	"math/rand"
 	"os"
 	"runtime"
@@ -79,11 +80,7 @@ func runCacheScenarios(tb testing.TB) []cacheScenarioResult {
 			tb.Fatal(err)
 		}
 	}
-	keys := make([]string, 0, objects)
-	for key := range oracle {
-		keys = append(keys, key)
-	}
-	slices.Sort(keys)
+	keys := slices.Sorted(maps.Keys(oracle))
 	workingBytes := int64(objects * objectBytes)
 	type scenario struct {
 		name       string
@@ -184,12 +181,8 @@ func TestWALPagesHaveTheirOwnBudget(t *testing.T) {
 // table larger than the whole budget) is a disk hit, not a store read.
 func TestPutFillsTheDiskTier(t *testing.T) {
 	ctx := context.Background()
-	disk, err := NewDisk(t.TempDir(), 1<<20)
-	if err != nil {
-		t.Fatal(err)
-	}
+	disk := newDisk(t, 1<<20)
 	c := New(bucket.New(t), 1<<10, disk, Keys{})
-	defer c.Close()
 	key := "ns/x/table/1"
 	data := bytes.Repeat([]byte("table"), 1000)
 	if err := c.Put(ctx, key, data); err != nil {
@@ -366,12 +359,8 @@ func TestOutcomeAndClassStrings(t *testing.T) {
 // invalidated while it runs publishes nowhere, the disk tier included: its
 // disk key names a retired generation nothing reads again.
 func TestInvalidatedLoadSkipsTheDiskTier(t *testing.T) {
-	disk, err := NewDisk(t.TempDir(), 1<<20)
-	if err != nil {
-		t.Fatal(err)
-	}
+	disk := newDisk(t, 1<<20)
 	c := New(nil, 1<<20, disk, Keys{})
-	defer c.Close()
 	key := "ns/x/obj"
 	b, err := c.FetchWith(context.Background(), key, func(context.Context) ([]byte, error) {
 		c.InvalidateNamespace("x")

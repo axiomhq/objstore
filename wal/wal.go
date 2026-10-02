@@ -5,7 +5,6 @@ import (
 	"errors"
 	"fmt"
 	"strconv"
-	"strings"
 
 	"github.com/axiomhq/objstore"
 )
@@ -24,14 +23,7 @@ var maxBatchPages = uint64(2*maxUnackedBytes/(maxEntryBytes-entryHeaderReserve) 
 // Key is the object key of page seq under prefix. The sequence is
 // zero-padded to 20 digits (uint64 max), so lexical order is numeric order.
 func Key(prefix string, seq uint64) string {
-	var d [seqDigits]byte
-	digits := strconv.AppendUint(d[:0], seq, 10)
-	var b strings.Builder
-	b.Grow(len(prefix) + seqDigits)
-	b.WriteString(prefix)
-	b.WriteString("00000000000000000000"[len(digits):])
-	b.Write(digits)
-	return b.String()
+	return fmt.Sprintf("%s%020d", prefix, seq)
 }
 
 // SeqFromKey parses the sequence out of a key Key made, whatever its prefix:

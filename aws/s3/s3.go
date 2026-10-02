@@ -174,10 +174,19 @@ func (s *Backend) SupportsKMS() bool { return true }
 
 // opErr is objstore.OpErr, adding objstore.ErrAccessDenied for a 403 or an
 // SSE-KMS failure S3 reports under a KMS.* code (a disabled,
-// pending-deletion or unreachable key), and ErrNotFound for a missing bucket.
+// pending-deletion or unreachable key), ErrNotFound for a missing bucket
+// or a missing object on reads, and ErrRange for an invalid read range.
 func opErr(op, key string, err error) error {
 	if err == nil {
 		return nil
+	}
+	switch op {
+	case "get", "get-with-etag", "get-if-changed", "get-range":
+		if code := apiErrorCode(err); code == "NoSuchKey" {
+			err = fmt.Errorf("%w: %w", objstore.ErrNotFound, err)
+		} else if op == "get-range" && code == "InvalidRange" {
+			err = fmt.Errorf("%w: %w", objstore.ErrRange, err)
+		}
 	}
 	if apiErrorCode(err) == "NoSuchBucket" && !errors.Is(err, objstore.ErrNotFound) {
 		err = fmt.Errorf("%w: %w", objstore.ErrNotFound, err)
@@ -273,9 +282,6 @@ func apiErrorCode(err error) string {
 func (s *Backend) Get(ctx context.Context, key string) ([]byte, error) {
 	out, err := s.client.GetObject(ctx, &awss3.GetObjectInput{Bucket: &s.bucket, Key: &key})
 	if err != nil {
-		if apiErrorCode(err) == "NoSuchKey" {
-			return nil, opErr("get", key, fmt.Errorf("%w: %w", objstore.ErrNotFound, err))
-		}
 		return nil, opErr("get", key, err)
 	}
 	return readBody("get", key, out.Body, out.ContentLength)
@@ -426,20 +432,13 @@ func (s *Backend) DropBucket(ctx context.Context) error {
 func (s *Backend) GetWithETag(ctx context.Context, key string) ([]byte, string, error) {
 	out, err := s.client.GetObject(ctx, &awss3.GetObjectInput{Bucket: &s.bucket, Key: &key})
 	if err != nil {
-		if apiErrorCode(err) == "NoSuchKey" {
-			return nil, "", opErr("get-with-etag", key, fmt.Errorf("%w: %w", objstore.ErrNotFound, err))
-		}
 		return nil, "", opErr("get-with-etag", key, err)
 	}
 	data, err := readBody("get-with-etag", key, out.Body, out.ContentLength)
 	if err != nil {
 		return nil, "", err
 	}
-	etag := ""
-	if out.ETag != nil {
-		etag = *out.ETag
-	}
-	return data, etag, nil
+	return data, aws.ToString(out.ETag), nil
 }
 
 // GetIfChanged uses a single conditional request, including the 304 path.
@@ -453,9 +452,6 @@ func (s *Backend) GetIfChanged(ctx context.Context, key, etag string) ([]byte, s
 		var response *awshttp.ResponseError
 		if etag != "" && errors.As(err, &response) && response.HTTPStatusCode() == http.StatusNotModified {
 			return nil, etag, true, nil
-		}
-		if apiErrorCode(err) == "NoSuchKey" {
-			err = fmt.Errorf("%w: %w", objstore.ErrNotFound, err)
 		}
 		return nil, "", false, opErr("get-if-changed", key, err)
 	}
@@ -502,12 +498,6 @@ func (s *Backend) GetRange(ctx context.Context, key string, offset, length int64
 	span := fmt.Sprintf("bytes=%d-%d", offset, offset+length-1)
 	out, err := s.client.GetObject(ctx, &awss3.GetObjectInput{Bucket: &s.bucket, Key: &key, Range: &span})
 	if err != nil {
-		switch apiErrorCode(err) {
-		case "NoSuchKey":
-			err = fmt.Errorf("%w: %w", objstore.ErrNotFound, err)
-		case "InvalidRange":
-			err = fmt.Errorf("%w: %w", objstore.ErrRange, err)
-		}
 		return nil, opErr("get-range", key, err)
 	}
 	// Check both the returned range and length: a server ignoring Range must

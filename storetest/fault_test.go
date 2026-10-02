@@ -80,15 +80,13 @@ func TestFaultModes(t *testing.T) {
 		var mu sync.Mutex
 		var faults int
 		for i := 0; i < 32; i++ {
-			wg.Add(1)
-			go func(i int) {
-				defer wg.Done()
+			wg.Go(func() {
 				if err := s.Put(ctx, "race/"+string(rune('a'+i)), []byte("x")); errors.Is(err, storetest.ErrFault) {
 					mu.Lock()
 					faults++
 					mu.Unlock()
 				}
-			}(i)
+			})
 		}
 		wg.Wait()
 		if faults != 1 || f.Fired() != 1 {
@@ -195,19 +193,13 @@ func TestFaultShapeIsDeterministicAndBounded(t *testing.T) {
 func TestFaultSetShapeRacesCalls(t *testing.T) {
 	ctx, cancel := context.WithTimeout(t.Context(), time.Minute)
 	defer cancel()
-	raw := fs.Open(t.TempDir(), "shape-race", objstore.Config{})
-	if err := raw.EnsureBucket(ctx); err != nil {
-		t.Fatal(err)
-	}
-	s, f := storetest.NewFault(raw)
+	s, f := storetest.NewFault(bucket.NewFS(t))
 	if err := s.Put(ctx, "k", []byte("x")); err != nil {
 		t.Fatal(err)
 	}
 	var wg sync.WaitGroup
 	for range 4 {
-		wg.Add(1)
-		go func() {
-			defer wg.Done()
+		wg.Go(func() {
 			for range 200 {
 				if _, err := s.Get(ctx, "k"); err != nil && !errors.Is(err, storetest.ErrFault) {
 					t.Error(err)
@@ -215,7 +207,7 @@ func TestFaultSetShapeRacesCalls(t *testing.T) {
 				}
 				f.ShapeErrors()
 			}
-		}()
+		})
 	}
 	for i := range 200 {
 		if i%2 == 0 {

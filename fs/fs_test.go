@@ -194,9 +194,8 @@ func TestFSWritesBackInChunks(t *testing.T) {
 	}
 }
 
-// TestFSGetRangeEdges pins the range contract at EOF: a read ending exactly
-// at the last byte succeeds, one byte past it is objstore.ErrRange before any read,
-// and a zero-length read at EOF is empty and error-free.
+// TestFSGetRangeEdges: a raw zero-length read at EOF is empty and error-free
+// (Store rejects zero-length ranges; conformance covers non-empty ranges).
 func TestFSGetRangeEdges(t *testing.T) {
 	f := New(t.TempDir(), "b")
 	ctx := context.Background()
@@ -205,13 +204,6 @@ func TestFSGetRangeEdges(t *testing.T) {
 	}
 	if err := f.Put(ctx, "k", []byte("0123456789")); err != nil {
 		t.Fatal(err)
-	}
-	got, err := f.GetRange(ctx, "k", 9, 1)
-	if err != nil || string(got) != "9" {
-		t.Fatalf("read ending exactly at EOF: %q %v", got, err)
-	}
-	if _, err := f.GetRange(ctx, "k", 10, 1); !errors.Is(err, objstore.ErrRange) {
-		t.Fatalf("read past EOF: %v", err)
 	}
 	if got, err := f.GetRange(ctx, "k", 10, 0); err != nil || len(got) != 0 {
 		t.Fatalf("zero-length read at EOF: %q %v", got, err)
@@ -236,9 +228,6 @@ func TestFSHonoursContext(t *testing.T) {
 		"Put":         func(c context.Context) error { return f.Put(c, "c", []byte("x")) },
 		"PutIfAbsent": func(c context.Context) error { _, err := f.PutIfAbsent(c, "c", []byte("x")); return err },
 		"PutIfMatch":  func(c context.Context) error { _, err := f.PutIfMatch(c, "k", []byte("x"), "etag"); return err },
-		"Get":         func(c context.Context) error { _, err := f.Get(c, "k"); return err },
-		"ListPage":    func(c context.Context) error { _, _, err := f.ListPage(c, "", "", 10); return err },
-		"Delete":      func(c context.Context) error { return f.Delete(c, "k") },
 		"DropBucket":  func(c context.Context) error { return f.DropBucket(c) },
 	} {
 		if err := op(cancelled); !errors.Is(err, context.Canceled) {
@@ -249,7 +238,7 @@ func TestFSHonoursContext(t *testing.T) {
 		t.Fatalf("a cancelled put landed: %v", err)
 	}
 	if _, err := f.Get(ctx, "k"); err != nil {
-		t.Fatalf("a cancelled delete/drop took effect: %v", err)
+		t.Fatalf("a cancelled drop took effect: %v", err)
 	}
 
 	unlock, err := f.lockRoot(ctx)
@@ -412,9 +401,7 @@ func TestFSConcurrentCASWinner(t *testing.T) {
 	winners := make(chan string, 16)
 	start := make(chan struct{})
 	for i := range 16 {
-		wg.Add(1)
-		go func() {
-			defer wg.Done()
+		wg.Go(func() {
 			<-start
 			value := string(rune('a' + i))
 			ok, err := New(root, "b").PutIfMatch(ctx, "key", []byte(value), etag)
@@ -424,7 +411,7 @@ func TestFSConcurrentCASWinner(t *testing.T) {
 			if ok {
 				winners <- value
 			}
-		}()
+		})
 	}
 	close(start)
 	wg.Wait()

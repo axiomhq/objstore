@@ -10,6 +10,7 @@ import (
 	"time"
 
 	"golang.org/x/sync/semaphore"
+	"golang.org/x/time/rate"
 )
 
 // ErrNotFound is wrapped by every error for a missing object or bucket.
@@ -90,7 +91,7 @@ func Open(b Backend, cfg Config) *Store {
 		s.id = n.ID()
 	}
 	if cfg.RequestsPerSecond > 0 {
-		s.b = &paced{Backend: b, pace: newPacer(cfg.RequestsPerSecond)}
+		s.b = &paced{Backend: b, limiter: rate.NewLimiter(rate.Limit(cfg.RequestsPerSecond), 1)}
 	}
 	if cfg.MaxInflightWrites >= 0 {
 		s.writes = semaphore.NewWeighted(int64(cmp.Or(cfg.MaxInflightWrites, defaultMaxInflightWrites)))
@@ -255,18 +256,7 @@ func (s *Store) ListPage(ctx context.Context, prefix, after string, limit int) (
 
 // List returns all keys under prefix, lexically sorted.
 func (s *Store) List(ctx context.Context, prefix string) ([]string, error) {
-	var keys []string
-	for after := ""; ; {
-		page, next, err := s.ListPage(ctx, prefix, after, MaxListPage)
-		if err != nil {
-			return nil, err
-		}
-		keys = append(keys, page...)
-		if next == "" {
-			return keys, nil
-		}
-		after = next
-	}
+	return paginate(ctx, prefix, s.ListPage)
 }
 
 // ListPrefixes returns the immediate child prefixes under prefix — S3's
@@ -275,15 +265,19 @@ func (s *Store) List(ctx context.Context, prefix string) ([]string, error) {
 // instead of one key per object in the bucket. A prefix appears
 // only if at least one object lives under it, on every backend.
 func (s *Store) ListPrefixes(ctx context.Context, prefix string) ([]string, error) {
-	var prefixes []string
+	return paginate(ctx, prefix, s.ListPrefixesPage)
+}
+
+func paginate(ctx context.Context, prefix string, listPage func(context.Context, string, string, int) ([]string, string, error)) ([]string, error) {
+	var keys []string
 	for after := ""; ; {
-		page, next, err := s.ListPrefixesPage(ctx, prefix, after, MaxListPage)
+		page, next, err := listPage(ctx, prefix, after, MaxListPage)
 		if err != nil {
 			return nil, err
 		}
-		prefixes = append(prefixes, page...)
+		keys = append(keys, page...)
 		if next == "" {
-			return prefixes, nil
+			return keys, nil
 		}
 		after = next
 	}

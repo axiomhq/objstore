@@ -81,31 +81,37 @@ func TestWalkStreamsOnePageAtATime(t *testing.T) {
 			t.Fatalf("append %d: %v, %v", i+1, ok, err)
 		}
 	}
-	visited := 0
-	var readAt []int // visits completed when each page was read
-	err := WalkWithGet(ctx, func(ctx context.Context, key string) ([]byte, error) {
-		readAt = append(readAt, visited)
-		return s.Get(ctx, key)
-	}, testPrefix, 0, 0, Decode, func(entry) error {
-		visited++
-		return nil
-	})
-	if err != nil {
-		t.Fatal(err)
-	}
-	if visited != pages || len(readAt) != pages+1 { // +1: the miss that ends the log
-		t.Fatalf("visited %d entries over %d reads, want %d over %d", visited, len(readAt), pages, pages+1)
-	}
-	for i, n := range readAt {
-		if n != i {
-			t.Fatalf("page %d was read after %d visits, want %d: the walk read ahead", i+1, n, i)
-		}
+	for name, through := range map[string]uint64{"unbounded": 0, "one-page": 1, "bounded": pages} {
+		t.Run(name, func(t *testing.T) {
+			visited, records := 0, 0
+			var readAt []int // visits completed when each page was read
+			err := WalkWithGet(ctx, func(ctx context.Context, key string) ([]byte, error) {
+				readAt = append(readAt, visited)
+				return s.Get(ctx, key)
+			}, testPrefix, 0, through, Decode, func(e entry) error {
+				visited++
+				records += len(ids(e))
+				return nil
+			})
+			wantVisits, wantReads := int(through), int(through)
+			if through == 0 {
+				wantVisits, wantReads = pages, pages+1 // +1: the miss that ends the log
+			}
+			if err != nil || visited != wantVisits || records != wantVisits || len(readAt) != wantReads {
+				t.Fatalf("visited %d entries with %d records over %d reads, want %d over %d; error=%v", visited, records, len(readAt), wantVisits, wantReads, err)
+			}
+			for i, n := range readAt {
+				if n != i {
+					t.Fatalf("page %d was read after %d visits, want %d: the walk read ahead", i+1, n, i)
+				}
+			}
+		})
 	}
 }
 
 func TestKeyAcceptsAnyPrefix(t *testing.T) {
-	for _, prefix := range []string{"", "log/", "no-slash", "a/b/c-", "ns/x/wal/0"} {
-		for _, seq := range []uint64{0, 1, 42, 1 << 40, ^uint64(0)} {
+	for _, prefix := range []string{"", "x/", "log/", "no-slash", "a/b/c-", "ns/x/wal/0"} {
+		for _, seq := range []uint64{0, 1, 7, 42, 1 << 40, ^uint64(0)} {
 			key := Key(prefix, seq)
 			if len(key) != len(prefix)+20 || !strings.HasPrefix(key, prefix) {
 				t.Fatalf("Key(%q, %d) = %q", prefix, seq, key)

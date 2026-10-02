@@ -777,10 +777,7 @@ func (f *Backend) DropBucket(ctx context.Context) error {
 	err := os.RemoveAll(f.root)
 	// The tree is gone: nothing in it is durable any more, and a stale mark
 	// would let a later publish into a recreated bucket skip its walk.
-	f.durable.Range(func(k, _ any) bool {
-		f.durable.Delete(k)
-		return true
-	})
+	f.durable.Clear()
 	if err == nil {
 		err = f.syncDir(filepath.Dir(f.root))
 		if errors.Is(err, iofs.ErrNotExist) {

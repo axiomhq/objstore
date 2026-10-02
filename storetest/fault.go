@@ -5,6 +5,7 @@ import (
 	"crypto/sha256"
 	"errors"
 	"fmt"
+	"maps"
 	"math/rand/v2"
 	"slices"
 	"strings"
@@ -314,9 +315,7 @@ func (f *Fault) Ops() map[Op]int {
 	f.mu.Lock()
 	defer f.mu.Unlock()
 	out := make(map[Op]int, len(f.ops))
-	for op, n := range f.ops {
-		out[op] = n
-	}
+	maps.Copy(out, f.ops)
 	return out
 }
 
@@ -337,9 +336,7 @@ func (f *Fault) ReadKeys() map[string]int {
 	f.mu.Lock()
 	defer f.mu.Unlock()
 	out := make(map[string]int, len(f.readKeys))
-	for k, n := range f.readKeys {
-		out[k] = n
-	}
+	maps.Copy(out, f.readKeys)
 	return out
 }
 
@@ -353,9 +350,7 @@ func (f *Fault) WriteKeys() map[string]int {
 	f.mu.Lock()
 	defer f.mu.Unlock()
 	out := make(map[string]int, len(f.writeKeys))
-	for key, n := range f.writeKeys {
-		out[key] = n
-	}
+	maps.Copy(out, f.writeKeys)
 	return out
 }
 
@@ -477,7 +472,7 @@ func (f *Fault) hitAt(ctx context.Context, op Op, off int64, keys ...string) (Mo
 	f.ops[op]++
 	p := f.plan
 	if p.N <= 0 || p.Op != op ||
-		(p.Key != "" && !anyContains(keys, p.Key)) ||
+		(p.Key != "" && !slices.ContainsFunc(keys, func(k string) bool { return strings.Contains(k, p.Key) })) ||
 		((p.MatchFrom || p.From != 0) && p.From != off) {
 		f.mu.Unlock()
 		return 0, false
@@ -501,15 +496,6 @@ func (f *Fault) hitAt(ctx context.Context, op Op, off int64, keys ...string) (Mo
 		}
 	}
 	return 0, false
-}
-
-func anyContains(keys []string, sub string) bool {
-	for _, k := range keys {
-		if strings.Contains(k, sub) {
-			return true
-		}
-	}
-	return false
 }
 
 // pre is the injection for the modes that never reach storage.

@@ -2,6 +2,7 @@ package cache
 
 import (
 	"bytes"
+	"cmp"
 	"container/list"
 	"crypto/sha256"
 	"encoding/hex"
@@ -15,7 +16,6 @@ import (
 	"os"
 	"path/filepath"
 	"slices"
-	"sort"
 	"strconv"
 	"strings"
 	"sync"
@@ -173,9 +173,7 @@ func sweepStale(root string, logger *slog.Logger) error {
 	if !sweepable {
 		return nil
 	}
-	if logger == nil {
-		logger = slog.Default()
-	}
+	logger = cmp.Or(logger, slog.Default())
 	// Not filepath.Glob: root may contain pattern characters.
 	entries, err := os.ReadDir(root)
 	if err != nil {
@@ -431,7 +429,7 @@ func (c *Disk) PutChecked(key string, b []byte) error {
 			// A partial file we cannot reclaim must never escape accounting:
 			// stop caching rather than grow past the capacity.
 			c.closed = true
-			c.logger().Error("cache: disk tier closed: cannot remove temporary file", "path", tmp, "err", err)
+			cmp.Or(c.Logger, slog.Default()).Error("cache: disk tier closed: cannot remove temporary file", "path", tmp, "err", err)
 		}
 	}
 	if werr != nil {
@@ -470,13 +468,6 @@ func (c *Disk) PutChecked(key string, b []byte) error {
 	}
 	c.touch(key)
 	return nil
-}
-
-func (c *Disk) logger() *slog.Logger {
-	if c.Logger == nil {
-		return slog.Default()
-	}
-	return c.Logger
 }
 
 // detachDir renames the data directory aside, inside the locked home so no
@@ -903,7 +894,7 @@ func (c *Disk) Close() {
 	if err != nil {
 		c.failures++
 	}
-	logger := c.logger()
+	logger := cmp.Or(c.Logger, slog.Default())
 	c.mu.Unlock()
 	if err == nil && trash != "" {
 		err = os.RemoveAll(trash)
@@ -1024,10 +1015,5 @@ func (d *Disk) KeysForTest() []string {
 	}
 	d.mu.Lock()
 	defer d.mu.Unlock()
-	keys := make([]string, 0, len(d.items))
-	for k := range d.items {
-		keys = append(keys, k)
-	}
-	sort.Strings(keys)
-	return keys
+	return slices.Sorted(maps.Keys(d.items))
 }

@@ -1,6 +1,7 @@
 package cache
 
 import (
+	"cmp"
 	"context"
 	"errors"
 	"fmt"
@@ -192,13 +193,6 @@ func (c *Cache) putDisk(memory *ByteCache, key string, generation uint64, data [
 	}
 }
 
-func (c *Cache) logger() *slog.Logger {
-	if c.Logger == nil {
-		return slog.Default()
-	}
-	return c.Logger
-}
-
 // GateWidth bounds concurrent store GETs (Cache.Gate) so a wide query
 // cannot stampede the bucket. semaphore.Weighted keeps its occupancy private, so
 // AcquireGet/ReleaseGet count it for Stats.
@@ -236,7 +230,7 @@ func (c *Cache) FetchWith(ctx context.Context, key string, load func(context.Con
 // reader, which already missed key in both tiers, counts the returned
 // outcome, who answered it in the end.
 func (c *Cache) FetchCachedRange(ctx context.Context, key string, storedBytes int, load func(context.Context) ([]byte, error)) ([]byte, Outcome, error) {
-	b, o, _, err := c.fetchCached(ctx, key, load, false, storedBytes)
+	b, o, _, err := c.fetchCachedOnce(ctx, key, load, false, storedBytes, false)
 	return b, o, err
 }
 
@@ -247,20 +241,16 @@ func (c *Cache) FetchCached(ctx context.Context, key string, load func(context.C
 	if b, ok := Scoped(ctx, key); ok { // the stage paid for it already
 		return b, nil
 	}
-	b, o, owner, err := c.fetchCached(ctx, key, load, logical, 0)
+	b, o, owner, err := c.fetchCachedOnce(ctx, key, load, logical, 0, false)
 	if err == nil && logical {
 		c.NoteAs(ctx, key, o, owner)
 	}
 	return b, err
 }
 
-// fetchCached returns key's bytes, who answered this caller (a caller that
+// fetchCachedOnce returns key's bytes, who answered this caller (a caller that
 // waited on another's load is answered from memory), and whether this
 // lookup owns the request's miss of key (MarkMissed).
-func (c *Cache) fetchCached(ctx context.Context, key string, load func(context.Context) ([]byte, error), logical bool, storedBytes int) ([]byte, Outcome, bool, error) {
-	return c.fetchCachedOnce(ctx, key, load, logical, storedBytes, false)
-}
-
 func (c *Cache) fetchCachedOnce(ctx context.Context, key string, load func(context.Context) ([]byte, error), logical bool, storedBytes int, retried bool) ([]byte, Outcome, bool, error) {
 	memory := c.ByteCacheFor(key)
 	if b, ok := Scoped(ctx, key); ok {
@@ -296,7 +286,7 @@ func (c *Cache) fetchCachedOnce(ctx context.Context, key string, load func(conte
 		// where nothing can recover it: convert it into every waiter's error.
 		defer func() {
 			if p := recover(); p != nil {
-				c.logger().Error("cache: loader panic", "key", key, "panic", p, "stack", string(debug.Stack()))
+				cmp.Or(c.Logger, slog.Default()).Error("cache: loader panic", "key", key, "panic", p, "stack", string(debug.Stack()))
 				v, err = nil, fmt.Errorf("cache: fetch %s: panic: %v", key, p)
 			}
 		}()

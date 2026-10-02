@@ -20,9 +20,7 @@ func TestConcurrentRequestStatsStayIsolated(t *testing.T) {
 		ctx context.Context
 		key string
 	}{{hotCtx, "hot"}, {coldCtx, "cold"}} {
-		wg.Add(1)
-		go func() {
-			defer wg.Done()
+		wg.Go(func() {
 			<-start
 			for range 100 {
 				if _, err := c.FetchWith(tc.ctx, tc.key, func(context.Context) ([]byte, error) {
@@ -32,7 +30,7 @@ func TestConcurrentRequestStatsStayIsolated(t *testing.T) {
 					return
 				}
 			}
-		}()
+		})
 	}
 	close(start)
 	wg.Wait()
@@ -45,12 +43,8 @@ func TestConcurrentRequestStatsStayIsolated(t *testing.T) {
 }
 
 func TestRequestStatsCountDiskHits(t *testing.T) {
-	disk, err := NewDisk(t.TempDir(), 1<<20)
-	if err != nil {
-		t.Fatal(err)
-	}
+	disk := newDisk(t, 1<<20)
 	c := New(nil, 1024, disk, Keys{})
-	t.Cleanup(c.Close)
 	loads := 0
 	load := func(context.Context) ([]byte, error) {
 		loads++
@@ -135,11 +129,7 @@ func TestClassCountsSplitLookupsByKeyAndOutcome(t *testing.T) {
 			t.Errorf("class(%q) = %d, want %d", key, got, want)
 		}
 	}
-	disk, err := NewDisk(t.TempDir(), 1<<20)
-	if err != nil {
-		t.Fatal(err)
-	}
-	defer disk.Close()
+	disk := newDisk(t, 1<<20)
 	key := "ns/a/table/1#range#0+4096"
 	load := func(context.Context) ([]byte, error) { return []byte("region"), nil }
 	cold := New(nil, 1<<20, disk, keys)
@@ -187,20 +177,17 @@ func TestFlightFollowerCountsAMemoryHit(t *testing.T) {
 	leaderCtx, leader := WithRequestStats(context.Background())
 	followerCtx, follower := WithRequestStats(context.Background())
 	var wg sync.WaitGroup
-	wg.Add(2)
-	go func() {
-		defer wg.Done()
+	wg.Go(func() {
 		if _, err := c.FetchWith(leaderCtx, "k", load); err != nil {
 			t.Error(err)
 		}
-	}()
+	})
 	<-entered
-	go func() {
-		defer wg.Done()
+	wg.Go(func() {
 		if _, err := c.FetchWith(followerCtx, "k", load); err != nil {
 			t.Error(err)
 		}
-	}()
+	})
 	waitFor(t, func() bool { return c.waiters("k") == 2 }) // the follower joined the flight
 	close(release)
 	wg.Wait()

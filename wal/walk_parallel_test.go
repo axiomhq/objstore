@@ -41,6 +41,15 @@ func scanSummary(data []byte) (Header, summary, error) {
 	return h, summary{rows: rows, bytes: len(data)}, err
 }
 
+func putNumberedPages(t *testing.T, ctx context.Context, s *objstore.Store, pages uint64) {
+	t.Helper()
+	for seq := uint64(1); seq <= pages; seq++ {
+		if ok, err := put(ctx, s, testPrefix, Header{Seq: seq}, Bytes(fmt.Sprint(seq))); !ok || err != nil {
+			t.Fatalf("append %d: ok=%v err=%v", seq, ok, err)
+		}
+	}
+}
+
 func TestWalkParallelMatchesWalk(t *testing.T) {
 	ctx := context.Background()
 	s := bucket.New(t)
@@ -117,11 +126,7 @@ func TestWalkParallelMatchesWalk(t *testing.T) {
 func TestWalkParallelVisitError(t *testing.T) {
 	ctx := context.Background()
 	s := bucket.New(t)
-	for seq := uint64(1); seq <= 20; seq++ {
-		if ok, err := put(ctx, s, testPrefix, Header{Seq: seq}, Bytes(fmt.Sprint(seq))); !ok || err != nil {
-			t.Fatal(err)
-		}
-	}
+	putNumberedPages(t, ctx, s, 20)
 	stop := errors.New("stop visiting")
 	var visited []uint64
 	err := WalkParallel(ctx, s, testPrefix, 0, 0, 8, Decode, nil, func(e entry) error {
@@ -157,11 +162,7 @@ func TestWalkParallelStopsAtFirstError(t *testing.T) {
 	// goroutines alive. Stopping at the first error does not depend on the
 	// backend.
 	s := bucket.NewFS(t)
-	for seq := uint64(1); seq <= 12; seq++ {
-		if ok, err := put(ctx, s, testPrefix, Header{Seq: seq}, Bytes(fmt.Sprint(seq))); !ok || err != nil {
-			t.Fatal(err)
-		}
-	}
+	putNumberedPages(t, ctx, s, 12)
 	if err := s.Put(ctx, Key(testPrefix, 7), []byte("corrupt")); err != nil {
 		t.Fatal(err)
 	}
@@ -184,11 +185,7 @@ func TestWalkParallelStopsAtFirstError(t *testing.T) {
 func TestWalkParallelCancellation(t *testing.T) {
 	ctx := context.Background()
 	s := bucket.New(t)
-	for seq := uint64(1); seq <= 64; seq++ {
-		if ok, err := put(ctx, s, testPrefix, Header{Seq: seq}, Bytes(fmt.Sprint(seq))); !ok || err != nil {
-			t.Fatal(err)
-		}
-	}
+	putNumberedPages(t, ctx, s, 64)
 	walkCtx, cancel := context.WithCancel(ctx)
 	defer cancel()
 	start := time.Now()
@@ -210,11 +207,7 @@ func TestWalkParallelWithGetFetchesConcurrently(t *testing.T) {
 	ctx := context.Background()
 	s := bucket.New(t)
 	const pages, workers = 8, 4
-	for seq := uint64(1); seq <= pages; seq++ {
-		if ok, err := put(ctx, s, testPrefix, Header{Seq: seq}, Bytes(fmt.Sprint(seq))); !ok || err != nil {
-			t.Fatal(err)
-		}
-	}
+	putNumberedPages(t, ctx, s, pages)
 	var mu sync.Mutex
 	entered := 0
 	all := make(chan struct{})

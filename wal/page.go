@@ -180,15 +180,9 @@ func checkRecordSize(n int) error {
 }
 
 // framedSize is a record of n bytes with its length prefix.
-func framedSize(n int) int { return uvarintSize(n) + n }
-
-func uvarintSize(n int) int {
-	size := 1
-	for n >= 0x80 {
-		n >>= 7
-		size++
-	}
-	return size
+func framedSize(n int) int {
+	var scratch [binary.MaxVarintLen64]byte
+	return binary.PutUvarint(scratch[:], uint64(n)) + n
 }
 
 var castagnoli = crc32.MakeTable(crc32.Castagnoli)
@@ -333,17 +327,9 @@ func (r *pageReader) number() uint64 {
 	return v
 }
 
-func (r *pageReader) count(width int) int {
+func (r *pageReader) blob() []byte {
 	n := r.number()
-	if r.err || n > uint64(len(r.data)/width) {
-		r.err = true
-		return 0
-	}
-	return int(n)
-}
-
-func (r *pageReader) take(n int) []byte {
-	if r.err || n > len(r.data) {
+	if r.err || n > uint64(len(r.data)) {
 		r.err = true
 		return nil
 	}
@@ -351,5 +337,3 @@ func (r *pageReader) take(n int) []byte {
 	r.data = r.data[n:]
 	return v
 }
-
-func (r *pageReader) blob() []byte { return r.take(r.count(1)) }

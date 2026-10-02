@@ -4,12 +4,12 @@ import (
 	"context"
 	"errors"
 	"fmt"
-	"sync"
 	"testing"
 	"time"
 
 	"github.com/axiomhq/objstore"
 	"github.com/axiomhq/objstore/fs"
+	"github.com/axiomhq/objstore/storetest"
 )
 
 // TestWriteGateBoundsBulkWritesButNotUrgent pins the write path decoupling:
@@ -102,54 +102,22 @@ func TestWriteGateCleanupOnEarlyReturn(t *testing.T) {
 	}
 }
 
-// pausedPut signals backend entry while the caller still holds its write slot.
-type pausedPut struct {
-	objstore.Backend
-	key     string
-	entered chan struct{}
-	resume  chan struct{}
-}
-
-func (p *pausedPut) Put(ctx context.Context, key string, data []byte) error {
-	if key == p.key {
-		close(p.entered)
-		select {
-		case <-p.resume:
-		case <-ctx.Done():
-			return ctx.Err()
-		}
-	}
-	return p.Backend.Put(ctx, key, data)
-}
-
 func pauseWrite(t *testing.T, ctx context.Context, base *objstore.Store, key string) (*objstore.Store, <-chan error, func()) {
 	t.Helper()
-	p := &pausedPut{key: key, entered: make(chan struct{}), resume: make(chan struct{})}
-	s := base.WithBackend(func(b objstore.Backend) objstore.Backend { p.Backend = b; return p })
-	var once sync.Once
-	resume := func() { once.Do(func() { close(p.resume) }) }
+	s, f := storetest.Faulty(t, base)
+	f.Set(storetest.Plan{Op: storetest.OpPut, N: 1, Mode: storetest.Pause, Key: key})
 	first := make(chan error, 1)
-	finished := make(chan struct{})
-	t.Cleanup(func() {
-		resume()
-		cleanupCtx, cancel := context.WithTimeout(context.WithoutCancel(ctx), 5*time.Second)
-		defer cancel()
+	go func() { first <- s.Put(ctx, key, []byte("a")) }()
+	tick := time.NewTicker(time.Millisecond)
+	defer tick.Stop()
+	for f.Fired() == 0 {
 		select {
-		case <-finished:
-		case <-cleanupCtx.Done():
-			t.Error("paused writer did not exit during cleanup")
+		case <-tick.C:
+		case <-ctx.Done():
+			t.Fatalf("first put never reached the store: %v", ctx.Err())
 		}
-	})
-	go func() {
-		defer close(finished)
-		first <- s.Put(ctx, key, []byte("a"))
-	}()
-	select {
-	case <-p.entered:
-	case <-ctx.Done():
-		t.Fatalf("first put never reached the store: %v", ctx.Err())
 	}
-	return s, first, resume
+	return s, first, f.Resume
 }
 
 func receiveWrite(t *testing.T, ctx context.Context, ch <-chan error) error {

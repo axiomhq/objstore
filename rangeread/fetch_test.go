@@ -118,7 +118,7 @@ func TestSharedParentReservationCoversConsumers(t *testing.T) {
 		}
 		results := make(chan consumer, 2)
 		fetch := func() {
-			data, _, _, release, err := r.sharedParent(ctx, x, 0, read)
+			data, _, _, release, err := r.sharedParentOnce(ctx, x, 0, read, false)
 			results <- consumer{data, release, err}
 		}
 		go fetch()
@@ -217,7 +217,7 @@ func TestParentFlightKeyDoesNotAliasObjectGeneration(t *testing.T) {
 	}
 	leader := make(chan error, 1)
 	go func() {
-		_, _, _, leave, err := r.sharedParent(ctx, x, 1, func(ctx context.Context) ([]byte, cache.Outcome, error) {
+		_, _, _, leave, err := r.sharedParentOnce(ctx, x, 1, func(ctx context.Context) ([]byte, cache.Outcome, error) {
 			close(entered)
 			select {
 			case <-release:
@@ -225,7 +225,7 @@ func TestParentFlightKeyDoesNotAliasObjectGeneration(t *testing.T) {
 			case <-ctx.Done():
 				return nil, cache.Load, ctx.Err()
 			}
-		})
+		}, false)
 		if err == nil {
 			leave()
 		}
@@ -243,9 +243,9 @@ func TestParentFlightKeyDoesNotAliasObjectGeneration(t *testing.T) {
 	}
 	follower := make(chan error, 1)
 	go func() {
-		b, _, _, leave, err := r.sharedParent(ctx, x, 0, func(context.Context) ([]byte, cache.Outcome, error) {
+		b, _, _, leave, err := r.sharedParentOnce(ctx, x, 0, func(context.Context) ([]byte, cache.Outcome, error) {
 			return []byte("TWO"), cache.Load, nil
-		})
+		}, false)
 		if err == nil {
 			defer leave()
 		}
@@ -698,7 +698,7 @@ func TestSharedParentFollowerRetriesTheLeadersError(t *testing.T) {
 			own := fmt.Errorf("leader: %w", tc.err)
 			leader := make(chan error, 1)
 			go func() {
-				_, _, _, leave, err := r.sharedParent(ctx, x, 0, func(ctx context.Context) ([]byte, cache.Outcome, error) {
+				_, _, _, leave, err := r.sharedParentOnce(ctx, x, 0, func(ctx context.Context) ([]byte, cache.Outcome, error) {
 					close(started)
 					select {
 					case <-release:
@@ -706,7 +706,7 @@ func TestSharedParentFollowerRetriesTheLeadersError(t *testing.T) {
 					case <-ctx.Done():
 						return nil, cache.Load, ctx.Err()
 					}
-				})
+				}, false)
 				if err == nil {
 					leave()
 				}
@@ -716,9 +716,9 @@ func TestSharedParentFollowerRetriesTheLeadersError(t *testing.T) {
 			await(t, joined, "leader join")
 			follower := make(chan error, 1)
 			go func() {
-				data, _, _, leave, err := r.sharedParent(ctx, x, 0, func(context.Context) ([]byte, cache.Outcome, error) {
+				data, _, _, leave, err := r.sharedParentOnce(ctx, x, 0, func(context.Context) ([]byte, cache.Outcome, error) {
 					return []byte("data"), cache.Load, nil
-				})
+				}, false)
 				if err == nil {
 					defer leave()
 				}

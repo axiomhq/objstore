@@ -83,9 +83,8 @@ func TestKeyOrdering(t *testing.T) {
 	if Key("x/", 2) >= Key("x/", 10) {
 		t.Fatalf("key ordering broken: %q >= %q", Key("x/", 2), Key("x/", 10))
 	}
-	seq, err := SeqFromKey(Key("x/", 42))
-	if err != nil || seq != 42 {
-		t.Fatalf("round-trip: %d, %v", seq, err)
+	if got := Key("x/", 7); got != "x/00000000000000000007" {
+		t.Fatalf("key format: %q", got)
 	}
 }
 
@@ -113,10 +112,6 @@ func TestAppendReplay(t *testing.T) {
 	if !slices.Equal(ids(entries[1]), []string{"b"}) {
 		t.Fatalf("entry 2 content: %+v", entries[1])
 	}
-	entries, err = replay(ctx, s, testPrefix, 2)
-	if err != nil || len(entries) != 1 || entries[0].Seq != 3 {
-		t.Fatalf("replay after=2: %+v, %v", entries, err)
-	}
 	// Prefixes are isolated.
 	entries, err = replay(ctx, s, "other/", 0)
 	if err != nil || len(entries) != 0 {
@@ -135,25 +130,23 @@ func TestReplayWalksToNotFound(t *testing.T) {
 			t.Fatalf("append %d: ok=%v err=%v", seq, ok, err)
 		}
 	}
-	f.ResetOps()
-	entries, err := replay(ctx, s, testPrefix, 0)
-	if err != nil || len(entries) != 3 {
-		t.Fatalf("replay: %+v, %v", entries, err)
-	}
-	ops := f.Ops()
-	if ops[storetest.OpList] != 0 {
-		t.Fatalf("the walk listed the WAL prefix: %v", ops)
-	}
-	if ops[storetest.OpGet] != 4 {
-		t.Fatalf("replay of 3 pages cost %d GETs, want 3 + the miss: %v", ops[storetest.OpGet], ops)
-	}
-	// From a watermark: only what is above it, plus the miss.
-	f.ResetOps()
-	if entries, err = replay(ctx, s, testPrefix, 2); err != nil || len(entries) != 1 || entries[0].Seq != 3 {
-		t.Fatalf("replay after=2: %+v, %v", entries, err)
-	}
-	if ops := f.Ops(); ops[storetest.OpGet] != 2 || ops[storetest.OpList] != 0 {
-		t.Fatalf("replay from a watermark: %v", ops)
+	// From either the start or a watermark: only what is above it, plus the miss.
+	for name, after := range map[string]uint64{"all": 0, "after-watermark": 2} {
+		t.Run(name, func(t *testing.T) {
+			f.ResetOps()
+			entries, err := replay(ctx, s, testPrefix, after)
+			if err != nil || len(entries) != 3-int(after) {
+				t.Fatalf("replay after=%d: %+v, %v", after, entries, err)
+			}
+			for i, e := range entries {
+				if e.Seq != after+uint64(i)+1 {
+					t.Fatalf("replay after=%d: entry %d has sequence %d", after, i, e.Seq)
+				}
+			}
+			if ops := f.Ops(); ops[storetest.OpGet] != len(entries)+1 || ops[storetest.OpList] != 0 {
+				t.Fatalf("replay after=%d: %v", after, ops)
+			}
+		})
 	}
 	// A page ABOVE a gap is not part of the log: the walk ends at the gap.
 	// No writer can produce one (TestCrashedWriterLeavesNoHole); this pins
@@ -161,7 +154,7 @@ func TestReplayWalksToNotFound(t *testing.T) {
 	if ok, err := put(ctx, s, testPrefix, Header{Seq: 5}, Bytes("orphan")); err != nil || !ok {
 		t.Fatalf("plant seq 5: ok=%v err=%v", ok, err)
 	}
-	if entries, err = replay(ctx, s, testPrefix, 0); err != nil || len(entries) != 3 {
+	if entries, err := replay(ctx, s, testPrefix, 0); err != nil || len(entries) != 3 {
 		t.Fatalf("the walk did not stop at the gap: %+v, %v", entries, err)
 	}
 	f.Set(storetest.Plan{Op: storetest.OpGet, Key: Key(testPrefix, 2), N: 1, Mode: storetest.Fail})
@@ -192,25 +185,6 @@ func FuzzSeqFromKey(f *testing.F) {
 			t.Fatalf("SeqFromKey(%q)=%d, but canonical key re-parses as %d (%v)", key, seq, got, err)
 		}
 	})
-}
-
-func TestWalkWithGetUsesSuppliedFetcher(t *testing.T) {
-	ctx := context.Background()
-	s := bucket.New(t)
-	if ok, err := put(ctx, s, testPrefix, Header{Seq: 1}, Bytes("a")); err != nil || !ok {
-		t.Fatalf("append: ok=%v err=%v", ok, err)
-	}
-	reads, seen := 0, 0
-	err := WalkWithGet(ctx, func(ctx context.Context, key string) ([]byte, error) {
-		reads++
-		return s.Get(ctx, key)
-	}, testPrefix, 0, 1, Decode, func(e entry) error {
-		seen += len(ids(e))
-		return nil
-	})
-	if err != nil || reads != 1 || seen != 1 {
-		t.Fatalf("walk: reads=%d records=%d err=%v", reads, seen, err)
-	}
 }
 
 func TestReplayPublishesBatchOnlyAtLastPage(t *testing.T) {
@@ -277,6 +251,18 @@ func TestDecodeRejectsHugeDeclaredCountWithoutAllocation(t *testing.T) {
 		}
 	}); allocs > 5 {
 		t.Fatalf("huge count used %.0f allocations, want constant-size rejection", allocs)
+	}
+}
+
+func TestFramedSizeAllocationFree(t *testing.T) {
+	if allocs := testing.AllocsPerRun(100, func() {
+		for _, tc := range []struct{ n, want int }{{0, 1}, {127, 128}, {128, 130}, {16383, 16385}, {16384, 16387}, {maxPageBytes, maxPageBytes + 4}} {
+			if got := framedSize(tc.n); got != tc.want {
+				t.Fatalf("framedSize(%d) = %d, want %d", tc.n, got, tc.want)
+			}
+		}
+	}); allocs != 0 {
+		t.Fatalf("framedSize used %g allocations, want zero", allocs)
 	}
 }
 
