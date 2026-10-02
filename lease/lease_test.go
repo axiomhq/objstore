@@ -1400,3 +1400,35 @@ func TestZeroRefIsNotValid(t *testing.T) {
 		t.Fatalf("zero Ref is valid: %v", err)
 	}
 }
+
+// TestContinuousNeedsFloorProof: a handle that regained a broken lease is
+// valid again but not continuous, until the holder proves its floor.
+func TestContinuousNeedsFloorProof(t *testing.T) {
+	synctest.Test(t, func(t *testing.T) {
+		ctx := t.Context()
+		l := New(newMemStore(), "floor/lease", "owner", time.Minute)
+		if err := l.Take(ctx); err != nil {
+			t.Fatal(err)
+		}
+		if !l.Continuous() {
+			t.Fatal("fresh acquisition is not continuous")
+		}
+		l.Fence()
+		if l.Continuous() {
+			t.Fatal("fenced lease is continuous")
+		}
+		if err := l.Steal(ctx); err != nil {
+			t.Fatal(err)
+		}
+		if err := l.Valid(); err != nil {
+			t.Fatal(err)
+		}
+		if l.Continuous() {
+			t.Fatal("re-taken lease is continuous before FloorProven")
+		}
+		l.FloorProven()
+		if !l.Continuous() {
+			t.Fatal("FloorProven did not restore continuity")
+		}
+	})
+}

@@ -220,7 +220,14 @@ func (c *Cache) ReleaseGet() {
 // path as whole objects. The cache key is logical; load performs the exact
 // store operation only on a miss.
 func (c *Cache) FetchWith(ctx context.Context, key string, load func(context.Context) ([]byte, error)) ([]byte, error) {
-	return c.FetchCached(ctx, key, load, true)
+	if b, ok := Scoped(ctx, key); ok { // the stage paid for it already
+		return b, nil
+	}
+	b, o, owner, err := c.fetchCachedOnce(ctx, key, load, true, 0, false)
+	if err == nil {
+		c.NoteAs(ctx, key, o, owner)
+	}
+	return b, err
 }
 
 // FetchCachedRange fetches a decoded single-child range through the tiers.
@@ -232,20 +239,6 @@ func (c *Cache) FetchWith(ctx context.Context, key string, load func(context.Con
 func (c *Cache) FetchCachedRange(ctx context.Context, key string, storedBytes int, load func(context.Context) ([]byte, error)) ([]byte, Outcome, error) {
 	b, o, _, err := c.fetchCachedOnce(ctx, key, load, false, storedBytes, false)
 	return b, o, err
-}
-
-// FetchCached is FetchWith for a caller that counts its own lookup:
-// logical=false charges no outcome and peeks rather than touching the
-// memory tier's recency.
-func (c *Cache) FetchCached(ctx context.Context, key string, load func(context.Context) ([]byte, error), logical bool) ([]byte, error) {
-	if b, ok := Scoped(ctx, key); ok { // the stage paid for it already
-		return b, nil
-	}
-	b, o, owner, err := c.fetchCachedOnce(ctx, key, load, logical, 0, false)
-	if err == nil && logical {
-		c.NoteAs(ctx, key, o, owner)
-	}
-	return b, err
 }
 
 // fetchCachedOnce returns key's bytes, who answered this caller (a caller that
@@ -447,7 +440,7 @@ func (c *resultsContext) Value(key any) any {
 	return c.Context.Value(key)
 }
 
-// WithResults publishes one query stage's exact children on ctx. FetchCached
+// WithResults publishes one query stage's exact children on ctx. FetchWith
 // prefers them over the LRU so a tiny cache cannot drop a working set the
 // stage already paid for.
 //

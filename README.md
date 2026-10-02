@@ -319,7 +319,7 @@ storetest imports no provider, so it links neither the AWS nor the GCS SDK.
 | S3 in package `objstore` | package `s3` at `objstore/aws/s3`; GCS (new) is `objstore/gcp/gcs` |
 | `objstore.New(ctx, endpoint, bucket)` | `s3.Open(ctx, s3.Config{Endpoint: endpoint, Bucket: bucket}, objstore.Config{})`; for `file://root`, `fs.Open(root, bucket, objstore.Config{})` |
 | `Config.Endpoint`, `Bucket`, `SSE`, `KMSKeyID`, `AllowedEndpoints`, `RequestTimeout` | `s3.Config` |
-| `Store.SSE()`, `objstore.ErrEndpointDenied` | `(*s3.Backend).SSE()` (from `s3.New`), `s3.ErrEndpointDenied` |
+| `Store.SSE()`, `objstore.ErrEndpointDenied` | gone: set it with `s3.Config.SSE`; `s3.ErrEndpointDenied` |
 | `s.ConfigureCMEK(p)`, `InstallNamespaceKey`, `RotateNamespaceKey`, `CheckNamespaceKey`, package `kms` | gone: `s = s.WithKMSKeys(fn)`, and the store encrypts (see [Encryption](#encryption)) |
 | `Timings.LogAttrs()` | `Timings.Attrs()` |
 | `l.Release()`, `ref.Release()` | `l.Release(ctx)`, `ref.Release(ctx)` |

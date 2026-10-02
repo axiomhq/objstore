@@ -1,5 +1,14 @@
 # Changelog
 
+## Unreleased
+
+### Removed
+
+API nothing calls, here or in its known importers (dotwerk, logwerk):
+
+- cache: `AddRequestLookups`; `ByteCache.Hit`, `Misses`, `LowStats`, `LowCharge`, and the low-priority hit and miss counters behind them; `Cache.FetchCached` (use `FetchWith`).
+- aws/s3: `Backend.SSE` (the caller set it in `s3.Config`).
+
 ## v0.8.0
 
 ### Changed behaviour

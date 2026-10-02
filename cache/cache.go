@@ -39,8 +39,7 @@ type ByteCache struct {
 	low     func(key string) bool // nil: every entry is regular
 	gens    generations           // per namespace; invalidation also retires in-flight publications
 
-	hits, misses       atomic.Int64
-	lowHits, lowMisses atomic.Int64
+	hits, misses atomic.Int64
 }
 
 type cacheStripe struct {
@@ -196,9 +195,6 @@ func (c *ByteCache) get(key string, stat bool) ([]byte, bool) {
 		return nil, false
 	}
 	c.hits.Add(1)
-	if e.low {
-		c.lowHits.Add(1)
-	}
 	return e.val, true
 }
 
@@ -446,27 +442,11 @@ func Decoded[T any](c *ByteCache, key string) (T, bool) {
 // Missed records a logical miss of key, e.g. a value the range reader loads.
 func (c *ByteCache) Missed(key string) {
 	c.misses.Add(1)
-	if c.isLow(key) {
-		c.lowMisses.Add(1)
-	}
-}
-
-// Hit records a logical hit of key after a non-counting Peek.
-func (c *ByteCache) Hit(key string) {
-	c.hits.Add(1)
-	if c.isLow(key) {
-		c.lowHits.Add(1)
-	}
 }
 
 // Stats returns cumulative hits and misses (observability + test hook).
 func (c *ByteCache) Stats() (hits, misses int) {
 	return int(c.hits.Load()), int(c.misses.Load())
-}
-
-// LowStats is Stats for the low-priority keys alone.
-func (c *ByteCache) LowStats() (hits, misses int) {
-	return int(c.lowHits.Load()), int(c.lowMisses.Load())
 }
 
 // Charge is the retained size summed over every stripe.
@@ -480,22 +460,6 @@ func (c *ByteCache) Charge() int {
 	}
 	return total
 }
-
-// LowCharge is the retained size of the low-priority entries.
-func (c *ByteCache) LowCharge() int {
-	total := 0
-	for i := range c.stripes {
-		s := &c.stripes[i]
-		s.mu.Lock()
-		total += s.lists[1].size
-		s.mu.Unlock()
-	}
-	return total
-}
-
-// Misses is the cumulative miss counter. Tests poll it to observe a follower
-// joining a singleflight.
-func (c *ByteCache) Misses() int64 { return c.misses.Load() }
 
 // DecodedSize is the charged retained size of key's decode, if any.
 func (c *ByteCache) DecodedSize(key string) (int, bool) {

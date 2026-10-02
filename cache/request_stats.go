@@ -60,14 +60,6 @@ func WithRequestStats(ctx context.Context) (context.Context, *RequestStats) {
 	return context.WithValue(ctx, requestStatsKey{}, s), s
 }
 
-// AddRequestLookups charges lookups made elsewhere on this request's behalf:
-// the cache lookups of a shard leg another query node ran.
-func AddRequestLookups(ctx context.Context, classes ClassCounts) {
-	if s, _ := ctx.Value(requestStatsKey{}).(*RequestStats); s != nil {
-		s.classes.add(classes)
-	}
-}
-
 // Classes is this request's lookups by class and outcome.
 func (s *RequestStats) Classes() ClassCounts { return s.classes.snapshot() }
 
@@ -151,14 +143,6 @@ func (c ClassCounts) HitRatio() float64 {
 
 type classCounters struct {
 	n [numOutcomes][NumClasses]atomic.Int64 // by Outcome
-}
-
-func (cc *classCounters) add(c ClassCounts) {
-	for i := range NumClasses {
-		cc.n[MemoryHit][i].Add(c.MemoryHits[i])
-		cc.n[DiskHit][i].Add(c.DiskHits[i])
-		cc.n[Load][i].Add(c.Loads[i])
-	}
 }
 
 // Note counts one logical lookup of key with outcome o, for the process

@@ -618,8 +618,7 @@ func (l *Lease) retire(released bool) {
 // since it was acquired: valid now, never fenced, never retired or
 // released, and not waiting to re-prove itself (FloorProven). It is a
 // purely LOCAL question and the only claim a writer can make about its own
-// next sequence without a store read. Also a test hook: no package in this
-// module calls it.
+// next sequence without a store read.
 func (l *Lease) Continuous() bool {
 	if l == nil {
 		return false
@@ -635,8 +634,7 @@ func (l *Lease) Continuous() bool {
 // FloorProven records that the holder checked its position against the
 // durable state and the check passed, which closes an interruption:
 // nothing can have overtaken this holder between that read and its own
-// next sequence without taking the lease, which fences it again. Also a
-// test hook: no package in this module calls it.
+// next sequence without taking the lease, which fences it again.
 func (l *Lease) FloorProven() {
 	if l == nil {
 		return

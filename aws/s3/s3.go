@@ -149,11 +149,6 @@ func New(ctx context.Context, cfg Config) (*Backend, error) {
 // ID is the endpoint and bucket, or s3://bucket on AWS's default endpoint.
 func (s *Backend) ID() string { return cmp.Or(s.endpoint, "s3:/") + "/" + s.bucket }
 
-// SSE reports the bucket's configured server-side encryption: the S3 mode
-// ("", "AES256" or "aws:kms") and the KMS key id when one is set. The caller
-// decides what it means for its users; the store does not interpret it.
-func (s *Backend) SSE() (mode, kmsKeyID string) { return s.sse, s.kmsKeyID }
-
 func (s *Backend) putInput(ctx context.Context, key string, data []byte) *awss3.PutObjectInput {
 	in := &awss3.PutObjectInput{Bucket: &s.bucket, Key: &key, Body: bytes.NewReader(data)}
 	if s.sse != "" {
