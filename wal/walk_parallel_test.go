@@ -528,7 +528,7 @@ func TestWalkParallelRejectsImpossibleBatchPages(t *testing.T) {
 
 func TestWalkParallelChargesRecordDescriptors(t *testing.T) {
 	const records = 1 << 20
-	data, err := appendHeader(nil, Header{Seq: 1}, records, 0)
+	data, err := appendHeader(nil, Header{Seq: 1}, records, 0, records)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -573,7 +573,7 @@ func TestWalkParallelBatchBudgetMatchesWalk(t *testing.T) {
 				if err != nil {
 					return nil, err
 				}
-				return appendHeader(nil, Header{Seq: seq, Nonce: "batch", BatchPages: 3, BatchIndex: (seq - 1) % 3}, tc.records, 0)
+				return appendHeader(nil, Header{Seq: seq, Nonce: "batch", BatchPages: 3, BatchIndex: (seq - 1) % 3}, tc.records, 0, tc.records)
 			}
 			decode := func(b []byte) (Header, Header, error) {
 				h, err := DecodeHeader(b)

@@ -412,18 +412,19 @@ func TestEncodeDecodeRoundTrip(t *testing.T) {
 		if n := rng.Uint64N(4); n > 0 {
 			h.BatchPages, h.BatchIndex = n, rng.Uint64N(n)
 		}
-		records := make([]weighed, rng.IntN(20))
+		records := make([]counted, rng.IntN(20))
 		for i := range records {
-			records[i] = weighed{randomBytes(rng, rng.IntN(300)), rng.Uint64N(1 << 40)}
+			records[i] = counted{weighed{randomBytes(rng, rng.IntN(300)), rng.Uint64N(1 << 40)}, rng.IntN(600)}
 			h.Weight += records[i].w
+			h.Rows += records[i].rows
 		}
 		h.Records = len(records)
-		data, err := Encode(Header{Seq: h.Seq, Nonce: h.Nonce, At: h.At, BatchPages: h.BatchPages, BatchIndex: h.BatchIndex, Records: 99, Weight: 99}, records)
+		data, err := Encode(Header{Seq: h.Seq, Nonce: h.Nonce, At: h.At, BatchPages: h.BatchPages, BatchIndex: h.BatchIndex, Records: 99, Weight: 99, Rows: 99}, records)
 		if err != nil {
 			t.Fatal(err)
 		}
 		got, decoded, err := Decode(data)
-		if err != nil || !reflect.DeepEqual(got, h) || !slices.EqualFunc(decoded, records, func(a []byte, b weighed) bool { return bytes.Equal(a, b.Bytes) }) {
+		if err != nil || !reflect.DeepEqual(got, h) || !slices.EqualFunc(decoded, records, func(a []byte, b counted) bool { return bytes.Equal(a, b.Bytes) }) {
 			t.Fatalf("round trip of %+v: %+v, %v", h, got, err)
 		}
 		if sh, err := Scan(data, nil); err != nil || !reflect.DeepEqual(sh, h) {
@@ -444,6 +445,65 @@ type weighed struct {
 }
 
 func (r weighed) Weight() uint64 { return r.w }
+
+// counted is a weighed record that stands for rows rows (Counter).
+type counted struct {
+	weighed
+	rows int
+}
+
+func (r counted) Rows() int { return r.rows }
+
+// TestHeaderRowsCountOnePerPlainRecord: a record that is not a Counter
+// counts one row.
+func TestHeaderRowsCountOnePerPlainRecord(t *testing.T) {
+	data, err := Encode(Header{Seq: 1}, []Bytes{Bytes("a"), Bytes("b"), Bytes("c")})
+	if err != nil {
+		t.Fatal(err)
+	}
+	h, _, err := Decode(data)
+	if err != nil || h.Records != 3 || h.Rows != 3 {
+		t.Fatalf("plain records: %+v, %v; want 3 records, 3 rows", h, err)
+	}
+}
+
+// TestV1PagesStillDecode: a page written before the row count (magic
+// OWAL\x01, no rows field) decodes, its rows its record count, by Decode,
+// Scan and DecodeHeader alike.
+func TestV1PagesStillDecode(t *testing.T) {
+	recs := [][]byte{[]byte("one"), []byte("two")}
+	b := []byte(pageMagicV1)
+	b = binary.AppendUvarint(b, 7)                // seq
+	b = binary.AppendUvarint(b, uint64(len("n"))) // nonce
+	b = append(b, "n"...)
+	b = binary.AppendUvarint(b, 1_700_000_000_000) // at
+	b = binary.AppendUvarint(b, 0)                 // batch pages
+	b = binary.AppendUvarint(b, 0)                 // batch index
+	b = binary.AppendUvarint(b, uint64(len(recs))) // records
+	b = binary.AppendUvarint(b, 42)                // weight
+	for _, r := range recs {
+		b = binary.AppendUvarint(b, uint64(len(r)))
+		b = append(b, r...)
+	}
+	b = seal(b)
+	want := Header{Seq: 7, Nonce: "n", At: time.UnixMilli(1_700_000_000_000).UTC(), Records: 2, Weight: 42, Rows: 2}
+	h, got, err := Decode(b)
+	if err != nil || !reflect.DeepEqual(h, want) || len(got) != 2 || string(got[1]) != "two" {
+		t.Fatalf("v1 page: %+v %q %v, want %+v", h, got, err, want)
+	}
+	if sh, err := Scan(b, nil); err != nil || !reflect.DeepEqual(sh, want) {
+		t.Fatalf("v1 scan: %+v %v", sh, err)
+	}
+	if hh, err := DecodeHeader(b[:min(len(b), headerReadBytes)]); err != nil || !reflect.DeepEqual(hh, want) {
+		t.Fatalf("v1 header: %+v %v", hh, err)
+	}
+	// A third version is not a page.
+	bad := bytes.Clone(b)
+	bad[len(pageMagic)-1] = 3
+	if _, _, err := Decode(seal(bad[:len(bad)-4])); !errors.Is(err, ErrCorrupt) {
+		t.Fatalf("version 3 page decoded: %v", err)
+	}
+}
 
 func randomBytes(rng *rand.Rand, n int) Bytes {
 	b := make(Bytes, n)

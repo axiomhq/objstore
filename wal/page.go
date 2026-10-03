@@ -10,7 +10,13 @@ import (
 	"unsafe"
 )
 
-const pageMagic = "OWAL\x01"
+// pageMagic opens every page this package writes: v2 carries a row count
+// after the record weight. pageMagicV1 pages (no row count) still decode,
+// a record counting as one row.
+const (
+	pageMagic   = "OWAL\x02"
+	pageMagicV1 = "OWAL\x01"
+)
 
 // maxPageBytes is the codec ceiling: no page, however it was cut, is larger.
 const maxPageBytes = 65 << 20
@@ -39,6 +45,27 @@ type Record interface {
 // Like Size and AppendTo, Weight must not block.
 type Weigher interface {
 	Weight() uint64
+}
+
+// Counter is a Record that stands for several rows of the caller's (a
+// block of documents, say). A page's header carries the sum over its
+// records (Header.Rows), so a reader can count a page's rows from its
+// header alone (WalkHeaders). Records that are not Counters count one.
+// Like Size and AppendTo, Rows must not block.
+type Counter interface {
+	Rows() int
+}
+
+func rowsOf[R Record](records []R) int {
+	n := 0
+	for _, r := range records {
+		if c, ok := any(r).(Counter); ok {
+			n += c.Rows()
+		} else {
+			n++
+		}
+	}
+	return n
 }
 
 func weightOf[R Record](records []R) (uint64, error) {
@@ -76,11 +103,13 @@ type Header struct {
 	// position in it. A single-page entry has BatchPages 0 (Encode's
 	// default) or 1 (what a Writer writes): walks treat the two alike.
 	BatchPages, BatchIndex uint64
-	// Records is the page's record count and Weight the sum of their
-	// weights (Weigher). A read fills them; Encode and the Writer compute
-	// them from the records and ignore what the caller set.
+	// Records is the page's record count, Weight the sum of their
+	// weights (Weigher) and Rows the sum of their rows (Counter; Records
+	// on a v1 page). A read fills them; Encode and the Writer compute them
+	// from the records and ignore what the caller set.
 	Records int
 	Weight  uint64
+	Rows    int
 }
 
 // Encode writes one page: magic, sequence, nonce, commit time (unix
@@ -106,7 +135,7 @@ func Encode[R Record](h Header, records []R) ([]byte, error) {
 	if err != nil {
 		return nil, err
 	}
-	b, err := appendHeader(make([]byte, 0, size), h, len(records), weight)
+	b, err := appendHeader(make([]byte, 0, size), h, len(records), weight, rowsOf(records))
 	if err != nil {
 		return nil, err
 	}
@@ -121,8 +150,8 @@ func Encode[R Record](h Header, records []R) ([]byte, error) {
 	return seal(b), nil
 }
 
-func appendHeader(b []byte, h Header, records int, weight uint64) ([]byte, error) {
-	if !validBatch(h.BatchPages, h.BatchIndex) || records < 0 || records > maxPageBytes {
+func appendHeader(b []byte, h Header, records int, weight uint64, rows int) ([]byte, error) {
+	if !validBatch(h.BatchPages, h.BatchIndex) || records < 0 || records > maxPageBytes || rows < 0 {
 		return nil, fmt.Errorf("wal: invalid page header")
 	}
 	b = append(b, pageMagic...)
@@ -144,12 +173,13 @@ func appendHeader(b []byte, h Header, records int, weight uint64) ([]byte, error
 	b = binary.AppendUvarint(b, h.BatchIndex)
 	b = binary.AppendUvarint(b, uint64(records))
 	b = binary.AppendUvarint(b, weight)
+	b = binary.AppendUvarint(b, uint64(rows))
 	return b, nil
 }
 
 // headerReserve bounds a page header's size for a nonce of n bytes, CRC
 // included.
-func headerReserve(n int) int { return len(pageMagic) + 7*binary.MaxVarintLen64 + n + 4 }
+func headerReserve(n int) int { return len(pageMagic) + 8*binary.MaxVarintLen64 + n + 4 }
 
 func appendRecord[R Record](b []byte, r R) ([]byte, error) {
 	n := r.Size()
@@ -284,7 +314,11 @@ func (r *pageReader) header() (Header, bool) {
 // headerFields leaves the nonce aliased, so budgeting needs no allocation.
 func (r *pageReader) headerFields() (Header, []byte, bool) {
 	var h Header
-	if len(r.data) < len(pageMagic) || string(r.data[:len(pageMagic)]) != pageMagic {
+	if len(r.data) < len(pageMagic) {
+		return Header{}, nil, false
+	}
+	v2 := string(r.data[:len(pageMagic)]) == pageMagic
+	if !v2 && string(r.data[:len(pageMagicV1)]) != pageMagicV1 {
 		return Header{}, nil, false
 	}
 	r.data = r.data[len(pageMagic):]
@@ -301,10 +335,14 @@ func (r *pageReader) headerFields() (Header, []byte, bool) {
 	}
 	n := r.number()
 	h.Weight = r.number()
-	if r.err || n > maxPageBytes {
+	rows := n
+	if v2 {
+		rows = r.number()
+	}
+	if r.err || n > maxPageBytes || rows > math.MaxInt32 {
 		return Header{}, nil, false
 	}
-	h.Records = int(n)
+	h.Records, h.Rows = int(n), int(rows)
 	return h, nonce, true
 }
 

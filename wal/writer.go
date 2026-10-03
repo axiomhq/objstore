@@ -853,7 +853,7 @@ func splitBatch[R Record](seq uint64, b *batch[R]) (pages [][]byte, kept []R, er
 	head := Header{Seq: seq, Nonce: b.nonce, At: b.at, BatchPages: 1}
 	// Until pages are cut, an overflowing sum is only a header-size reserve.
 	weight, _ := weightOf(b.records)
-	header, err := appendHeader(nil, head, len(b.records), weight)
+	header, err := appendHeader(nil, head, len(b.records), weight, rowsOf(b.records))
 	if err != nil {
 		return nil, nil, err
 	}
@@ -933,7 +933,7 @@ func splitBatch[R Record](seq uint64, b *batch[R]) (pages [][]byte, kept []R, er
 	// byte moves. Only a single page uses this header; a multi-page cut
 	// writes its own.
 	weight, weightErr := weightOf(records)
-	if header, err = appendHeader(header[:0], head, len(records), weight); err != nil {
+	if header, err = appendHeader(header[:0], head, len(records), weight, rowsOf(records)); err != nil {
 		return nil, nil, err
 	}
 	shift := hdr - len(header)
@@ -1002,7 +1002,7 @@ func splitBatch[R Record](seq uint64, b *batch[R]) (pages [][]byte, kept []R, er
 		if err != nil {
 			return nil, kept, err
 		}
-		page, err := appendHeader(make([]byte, 0, reserve+to-from), head, hi-lo, weight)
+		page, err := appendHeader(make([]byte, 0, reserve+to-from), head, hi-lo, weight, rowsOf(records[lo:hi]))
 		if err != nil {
 			return nil, nil, err
 		}

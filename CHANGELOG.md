@@ -2,6 +2,18 @@
 
 ## Unreleased
 
+### Breaking changes
+
+- **wal page format**: pages are `OWAL\x02`, whose header carries a row count after the record weight. `OWAL\x01` pages still decode (each record one row); readers older than this release refuse v2 pages as corrupt, so upgrade every reader before any writer.
+
+### Added
+
+- `wal.Counter`: a `Record` with `Rows() int`, for a record that stands for several of the caller's rows. A page's header carries the sum (`Header.Rows`), so `WalkHeaders` counts rows, not records. Records that are not Counters count one.
+
+### Changed behaviour
+
+- **wal**: the floor recheck after a claim passes `retry` as the check before it does (true only once an attempt failed unverifiably). A first try's recheck no longer forces a store read on an oracle that can answer locally; v0.8.0 cost a lease-holding writer a GET on every acked entry. A retried batch still asks for a fresh watermark.
+
 ### Removed
 
 API nothing calls, here or in its known importers (dotwerk, logwerk):
