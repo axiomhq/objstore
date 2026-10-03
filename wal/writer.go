@@ -800,8 +800,13 @@ func (w *Writer[R]) putPages(ctx context.Context, b *batch[R], floor func(contex
 		}
 		if floor != nil {
 			// A deleted claim can win after a replacement checkpointed it.
-			// Revalidate now that our PUT may be durable, even on its first try.
-			f, err := floor(ctx, true)
+			// Revalidate now that our PUT may be durable, even on its first
+			// try. retry=false on a first try lets an oracle that can rule
+			// the overtake out locally (a continuously held lease: no
+			// replacement could checkpoint without taking it) answer 0
+			// without a round trip; the test that pins this is
+			// TestWriterRechecksFloorAfterClaim.
+			f, err := floor(ctx, b.attempts > 1)
 			if err != nil {
 				return w.retry("floor", key, err)
 			}

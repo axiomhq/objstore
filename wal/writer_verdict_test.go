@@ -464,8 +464,13 @@ func TestWriterRechecksFloorAfterClaim(t *testing.T) {
 	defer w.Close()
 	// Release the oracle before Close, including on assertion failures.
 	defer release.Do(func() { close(resume) })
+	// An oracle that always reads the store (it ignores retry): the
+	// post-claim check alone must catch a claim a replacement checkpointed
+	// past while this one was in flight.
 	first := true
+	var calls atomic.Int32
 	w.SetFloor(func(ctx context.Context, retry bool) (uint64, error) {
+		calls.Add(1)
 		f := watermark.Load()
 		if first {
 			first = false
@@ -475,8 +480,6 @@ func TestWriterRechecksFloorAfterClaim(t *testing.T) {
 			case <-ctx.Done():
 				return 0, ctx.Err()
 			}
-		} else if !retry {
-			return 0, errors.New("post-claim floor must request a fresh watermark")
 		}
 		return f, nil
 	})
@@ -509,6 +512,50 @@ func TestWriterRechecksFloorAfterClaim(t *testing.T) {
 	}
 	if err := w.Append(ctx, rows("later")); !errors.Is(err, ErrWriterFailed) {
 		t.Fatalf("Append after covered claim: %v, want ErrWriterFailed", err)
+	}
+	if n := calls.Load(); n != 2 {
+		t.Fatalf("floor consulted %d times, want 2 (before and after the one claim): the post-claim check caught it, not a retry", n)
+	}
+}
+
+// TestWriterFloorRetryFlag: a first try asks the oracle with retry=false
+// before and after its claim, so an oracle that can rule a takeover out
+// locally (a continuously held lease) answers without a store read; an
+// attempt after an unverifiable one asks with retry=true both times.
+func TestWriterFloorRetryFlag(t *testing.T) {
+	ctx, cancel := context.WithTimeout(t.Context(), 10*time.Second)
+	defer cancel()
+	s, f := bucket.NewFaulty(t)
+	w := NewWriter[Bytes](s, testPrefix, 1, nil, WithCommitInterval(MinCommitInterval))
+	defer w.Close()
+	var mu sync.Mutex
+	var seen []bool
+	w.SetFloor(func(ctx context.Context, retry bool) (uint64, error) {
+		mu.Lock()
+		seen = append(seen, retry)
+		mu.Unlock()
+		return 0, nil
+	})
+	if err := w.Append(ctx, rows("first")); err != nil {
+		t.Fatal(err)
+	}
+	mu.Lock()
+	got := slices.Clone(seen)
+	seen = nil
+	mu.Unlock()
+	if !slices.Equal(got, []bool{false, false}) {
+		t.Fatalf("first try asked the floor with retry=%v, want [false false]", got)
+	}
+	// One failed PUT: the second attempt must ask for fresh watermarks.
+	f.Set(storetest.Plan{Op: storetest.OpPutIfAbsent, N: 1, Mode: storetest.Fail})
+	if err := w.Append(ctx, rows("second")); err != nil {
+		t.Fatal(err)
+	}
+	mu.Lock()
+	got = slices.Clone(seen)
+	mu.Unlock()
+	if !slices.Equal(got, []bool{false, true, true}) {
+		t.Fatalf("a retried batch asked the floor with retry=%v, want [false true true]", got)
 	}
 }
 
