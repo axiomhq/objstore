@@ -2,6 +2,7 @@ package rangeread
 
 import (
 	"context"
+	"fmt"
 	"sync"
 
 	"github.com/axiomhq/objstore"
@@ -35,6 +36,9 @@ func New(s *objstore.Store, objects *cache.Cache, cfg Config) (*Reader, error) {
 	if err != nil {
 		return nil, err
 	}
+	if objects != nil && cfg.Concurrency > objects.Width() {
+		return nil, fmt.Errorf("rangeread: concurrency %d exceeds the cache's gate width %d", cfg.Concurrency, objects.Width())
+	}
 	return &Reader{store: s, objects: objects, config: cfg, memory: semaphore.NewWeighted(cfg.MaxInFlightBytes)}, nil
 }
 
@@ -62,13 +66,13 @@ func (r *Reader) Fetch(ctx context.Context, key string) ([]byte, error) {
 // Prefetch warms the cache for keys and returns when every key is loaded,
 // failed or shed: it is synchronous; run it in a goroutine to warm in the
 // background. Keys already in their memory tier (ByteCacheFor) are skipped
-// without counting a hit. At most cache.GateWidth fetches run at once, and
+// without counting a hit. At most the cache's gate width fetches run at once, and
 // each coalesces with any racing consumer. Cancellation sheds pending
 // keys. Errors are dropped on purpose: the consumer re-fetches and surfaces
 // the real error under its own context.
 func (r *Reader) Prefetch(ctx context.Context, keys ...string) {
 	var g errgroup.Group
-	g.SetLimit(cache.GateWidth)
+	g.SetLimit(r.objects.Width())
 	for _, k := range keys {
 		if _, ok := r.objects.ByteCacheFor(k).Peek(k); ok { // Peek: the consumer's fetch owns the hit/miss accounting
 			continue

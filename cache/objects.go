@@ -39,8 +39,9 @@ type Cache struct {
 	flight       singleflight.Group // coalesces concurrent loads of one key
 	flightMu     sync.Mutex         // guards flights
 	flights      map[string]*flightRef
-	Gate         *semaphore.Weighted // GateWidth store GET slots; occupancy in GateInUse
-	GateInUse    atomic.Int64        // store GET slots taken (AcquireGet)
+	Gate         *semaphore.Weighted // Width store GET slots; occupancy in GateInUse
+	width        int
+	GateInUse    atomic.Int64 // store GET slots taken (AcquireGet)
 	invalidateMu sync.Mutex
 	classes      classCounters
 }
@@ -134,8 +135,18 @@ func New(s *objstore.Store, memoryBytes int, disk *Disk, keys Keys) *Cache {
 		memory.SetLow(keys.Low, min(memoryBytes/8, 128<<20))
 	}
 	return &Cache{Store: s, Memory: memory, WAL: NewByteCache(walBytes), Resident: NewResident(0),
-		Disk: disk, keys: keys, Gate: semaphore.NewWeighted(GateWidth)}
+		Disk: disk, keys: keys, Gate: semaphore.NewWeighted(GateWidth), width: GateWidth}
 }
+
+// SetGateWidth sizes Gate to n concurrent store GETs (default GateWidth).
+// Call it before the cache serves any read.
+func (c *Cache) SetGateWidth(n int) {
+	n = max(1, n)
+	c.Gate, c.width = semaphore.NewWeighted(int64(n)), n
+}
+
+// Width is Gate's slot count.
+func (c *Cache) Width() int { return c.width }
 
 // ByteCacheFor picks the budget a key is charged to: WAL pages their own,
 // everything else the memory budget.
@@ -193,7 +204,8 @@ func (c *Cache) putDisk(memory *ByteCache, key string, generation uint64, data [
 	}
 }
 
-// GateWidth bounds concurrent store GETs (Cache.Gate) so a wide query
+// GateWidth is the default bound on concurrent store GETs (Cache.Gate, see
+// SetGateWidth) so a wide query
 // cannot stampede the bucket. semaphore.Weighted keeps its occupancy private, so
 // AcquireGet/ReleaseGet count it for Stats.
 const GateWidth = 32

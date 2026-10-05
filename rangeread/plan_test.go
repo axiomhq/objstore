@@ -125,7 +125,7 @@ func TestRangePlanRejectsInvalidInput(t *testing.T) {
 			t.Fatalf("accepted invalid extent %+v", r)
 		}
 	}
-	for _, cfg := range []Config{{MaxGapBytes: -1}, {MaxExtraBytes: -1}, {MaxRangeBytes: -1}, {MaxInFlightBytes: -1}, {Concurrency: -1}, {Concurrency: 33}, {MaxRangeBytes: 20, MaxInFlightBytes: 10}} {
+	for _, cfg := range []Config{{MaxGapBytes: -1}, {MaxExtraBytes: -1}, {MaxRangeBytes: -1}, {MaxInFlightBytes: -1}, {Concurrency: -1}, {MaxRangeBytes: 20, MaxInFlightBytes: 10}} {
 		if _, err := Plan(nil, cfg); err == nil {
 			t.Fatalf("accepted invalid config %+v", cfg)
 		}

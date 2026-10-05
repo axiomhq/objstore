@@ -239,3 +239,18 @@ func TestFetchLoaderPanicIsAnError(t *testing.T) {
 		t.Fatalf("fetch after a panicking load = %v, want a fresh loader's panic, not a stuck flight", err)
 	}
 }
+
+// Concurrency is bounded by the cache's gate, which SetGateWidth widens.
+func TestNewBoundsConcurrencyByGateWidth(t *testing.T) {
+	objects := cache.New(nil, 1<<20, nil, cache.Keys{})
+	if _, err := New(nil, objects, Config{Concurrency: cache.GateWidth + 1}); err == nil {
+		t.Fatal("concurrency past the default gate accepted")
+	}
+	objects.SetGateWidth(256)
+	if objects.Width() != 256 {
+		t.Fatalf("width %d", objects.Width())
+	}
+	if _, err := New(nil, objects, Config{Concurrency: 256}); err != nil {
+		t.Fatalf("concurrency within a widened gate: %v", err)
+	}
+}

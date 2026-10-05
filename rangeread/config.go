@@ -4,8 +4,6 @@ import (
 	"errors"
 	"fmt"
 	"sync/atomic"
-
-	"github.com/axiomhq/objstore/cache"
 )
 
 // ErrCorrupt marks a read whose bytes cannot be what was asked for: the
@@ -41,7 +39,7 @@ type Config struct {
 	// scope. Default 64 MiB.
 	MaxInFlightBytes int64
 	// Concurrency is the number of ranged GETs one FetchRanges call runs
-	// at once. Default 8, at most cache.GateWidth.
+	// at once. Default 8, at most the cache's gate width (New checks).
 	Concurrency int
 }
 
@@ -66,8 +64,8 @@ func (c Config) Normalized() (Config, error) {
 	if c.Concurrency == 0 {
 		c.Concurrency = 8
 	}
-	if c.MaxRangeBytes > c.MaxInFlightBytes || c.Concurrency > cache.GateWidth {
-		return c, fmt.Errorf("rangeread: range size must fit in-flight bytes and concurrency must not exceed %d", cache.GateWidth)
+	if c.MaxRangeBytes > c.MaxInFlightBytes {
+		return c, fmt.Errorf("rangeread: range size must fit in-flight bytes")
 	}
 	return c, nil
 }
