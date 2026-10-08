@@ -176,10 +176,10 @@ func opErr(op, key string, err error) error {
 		return nil
 	}
 	switch op {
-	case "get", "get-with-etag", "get-if-changed", "get-range":
-		if code := apiErrorCode(err); code == "NoSuchKey" {
+	case "get", "get-with-etag", "get-if-changed", "get-range", "new-reader", "stat":
+		if code := apiErrorCode(err); code == "NoSuchKey" || code == "NotFound" {
 			err = fmt.Errorf("%w: %w", objstore.ErrNotFound, err)
-		} else if op == "get-range" && code == "InvalidRange" {
+		} else if code == "InvalidRange" {
 			err = fmt.Errorf("%w: %w", objstore.ErrRange, err)
 		}
 	}
@@ -187,7 +187,8 @@ func opErr(op, key string, err error) error {
 		err = fmt.Errorf("%w: %w", objstore.ErrNotFound, err)
 	}
 	var re *awshttp.ResponseError
-	if errors.As(err, &re) && re.HTTPStatusCode() == http.StatusForbidden || strings.HasPrefix(apiErrorCode(err), "KMS.") {
+	if errors.As(err, &re) && re.HTTPStatusCode() == http.StatusForbidden ||
+		apiErrorCode(err) == "AccessDenied" || strings.HasPrefix(apiErrorCode(err), "KMS.") {
 		err = fmt.Errorf("%w: %w", objstore.ErrAccessDenied, err)
 	}
 	return objstore.OpErr(op, key, err)
@@ -357,16 +358,40 @@ func (s *Backend) DeleteMany(ctx context.Context, keys ...string) error {
 	}
 	for i := 0; i < len(objs); i += deleteBatch {
 		end := min(i+deleteBatch, len(objs))
+		if err := ctx.Err(); err != nil {
+			return objstore.DeleteFailures(keys[i:], err, true)
+		}
 		out, err := s.client.DeleteObjects(ctx, &awss3.DeleteObjectsInput{
 			Bucket: &s.bucket,
 			Delete: &types.Delete{Objects: objs[i:end], Quiet: aws.Bool(true)},
 		})
 		if err != nil {
-			return opErr("delete-many", keys[i], err)
+			failures := &objstore.DeleteError{}
+			for j := i; j < len(keys); j++ {
+				failures.Failures = append(failures.Failures, objstore.DeleteFailure{
+					Key: keys[j], Err: opErr("delete-many", keys[j], err), Unattempted: j >= end,
+				})
+			}
+			return failures
 		}
 		if len(out.Errors) > 0 {
-			e := out.Errors[0]
-			return opErr("delete-many", aws.ToString(e.Key), fmt.Errorf("%s: %s (%d keys failed)", aws.ToString(e.Code), aws.ToString(e.Message), len(out.Errors)))
+			failed := map[string]error{}
+			for _, e := range out.Errors {
+				failed[aws.ToString(e.Key)] = opErr("delete-many", aws.ToString(e.Key), &smithy.GenericAPIError{
+					Code: aws.ToString(e.Code), Message: aws.ToString(e.Message),
+				})
+			}
+			failures := &objstore.DeleteError{}
+			for j := i; j < len(keys); j++ {
+				cause := failed[keys[j]]
+				if j >= end {
+					cause = errors.New("not attempted after batch failure")
+				}
+				if cause != nil {
+					failures.Failures = append(failures.Failures, objstore.DeleteFailure{Key: keys[j], Err: cause, Unattempted: j >= end})
+				}
+			}
+			return failures
 		}
 	}
 	return nil

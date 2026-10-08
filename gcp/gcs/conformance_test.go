@@ -56,6 +56,7 @@ func TestConformance(t *testing.T) {
 				t.Fatal(err)
 			}
 			storetest.Conformance(t, s)
+			storetest.StreamingConformance(t, s, "STANDARD")
 		})
 	}
 }
