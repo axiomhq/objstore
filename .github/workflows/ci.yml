@@ -85,3 +85,28 @@ jobs:
           go-version-file: go.mod
       - name: go test (darwin)
         run: go test -race -count=1 ./...
+
+  azure:
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v5
+      - uses: actions/setup-go@v6
+        with:
+          go-version-file: go.mod
+      - name: start Azurite
+        run: |
+          docker run -d --name azurite -p 10000:10000 \
+            -e AZURITE_ACCOUNTS="objstore:b2Jqc3RvcmUtZW11bGF0b3Itbm90LXNlY3JldA==" \
+            mcr.microsoft.com/azure-storage/azurite:3.37.0 \
+            azurite-blob --blobHost 0.0.0.0 --skipApiVersionCheck
+          for i in $(seq 60); do
+            curl -s -o /dev/null http://localhost:10000 && exit 0
+            sleep 1
+          done
+          docker logs azurite
+          exit 1
+      - name: go test (Azurite)
+        env:
+          OBJSTORE_TEST_AZURE: http://localhost:10000
+        run: go test -race -count=1 ./azure/blob
