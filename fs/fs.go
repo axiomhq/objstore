@@ -715,20 +715,43 @@ func (f *Backend) delete(ctx context.Context, key string, dirs map[string]string
 	return f.syncDir(filepath.Dir(p))
 }
 
-// DeleteMany removes keys one by one. Missing keys are not an error.
-func (f *Backend) DeleteMany(ctx context.Context, keys ...string) (err error) {
+// DeleteMany removes keys one by one, then syncs each affected directory once.
+// Failures include every unattempted key and every unproven durable deletion.
+func (f *Backend) DeleteMany(ctx context.Context, keys ...string) error {
 	dirs := make(map[string]string)
-	// Complete durability work even if a later key fails or ctx ends.
-	defer func() {
-		defer objstore.TimingsOf(ctx).Since(objstore.CallDirSync, time.Now())
-		for _, dir := range slices.Sorted(maps.Keys(dirs)) {
-			err = errors.Join(err, objstore.OpErr("delete-many", dirs[dir], f.syncDir(dir)))
-		}
-	}()
-	for _, k := range keys {
+	failures := make([]objstore.DeleteFailure, len(keys))
+	completed := make(map[string][]int)
+	for i, k := range keys {
 		if err := f.delete(ctx, k, dirs); err != nil {
-			return objstore.OpErr("delete-many", k, err)
+			failures[i] = objstore.DeleteFailure{Key: k, Err: objstore.OpErr("delete-many", k, err), Unattempted: ctx.Err() != nil}
+			for j := i + 1; j < len(keys); j++ {
+				failures[j] = objstore.DeleteFailure{Key: keys[j], Err: err, Unattempted: true}
+			}
+			break
 		}
+		p, _ := f.path(k)
+		dir := filepath.Dir(p)
+		if _, owes := dirs[dir]; owes {
+			completed[dir] = append(completed[dir], i)
+		}
+	}
+	// Complete durability work even after cancellation or an earlier failure.
+	defer objstore.TimingsOf(ctx).Since(objstore.CallDirSync, time.Now())
+	for _, dir := range slices.Sorted(maps.Keys(completed)) {
+		if err := f.syncDir(dir); err != nil {
+			for _, i := range completed[dir] {
+				failures[i] = objstore.DeleteFailure{Key: keys[i], Err: objstore.OpErr("delete-many", keys[i], err)}
+			}
+		}
+	}
+	e := &objstore.DeleteError{}
+	for _, failure := range failures {
+		if failure.Err != nil {
+			e.Failures = append(e.Failures, failure)
+		}
+	}
+	if len(e.Failures) > 0 {
+		return e
 	}
 	return nil
 }

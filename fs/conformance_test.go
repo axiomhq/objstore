@@ -15,6 +15,10 @@ func TestConformance(t *testing.T) {
 	storetest.Conformance(t, bucket.NewFS(t))
 }
 
+func TestStreamingConformance(t *testing.T) {
+	storetest.StreamingConformance(t, bucket.NewFS(t), "")
+}
+
 // TestFSRejectsTraversal: keys become filesystem paths — a trust boundary
 // the S3 backend never had. Terminal .lock/.tmp-* names are reserved for
 // backend internals, traversal and empty elements are rejected, and other
