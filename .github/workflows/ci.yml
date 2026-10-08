@@ -101,12 +101,14 @@ jobs:
             mcr.microsoft.com/azure-storage/azurite:3.37.0 \
             azurite-blob --blobHost 0.0.0.0 --skipApiVersionCheck
           for i in $(seq 60); do
-            curl -s -o /dev/null http://localhost:10000 && exit 0
+            curl -s -o /dev/null http://127.0.0.1:10000 && exit 0
             sleep 1
           done
           docker logs azurite
           exit 1
       - name: go test (Azurite)
         env:
-          OBJSTORE_TEST_AZURE: http://localhost:10000
+          # The SDK recognizes path-style emulator SAS URLs by an IP literal,
+          # not localhost; otherwise it signs the account as the container.
+          OBJSTORE_TEST_AZURE: http://127.0.0.1:10000
         run: go test -race -count=1 ./azure/blob
