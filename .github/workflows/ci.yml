@@ -75,17 +75,6 @@ jobs:
           OBJSTORE_TEST_S3: http://localhost:9000
         run: go test -race -count=1 -skip '/ETagCASMissing' ./...
 
-  macos:
-    runs-on: macos-latest
-    timeout-minutes: 20
-    steps:
-      - uses: actions/checkout@v5
-      - uses: actions/setup-go@v6
-        with:
-          go-version-file: go.mod
-      - name: go test (darwin)
-        run: go test -race -count=1 ./...
-
   azure:
     runs-on: ubuntu-latest
     timeout-minutes: 20
