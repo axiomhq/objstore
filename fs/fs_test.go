@@ -928,6 +928,41 @@ func TestFSDeleteSyncsDistinctParents(t *testing.T) {
 	}
 }
 
+func TestDeleteManyReportsDurabilityAndUnattemptedKeys(t *testing.T) {
+	f := New(t.TempDir(), "b")
+	if err := f.EnsureBucket(t.Context()); err != nil {
+		t.Fatal(err)
+	}
+	for _, key := range []string{"a/one", "a/two", "b/three", "b/later"} {
+		if err := f.Put(t.Context(), key, []byte("v")); err != nil {
+			t.Fatal(err)
+		}
+	}
+	syncErr := errors.New("failed directory sync")
+	f.syncFault = func(dir string) error {
+		if dir == filepath.Join(f.root, "a") {
+			return syncErr
+		}
+		return nil
+	}
+	err := f.DeleteMany(t.Context(), "a/one", "a/two", "b/three", "../invalid", "b/later")
+	var de *objstore.DeleteError
+	if !errors.As(err, &de) || len(de.Failures) != 4 {
+		t.Fatalf("delete: %v", err)
+	}
+	for i, key := range []string{"a/one", "a/two", "../invalid", "b/later"} {
+		if de.Failures[i].Key != key || de.Failures[i].Unattempted != (i == 3) {
+			t.Fatalf("failure: %+v", de.Failures[i])
+		}
+	}
+	if !errors.Is(de.Failures[0].Err, syncErr) || !errors.Is(de.Failures[1].Err, syncErr) {
+		t.Fatalf("lost sync error: %v", err)
+	}
+	if _, err := f.Get(t.Context(), "b/later"); err != nil {
+		t.Fatal(err)
+	}
+}
+
 // TestFSEnsureBucketUnderUnreadableAncestor: a directory we may cross but not
 // read (mode 0311) was not created by EnsureBucket, so it is not synced and
 // does not fail the call.

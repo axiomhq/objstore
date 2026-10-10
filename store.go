@@ -41,7 +41,8 @@ var ErrAccessDenied = errors.New("store: access denied")
 const MaxListPage = 1000
 
 // Backend is the object-store contract every provider package satisfies
-// (fs, s3, gcs); storetest.Conformance runs against each. It may grow.
+// (fs, s3, gcs, azure/blob); storetest.Conformance runs against each.
+// Streaming, stat and signing are separate optional capability interfaces.
 //
 // Every error a backend returns is wrapped by OpErr. A failed condition is
 // (false, nil), a missing object wraps ErrNotFound, a bad range wraps
@@ -311,10 +312,16 @@ func (s *Store) DeleteMany(ctx context.Context, keys ...string) error {
 	}
 	release, err := s.enterWrite(ctx)
 	if err != nil {
-		return err
+		return DeleteFailures(keys, err, true)
 	}
 	defer release()
-	return s.b.DeleteMany(ctx, keys...)
+	err = s.b.DeleteMany(ctx, keys...)
+	var detailed *DeleteError
+	if err != nil && !errors.As(err, &detailed) {
+		// Legacy backends provide no per-key evidence: every outcome is unknown.
+		return DeleteFailures(keys, err, false)
+	}
+	return err
 }
 
 // EnsureBucket creates the bucket if missing (dev/test convenience).

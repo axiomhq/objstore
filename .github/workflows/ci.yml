@@ -75,13 +75,29 @@ jobs:
           OBJSTORE_TEST_S3: http://localhost:9000
         run: go test -race -count=1 -skip '/ETagCASMissing' ./...
 
-  macos:
-    runs-on: macos-latest
+  azure:
+    runs-on: ubuntu-latest
     timeout-minutes: 20
     steps:
       - uses: actions/checkout@v5
       - uses: actions/setup-go@v6
         with:
           go-version-file: go.mod
-      - name: go test (darwin)
-        run: go test -race -count=1 ./...
+      - name: start Azurite
+        run: |
+          docker run -d --name azurite -p 10000:10000 \
+            -e AZURITE_ACCOUNTS="objstore:b2Jqc3RvcmUtZW11bGF0b3Itbm90LXNlY3JldA==" \
+            mcr.microsoft.com/azure-storage/azurite:3.37.0 \
+            azurite-blob --blobHost 0.0.0.0 --skipApiVersionCheck
+          for i in $(seq 60); do
+            curl -s -o /dev/null http://127.0.0.1:10000 && exit 0
+            sleep 1
+          done
+          docker logs azurite
+          exit 1
+      - name: go test (Azurite)
+        env:
+          # The SDK recognizes path-style emulator SAS URLs by an IP literal,
+          # not localhost; otherwise it signs the account as the container.
+          OBJSTORE_TEST_AZURE: http://127.0.0.1:10000
+        run: go test -race -count=1 ./azure/blob

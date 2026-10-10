@@ -2,6 +2,7 @@ package objstore
 
 import (
 	"context"
+	"io"
 
 	"golang.org/x/time/rate"
 )
@@ -108,7 +109,49 @@ func (p *paced) Delete(ctx context.Context, key string) error {
 
 func (p *paced) DeleteMany(ctx context.Context, keys ...string) error {
 	if err := p.wait(ctx); err != nil {
-		return err
+		return DeleteFailures(keys, err, true)
 	}
 	return p.Backend.DeleteMany(ctx, keys...)
+}
+
+func (p *paced) NewReader(ctx context.Context, key string, offset, length int64) (io.ReadCloser, error) {
+	if err := p.wait(ctx); err != nil {
+		return nil, err
+	}
+	return (&Store{b: p.Backend}).NewReader(ctx, key, offset, length)
+}
+
+func (p *paced) Stat(ctx context.Context, key string) (ObjectInfo, error) {
+	if err := p.wait(ctx); err != nil {
+		return ObjectInfo{}, err
+	}
+	return (&Store{b: p.Backend}).Stat(ctx, key)
+}
+
+func (p *paced) Upload(ctx context.Context, key string, body io.Reader, opts UploadOptions) (ObjectInfo, error) {
+	if err := p.wait(ctx); err != nil {
+		return ObjectInfo{}, err
+	}
+	return (&Store{b: p.Backend}).Upload(ctx, key, body, opts)
+}
+
+func (p *paced) UploadIfAbsent(ctx context.Context, key string, body io.Reader, opts UploadOptions) (ObjectInfo, bool, error) {
+	if err := p.wait(ctx); err != nil {
+		return ObjectInfo{}, false, err
+	}
+	return (&Store{b: p.Backend}).UploadIfAbsent(ctx, key, body, opts)
+}
+
+func (p *paced) UploadIfMatch(ctx context.Context, key string, body io.Reader, etag string, opts UploadOptions) (ObjectInfo, bool, error) {
+	if err := p.wait(ctx); err != nil {
+		return ObjectInfo{}, false, err
+	}
+	return (&Store{b: p.Backend}).UploadIfMatch(ctx, key, body, etag, opts)
+}
+
+func (p *paced) Sign(ctx context.Context, key string, opts SignOptions) (SignedRequest, error) {
+	if err := p.wait(ctx); err != nil {
+		return SignedRequest{}, err
+	}
+	return (&Store{b: p.Backend}).Sign(ctx, key, opts)
 }

@@ -194,13 +194,17 @@ func (f *Fault) wrote(key string, data []byte) {
 	if watching { // hash outside the mutex: fanned-out writers do not queue on it
 		sum = sha256.Sum256(data)
 	}
+	f.wroteDigest(key, int64(len(data)), sum, watching)
+}
+
+func (f *Fault) wroteDigest(key string, size int64, sum [32]byte, watching bool) {
 	f.mu.Lock()
 	defer f.mu.Unlock()
 	if f.writeKeys == nil {
 		f.writeKeys = map[string]int{}
 	}
 	f.writeKeys[key]++
-	f.writeBytes += int64(len(data))
+	f.writeBytes += size
 	if f.digest == nil || !watching {
 		return
 	}
@@ -640,11 +644,11 @@ func (f *Fault) DeleteMany(ctx context.Context, keys ...string) error {
 	defer f.inflight.Add(-1)
 	m, hit := f.hit(ctx, OpDelete, keys...)
 	if hit && m != Ambiguous {
-		return f.pre(ctx, m)
+		return objstore.DeleteFailures(keys, f.pre(ctx, m), true)
 	}
 	if !hit {
 		if err := f.shapeCall(ctx, 0); err != nil {
-			return err
+			return objstore.DeleteFailures(keys, err, true)
 		}
 	}
 	err := f.b.DeleteMany(ctx, keys...)
@@ -652,7 +656,7 @@ func (f *Fault) DeleteMany(ctx context.Context, keys ...string) error {
 		f.forget(keys...)
 	}
 	if hit && err == nil {
-		err = ErrFault
+		err = objstore.DeleteFailures(keys, ErrFault, false)
 	}
 	return err
 }

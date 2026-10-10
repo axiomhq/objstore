@@ -27,15 +27,20 @@ type Config struct {
 	// option.WithoutAuthentication for an emulator. Close also closes idle
 	// connections on an HTTP client supplied through these options.
 	Options []option.ClientOption
+	// Client supplies a caller-owned SDK client, including its retry policy.
+	// Mutually exclusive with Options. Close never closes this client.
+	// Use storage.WithJSONReads when constructing it for conditional reads.
+	Client *storage.Client
 }
 
-// Backend is the Google Cloud Storage backend. It owns its storage client;
-// call Close when the backend is no longer needed.
+// Backend is the Google Cloud Storage backend. Close releases clients created
+// by New, but not a caller-owned Config.Client.
 type Backend struct {
 	client  *storage.Client
 	bucket  *storage.BucketHandle
 	name    string
 	project string
+	owned   bool
 }
 
 // singleShotMax is the largest object uploaded in one request. Anything
@@ -52,6 +57,12 @@ func New(ctx context.Context, cfg Config) (*Backend, error) {
 	if cfg.Bucket == "" {
 		return nil, errors.New("gcs: empty bucket name")
 	}
+	if cfg.Client != nil {
+		if len(cfg.Options) != 0 {
+			return nil, errors.New("gcs: Client and Options are mutually exclusive")
+		}
+		return &Backend{client: cfg.Client, bucket: cfg.Client.Bucket(cfg.Bucket), name: cfg.Bucket, project: cfg.ProjectID}, nil
+	}
 	// JSON reads: the XML read path silently drops GenerationNotMatch, so
 	// GetIfChanged would never see a 304.
 	opts := append([]option.ClientOption{storage.WithJSONReads()}, cfg.Options...)
@@ -59,12 +70,17 @@ func New(ctx context.Context, cfg Config) (*Backend, error) {
 	if err != nil {
 		return nil, fmt.Errorf("gcs: %w", err)
 	}
-	return &Backend{client: client, bucket: client.Bucket(cfg.Bucket), name: cfg.Bucket, project: cfg.ProjectID}, nil
+	return &Backend{client: client, bucket: client.Bucket(cfg.Bucket), name: cfg.Bucket, project: cfg.ProjectID, owned: true}, nil
 }
 
 // Close releases the storage client New created. It must not run concurrently
 // with backend operations; the backend must not be used afterwards.
-func (b *Backend) Close() error { return b.client.Close() }
+func (b *Backend) Close() error {
+	if b.owned {
+		return b.client.Close()
+	}
+	return nil
+}
 
 // ID is gs://bucket.
 func (b *Backend) ID() string { return "gs://" + b.name }
@@ -435,14 +451,30 @@ func (g *Backend) Delete(ctx context.Context, key string) error {
 // in the JSON client). Missing keys are not an error. Empty input is a
 // no-op.
 func (g *Backend) DeleteMany(ctx context.Context, keys ...string) error {
-	eg, ctx := errgroup.WithContext(ctx)
+	var eg errgroup.Group
 	eg.SetLimit(deleteParallelism)
-	for _, key := range keys {
+	failures := make([]objstore.DeleteFailure, len(keys))
+	for i, key := range keys {
 		eg.Go(func() error {
-			return opErr("delete-many", key, g.delete(ctx, key))
+			if err := ctx.Err(); err != nil {
+				failures[i] = objstore.DeleteFailure{Key: key, Err: err, Unattempted: true}
+			} else if err := g.delete(ctx, key); err != nil {
+				failures[i] = objstore.DeleteFailure{Key: key, Err: opErr("delete-many", key, err)}
+			}
+			return nil
 		})
 	}
-	return eg.Wait()
+	_ = eg.Wait()
+	e := &objstore.DeleteError{}
+	for _, f := range failures {
+		if f.Err != nil {
+			e.Failures = append(e.Failures, f)
+		}
+	}
+	if len(e.Failures) > 0 {
+		return e
+	}
+	return nil
 }
 
 // EnsureBucket creates the bucket in Config.ProjectID if it is missing.

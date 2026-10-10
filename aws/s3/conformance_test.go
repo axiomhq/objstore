@@ -18,6 +18,14 @@ func TestConformance(t *testing.T) {
 	storetest.Conformance(t, bucket.NewS3(t, endpoint))
 }
 
+func TestStreamingConformance(t *testing.T) {
+	endpoint := os.Getenv("OBJSTORE_TEST_S3")
+	if endpoint == "" {
+		t.Skip("OBJSTORE_TEST_S3 not set")
+	}
+	storetest.StreamingConformance(t, bucket.NewS3(t, endpoint), "STANDARD")
+}
+
 // TestR2 runs the shared suite against Cloudflare R2; it skips without
 // OBJSTORE_TEST_R2_ENDPOINT (https://<account-id>.r2.cloudflarestorage.com).
 // Credentials come from AWS_ACCESS_KEY_ID / AWS_SECRET_ACCESS_KEY (an R2 API

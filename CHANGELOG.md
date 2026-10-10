@@ -6,6 +6,20 @@
 
 - **cache, rangeread**: removed. Caching is the caller's business, not the store's; dotwerk, their only importer, keeps its own copy.
 
+### Added
+
+- Optional streaming `NewReader`, `Upload`, `UploadIfAbsent`, `UploadIfMatch`, `Stat`, and header-aware `Sign` capabilities exposed through `Store`, without changing mandatory `Backend`. Upload results contain the committed size and backend CAS token.
+- `UploadOptions` for explicit known or unknown length, metadata, content type, cache control, and provider storage class. Unsupported options fail explicitly; streaming ranges cap at EOF while byte `GetRange` remains exact.
+- S3 bounded multipart unconditional uploads (8 MiB parts, about 78 GiB maximum). Conditional uploads remain single PUTs with known size up to 5 GiB. ETags remain opaque and are not portable checksums.
+- `azure/blob` backend with caller-owned SDK container client, block uploads, CAS, SAS signing, HTTP regression tests and Azurite conformance. SAS cannot authenticate custom headers; per-object objstore KMS overrides are unsupported. Lexical pagination rescans earlier pages.
+- `gcs.Config.Client` for caller-owned SDK clients, mutually exclusive with `Options`. `Close` preserves caller-owned clients.
+- Streaming conformance and wrapper/gate/KMS, integrity, cancellation, commit-token and metadata checks. Azure SDK versions are pinned in `go.mod`/`go.sum`.
+
+### Changed behaviour
+
+- `DeleteMany` errors expose `DeleteError.Failures`, including all failed and unattempted inputs, preserving order, duplicates, and underlying provider errors. Legacy backend errors conservatively list every key. S3 per-key AccessDenied wraps `ErrAccessDenied`.
+- No byte API, CAS token domain, exact range, WAL or cache format change. Upload sources remain caller-owned; surplus bytes beyond a declared size remain unread. Errors can have ambiguous commit outcomes.
+
 ## v0.9.0
 
 ### Breaking changes
