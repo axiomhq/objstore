@@ -178,7 +178,8 @@ func (c *Cache) InvalidateNamespace(name string) {
 func (c *Cache) Close() { c.Disk.Close() }
 
 // Put writes an immutable object and caches it on the way past, in memory
-// and on disk, so the process that published it never re-reads it: the
+// and on disk (unless WithoutDiskFill), so the process that published it
+// never re-reads it: the
 // memory entry of a large object may be low priority (Keys.Low) and go
 // first, and the range reads after that (CachedRange) find it on disk.
 // The memory tier aliases data, which must not be mutated after Put.
@@ -190,7 +191,9 @@ func (c *Cache) Put(ctx context.Context, key string, data []byte) error {
 		return err
 	}
 	memory.Put(key, data, generation)
-	c.putDisk(memory, key, generation, data)
+	if FillsDisk(ctx) {
+		c.putDisk(memory, key, generation, data)
+	}
 	return nil
 }
 
@@ -479,11 +482,12 @@ func Scoped(ctx context.Context, key string) ([]byte, bool) {
 
 type noDiskFillKey struct{}
 
-// WithoutDiskFill keeps reads under ctx from filling the disk tier: they
-// still read and fill memory, and still read what the disk already holds.
-// It is for work whose objects are not worth a disk write, such as a
-// compaction reading tables it is about to delete. A read that joins
-// another caller's load of the same key follows that caller's choice.
+// WithoutDiskFill keeps reads and Puts under ctx from filling the disk
+// tier: they still read and fill memory, and still read what the disk
+// already holds. It is for work whose objects are not worth a disk write,
+// such as a compaction reading tables it is about to delete and writing
+// tables the next one deletes. A read that joins another caller's load of
+// the same key follows that caller's choice.
 func WithoutDiskFill(ctx context.Context) context.Context {
 	return context.WithValue(ctx, noDiskFillKey{}, true)
 }

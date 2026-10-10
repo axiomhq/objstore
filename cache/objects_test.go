@@ -195,6 +195,14 @@ func TestPutFillsTheDiskTier(t *testing.T) {
 	if !ok || !fromDisk || !bytes.Equal(b, data[100:150]) {
 		t.Fatalf("CachedRange after a Put = %q disk %v ok %v, want a disk hit", b, fromDisk, ok)
 	}
+	// Under WithoutDiskFill (an indexer's output, deleted by a later
+	// compaction) the write leaves the disk tier alone.
+	if err := c.Put(WithoutDiskFill(ctx), "ns/x/table/2", data); err != nil {
+		t.Fatal(err)
+	}
+	if st := disk.Stats(); st.Entries != 1 {
+		t.Fatalf("disk entries = %d, want only the first table", st.Entries)
+	}
 }
 
 // waiters is the number of callers joined to key's flight.
