@@ -382,13 +382,14 @@ func (c *Disk) Put(key string, b []byte) {
 	_ = c.PutChecked(key, b)
 }
 
-// DiskWriters bounds the fills writing to the disk at once;
-// backgroundWriters of them may be Put and PutChecked fills (a warm, a
-// pin, a write's own objects), so a read's PutAsync fill is not queued
-// behind a warm.
+// DiskWriters bounds the fills writing to the disk at once; Put and
+// PutChecked fills (a warm, a pin, a write's own objects) take at most
+// backgroundWriters of them, so two are always free for a read's PutAsync
+// fill. With two for the background, a synced warm of 42 GB ran at a
+// quarter of the SSD's write rate.
 const (
 	DiskWriters       = 8
-	backgroundWriters = 2
+	backgroundWriters = DiskWriters - 2
 )
 
 // PutAsync is Put in the background, for a reader that must not wait on
