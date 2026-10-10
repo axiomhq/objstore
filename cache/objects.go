@@ -321,7 +321,10 @@ func (c *Cache) fetchCachedOnce(ctx context.Context, key string, load func(conte
 				outcome = DiskHit
 			}
 		} else {
-			c.putDisk(memory, key, generation, b) // flightKey is DiskKey(key, generation)
+			// In the background: a read never waits on a disk write.
+			if memory.GenerationOf(key) == generation {
+				c.Disk.PutAsync(flightKey, b) // flightKey is DiskKey(key, generation)
+			}
 		}
 		memory.Put(key, b, generation)
 		return fetched{b, outcome}, nil

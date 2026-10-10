@@ -316,7 +316,7 @@ func (r *Reader) FetchRanges(ctx context.Context, loads []Load) (context.Context
 		}
 		if !direct[i] && !load.Transient {
 			if stored[i].Load() {
-				r.objects.Disk.Put(cache.DiskKey(load.Key, gens[i]), data)
+				r.objects.Disk.PutAsync(cache.DiskKey(load.Key, gens[i]), data) // a read never waits on a disk write
 			}
 			memory.Put(load.Key, data, gens[i])
 		}

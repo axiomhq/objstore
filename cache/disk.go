@@ -4,8 +4,6 @@ import (
 	"bytes"
 	"cmp"
 	"container/list"
-	"crypto/sha256"
-	"encoding/hex"
 	"errors"
 	"fmt"
 	"hash/crc32"
@@ -64,9 +62,13 @@ type Disk struct {
 	lastAccess                        map[string]time.Time // namespace → last Get hit or Put of one of its objects
 	nsEntries                         map[string]int       // namespace → resident entry count
 	hits, misses, evictions, failures uint64
-	inactiveExpiries                  uint64       // namespaces ExpireInactive evicted
-	written                           func()       // test rendezvous after writing a fill, before publishing it
-	removing                          func(string) // test rendezvous before removing Wipe's trash
+	inactiveExpiries                  uint64         // namespaces ExpireInactive evicted
+	writers                           chan struct{}  // DiskWriters write slots
+	fills                             chan struct{}  // PutAsync fills queued or writing
+	background                        chan struct{}  // backgroundWriters write slots
+	pending                           sync.WaitGroup // PutAsync fills in flight
+	written                           func()         // test rendezvous after writing a fill, before publishing it
+	removing                          func(string)   // test rendezvous before removing Wipe's trash
 }
 
 // ErrPinCapacity is Pin's refusal: the reservation does not fit the pin
@@ -164,7 +166,7 @@ func OpenDisk(cfg DiskConfig) (*Disk, error) {
 		removeHome(home, lock)
 		return nil, err
 	}
-	return &Disk{Logger: cfg.Logger, home: home, lock: lock, dir: dir, cap: capacity, pinCap: pc, maxPinned: MaxPinnedNamespaces, items: make(map[string]*list.Element), pins: make(map[string]map[string]int64), pinBytes: make(map[string]int64), pinAt: make(map[string]time.Time), pinPrevAt: make(map[string]time.Time), pinned: make(map[string]int), lastAccess: make(map[string]time.Time), nsEntries: make(map[string]int)}, nil
+	return &Disk{Logger: cfg.Logger, home: home, lock: lock, dir: dir, cap: capacity, pinCap: pc, maxPinned: MaxPinnedNamespaces, items: make(map[string]*list.Element), pins: make(map[string]map[string]int64), pinBytes: make(map[string]int64), pinAt: make(map[string]time.Time), pinPrevAt: make(map[string]time.Time), pinned: make(map[string]int), lastAccess: make(map[string]time.Time), nsEntries: make(map[string]int), writers: make(chan struct{}, DiskWriters), fills: make(chan struct{}, asyncFills), background: make(chan struct{}, backgroundWriters)}, nil
 }
 
 // sweepStale removes the Disk directories under root whose lock is free.
@@ -380,9 +382,50 @@ func (c *Disk) Put(key string, b []byte) {
 	_ = c.PutChecked(key, b)
 }
 
+// DiskWriters bounds the fills writing to the disk at once;
+// backgroundWriters of them may be Put and PutChecked fills (a warm, a
+// pin, a write's own objects), so a read's PutAsync fill is not queued
+// behind a warm.
+const (
+	DiskWriters       = 8
+	backgroundWriters = 2
+)
+
+// PutAsync is Put in the background, for a reader that must not wait on
+// the disk: a fill that finds asyncFills fills already pending is dropped,
+// and the object is cached by a later read.
+func (c *Disk) PutAsync(key string, b []byte) {
+	if c == nil {
+		return
+	}
+	select {
+	case c.fills <- struct{}{}:
+	default:
+		return
+	}
+	c.pending.Go(func() {
+		defer func() { <-c.fills }()
+		_ = c.put(key, b, false)
+	})
+}
+
+// WaitFills waits for the PutAsync fills in flight.
+func (c *Disk) WaitFills() {
+	if c != nil {
+		c.pending.Wait()
+	}
+}
+
 // PutChecked is the strict Put, for when residency is a readiness
 // condition. Ordinary fills remain best effort through Put.
-func (c *Disk) PutChecked(key string, b []byte) error {
+func (c *Disk) PutChecked(key string, b []byte) error { return c.put(key, b, true) }
+
+// asyncFills bounds the PutAsync fills pending at once.
+const asyncFills = 64
+
+// put is PutChecked; a background fill takes one of backgroundWriters
+// slots before a write slot.
+func (c *Disk) put(key string, b []byte, background bool) error {
 	if c == nil {
 		return ErrWarmCache
 	}
@@ -411,9 +454,19 @@ func (c *Disk) PutChecked(key string, b []byte) error {
 	c.reserved += charge
 	dir := c.dir
 	c.mu.Unlock()
-	// Write and hash outside the lock (see Get); the rename below publishes
-	// the complete file under it, so readers never see a partial one.
+	// Write and hash outside the lock (see Get); the entry is published
+	// below under it, so readers never see a partial file. At most
+	// DiskWriters fills write at once: a warm's dozens of fills queued on
+	// the device starved every disk read behind them.
+	if background {
+		c.background <- struct{}{}
+	}
+	c.writers <- struct{}{}
 	tmp, sums, werr := writeTemp(dir, b)
+	<-c.writers
+	if background {
+		<-c.background
+	}
 	if c.written != nil {
 		c.written()
 	}
@@ -450,14 +503,11 @@ func (c *Disk) PutChecked(key string, b []byte) error {
 		discard()
 		return ErrWarmCache
 	}
-	id := sha256.Sum256([]byte(key))
-	path := filepath.Join(c.dir, hex.EncodeToString(id[:]))
-	if err := os.Rename(tmp, path); err != nil {
-		c.failures++
-		discard()
-		return errors.Join(ErrWarmCache, err)
-	}
-	e := &diskEntry{key: key, path: path, bytes: int64(len(b)), charge: charge, sums: sums}
+	// The temporary file is the entry: the cache is not recovered after a
+	// restart, so nothing needs its name. A rename here held the mutex
+	// every reader takes across a filesystem call, and on a saturated disk
+	// that call took long enough to stall every disk hit.
+	e := &diskEntry{key: key, path: tmp, bytes: int64(len(b)), charge: charge, sums: sums}
 	c.items[key] = c.ll.PushFront(e)
 	c.size += charge
 	if c.isPinned(key) {
@@ -882,6 +932,7 @@ func (c *Disk) Close() {
 	if c == nil {
 		return
 	}
+	c.WaitFills()
 	c.mu.Lock()
 	lock := c.lock
 	c.lock, c.closed = nil, true

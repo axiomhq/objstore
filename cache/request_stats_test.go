@@ -58,6 +58,7 @@ func TestRequestStatsCountDiskHits(t *testing.T) {
 			if _, err := c.FetchWith(ctx, "disk-key", load); err != nil {
 				t.Fatal(err)
 			}
+			disk.WaitFills() // the fill is asynchronous
 		}
 	}
 	if loads != 1 {
@@ -141,6 +142,7 @@ func TestClassCountsSplitLookupsByKeyAndOutcome(t *testing.T) {
 	if got := cold.ClassCounts(); got.Loads[ClassBlock] != 1 || got.MemoryHits[ClassBlock] != 1 || got.DiskHits[ClassBlock] != 0 {
 		t.Fatalf("cold process: %+v, want one load and one memory hit", got)
 	}
+	disk.WaitFills() // the fill is asynchronous
 	// A new process over the same disk tier: its memory misses, the disk answers.
 	warm := New(nil, 1<<20, disk, keys)
 	unexpected := errors.New("store read on a disk hit")

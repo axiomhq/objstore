@@ -406,6 +406,7 @@ func TestSingleChildPlanIsNotCachedTwice(t *testing.T) {
 	if charge, want := objects.Memory.Charge(), charged(load); charge != want {
 		t.Fatalf("memory charge = %d, want %d", charge, want)
 	}
+	disk.WaitFills() // the fill is asynchronous
 	generation := objects.Memory.GenerationOf(load.Key)
 	if disk.Stats().Entries != 1 || !disk.Has(cache.DiskKey(load.Key, generation)) {
 		t.Fatal("disk tier retained parent or missed child")
@@ -453,6 +454,7 @@ func TestCoalescedParentIsNotCached(t *testing.T) {
 	if charge, want := objects.Memory.Charge(), charged(loads...); charge != want {
 		t.Fatalf("memory charge = %d, want %d: the two 6-byte children only", charge, want)
 	}
+	disk.WaitFills() // the fill is asynchronous
 	if st := disk.Stats(); st.Entries != 2 {
 		t.Fatalf("disk entries = %d, want the two children only", st.Entries)
 	}
