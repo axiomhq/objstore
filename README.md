@@ -4,8 +4,8 @@
 [![CI](https://github.com/axiomhq/objstore/actions/workflows/ci.yml/badge.svg?branch=main)](https://github.com/axiomhq/objstore/actions/workflows/ci.yml)
 
 Object storage with compare-and-swap for Go. Supports S3, Google Cloud Storage,
-Azure Blob Storage, and local files, with packages for write-ahead logs, leases,
-and cached reads.
+Azure Blob Storage, and local files, with packages for write-ahead logs and
+leases.
 
 ## Quick start
 

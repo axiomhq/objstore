@@ -15,7 +15,6 @@
 // Store.WithKMSKeys names a KMS key per object; S3 (SSE-KMS) and GCS
 // (kmsKeyName) encrypt it under that key.
 //
-// Package wal is a write-ahead log on a Store, package cache a memory and
-// disk cache in front of one, package rangeread a coalescing ranged reader
-// over the cache, package lease a single-holder lease on one key.
+// Package wal is a write-ahead log on a Store, package lease a
+// single-holder lease on one key. Caching reads is the caller's business.
 package objstore

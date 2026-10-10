@@ -2,6 +2,10 @@
 
 ## Unreleased
 
+### Breaking changes
+
+- **cache, rangeread**: removed. Caching is the caller's business, not the store's; dotwerk, their only importer, keeps its own copy.
+
 ### Added
 
 - Optional streaming `NewReader`, `Upload`, `UploadIfAbsent`, `UploadIfMatch`, `Stat`, and header-aware `Sign` capabilities exposed through `Store`, without changing mandatory `Backend`. Upload results contain the committed size and backend CAS token.

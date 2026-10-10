@@ -235,16 +235,6 @@ use the **same TTL**, with relative clock error **below TTL/2**.
 compare-and-swap or sequence check. For repeated acquisition attempts, keep one
 handle from `lease.New`. Use `lease.Shared` to share a lease within a process.
 
-## Cached reads
-
-- [cache][cache] adds memory and optional disk storage. Concurrent misses for one
-  key share a GET. `Cache.Put` writes through both tiers.
-- [rangeread][rangeread] combines nearby byte ranges into fewer GETs through the cache.
-
-**Cache only immutable objects.** Cached keys are never revalidated. Keys under
-`ns/<name>/` belong to a namespace; `InvalidateNamespace` drops that namespace
-from both tiers.
-
 ## Encryption
 
 Choose a server-side KMS key per object:
@@ -316,7 +306,7 @@ against the target service before adoption.
 
 See [CHANGELOG.md](CHANGELOG.md) for breaking changes and API replacements.
 Streaming capabilities are additive: existing byte methods, exact ranges,
-mandatory `Backend`, and WAL/cache formats are unchanged. Custom wrappers must
+mandatory `Backend`, and the WAL format are unchanged. Custom wrappers must
 forward optional capabilities or explicitly remain unsupported. The existing
 conditional-write probe covers single PUTs, not multipart conditional writes;
 S3 conditional streaming deliberately remains single-request. Dependencies are
@@ -331,7 +321,5 @@ Rewrite or delete them before upgrading; the new providers do not decrypt them.
 [store]: https://pkg.go.dev/github.com/axiomhq/objstore#Store
 [wal]: https://pkg.go.dev/github.com/axiomhq/objstore/wal
 [lease]: https://pkg.go.dev/github.com/axiomhq/objstore/lease
-[cache]: https://pkg.go.dev/github.com/axiomhq/objstore/cache
-[rangeread]: https://pkg.go.dev/github.com/axiomhq/objstore/rangeread
 [storetest]: https://pkg.go.dev/github.com/axiomhq/objstore/storetest
 [bucket]: https://pkg.go.dev/github.com/axiomhq/objstore/storetest/bucket
