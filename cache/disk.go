@@ -596,14 +596,20 @@ func readBlocks(e diskEntry, off, n int64) ([]byte, bool) {
 }
 
 // writeTemp writes b to a new file in dir and returns its path and block sums.
-// This cache is intentionally not recovered after restart, so fsync is
-// unnecessary. On error the path, if any, names the partial file.
+// The cache is not recovered after restart; the sync paces the writers at
+// the device's speed. Without it a warm "finished" with 12 GB still dirty
+// in the page cache, and its write-back held every disk read for minutes
+// (10M 1024-dim vectors on a SATA SSD: hot queries 5-8 s, then 0.2-0.4 s).
+// On error the path, if any, names the partial file.
 func writeTemp(dir string, b []byte) (string, []uint32, error) {
 	f, err := os.CreateTemp(dir, "put-")
 	if err != nil {
 		return "", nil, err
 	}
 	_, err = f.Write(b)
+	if err == nil {
+		err = f.Sync()
+	}
 	if cerr := f.Close(); err == nil {
 		err = cerr
 	}
