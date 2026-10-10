@@ -382,6 +382,12 @@ func (c *Disk) Put(key string, b []byte) {
 	_ = c.PutChecked(key, b)
 }
 
+// MinDiskFill is the smallest range child a read copies to the disk tier.
+// A file per reranked row (4 KiB) made 463k files beside the 942 tables
+// they were cut from; smaller children stay in memory, and the disk entry
+// of their object, once warmed, serves them.
+const MinDiskFill = 32 << 10
+
 // DiskWriters bounds the fills writing to the disk at once;
 // backgroundWriters of them may be Put and PutChecked fills (a warm, a
 // pin, a write's own objects), so a read's PutAsync fill is not queued

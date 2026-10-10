@@ -51,6 +51,9 @@ type Load struct {
 // falls back to its own per-object reads. An invalid load, an empty Key, or
 // one Key given two different loads is ErrInvalidExtent, whatever the
 // budget; a range the store returns at the wrong length is ErrCorrupt.
+// diskLookups bounds a wave's concurrent disk-cache lookups.
+const diskLookups = 64
+
 func (r *Reader) FetchRanges(ctx context.Context, loads []Load) (context.Context, error) {
 	if err := ctx.Err(); err != nil {
 		return ctx, err
@@ -102,21 +105,37 @@ func (r *Reader) FetchRanges(ctx context.Context, loads []Load) (context.Context
 	var pending []Load
 	var owners []bool // owners[i]: this lookup owns the request's miss of pending[i] (cache.MarkMissed)
 	var extents []Extent
+	var probe []Load // memory misses, looked up on disk
 	for _, load := range unique {
 		if b, ok := cache.Scoped(ctx, load.Key); ok {
 			results[load.Key] = b
 			continue
 		}
-		memory := r.objects.ByteCacheFor(load.Key)
-		if b, ok := memory.Peek(load.Key); ok {
+		if b, ok := r.objects.ByteCacheFor(load.Key).Peek(load.Key); ok {
 			r.objects.Note(ctx, load.Key, cache.MemoryHit)
 			results[load.Key] = b
 			continue
 		}
-		if b, ok := r.objects.FromDisk(ctx, load.Key); ok {
+		probe = append(probe, load)
+	}
+	// Disk lookups at once: each is a file open and read, and one at a
+	// time a rerank's ~1,400 rows took minutes on a busy SSD.
+	fromDisk := make([][]byte, len(probe))
+	var lookups errgroup.Group
+	lookups.SetLimit(diskLookups)
+	for i, load := range probe {
+		lookups.Go(func() error {
+			fromDisk[i], _ = r.objects.FromDisk(ctx, load.Key)
+			return nil
+		})
+	}
+	lookups.Wait()
+	for i, load := range probe {
+		if b := fromDisk[i]; b != nil {
 			results[load.Key] = b
 			continue
 		}
+		memory := r.objects.ByteCacheFor(load.Key)
 		pending = append(pending, load)
 		gens = append(gens, memory.GenerationOf(load.Key))
 		if parentGens == nil {
@@ -315,7 +334,7 @@ func (r *Reader) FetchRanges(ctx context.Context, loads []Load) (context.Context
 			r.objects.NoteAs(ctx, load.Key, cache.Outcome(o), owners[i])
 		}
 		if !direct[i] && !load.Transient {
-			if stored[i].Load() {
+			if stored[i].Load() && load.Length >= cache.MinDiskFill {
 				r.objects.Disk.PutAsync(cache.DiskKey(load.Key, gens[i]), data) // a read never waits on a disk write
 			}
 			memory.Put(load.Key, data, gens[i])
