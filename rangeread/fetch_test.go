@@ -460,6 +460,61 @@ func TestCoalescedParentIsNotCached(t *testing.T) {
 	}
 }
 
+// TestWithoutDiskFillKeepsReadsOffDisk: under cache.WithoutDiskFill a
+// direct child (FetchCachedRange) and coalesced children (FetchRanges'
+// own fill) go to memory only, and a child the disk already holds is
+// still read from it.
+func TestWithoutDiskFillKeepsReadsOffDisk(t *testing.T) {
+	s, fault := storetest.NewFault(bucket.New(t))
+	disk, err := cache.NewDisk(t.TempDir(), 1<<20)
+	if err != nil {
+		t.Fatal(err)
+	}
+	objects := cache.New(s, 1<<20, disk, cache.Keys{})
+	t.Cleanup(objects.Close)
+	whole := []byte("0123456789abcdefghijklmnopqrstuvwxyz")
+	for _, object := range []string{"ns/nofill/single", "ns/nofill/merged", "ns/nofill/ondisk"} {
+		if err := s.Put(t.Context(), object, whole); err != nil {
+			t.Fatal(err)
+		}
+	}
+	loads := []Load{
+		{Extent: Extent{Object: "ns/nofill/single", Offset: 7, Length: 15}, Key: "ns/nofill/single#probe"},
+		{Extent: Extent{Object: "ns/nofill/merged", Offset: 2, Length: 6}, Key: "ns/nofill/merged#0"},
+		{Extent: Extent{Object: "ns/nofill/merged", Offset: 12, Length: 6}, Key: "ns/nofill/merged#1"},
+		{Extent: Extent{Object: "ns/nofill/ondisk", Offset: 0, Length: 4}, Key: "ns/nofill/ondisk#0"},
+	}
+	onDisk := cache.DiskKey(loads[3].Key, objects.Memory.GenerationOf(loads[3].Key))
+	if err := disk.PutChecked(onDisk, []byte("DISK")); err != nil {
+		t.Fatal(err)
+	}
+	r := newReader(t, s, objects, Config{})
+	fault.ResetOps()
+	ctx, err := r.FetchRanges(cache.WithoutDiskFill(t.Context()), loads)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, load := range loads[:3] {
+		want := whole[load.Offset : load.Offset+load.Length]
+		if got, ok := cache.Scoped(ctx, load.Key); !ok || !bytes.Equal(got, want) {
+			t.Fatalf("%s = %q, want %q", load.Key, got, want)
+		}
+		if _, ok := objects.Memory.Peek(load.Key); !ok {
+			t.Fatalf("%s was not stored in memory", load.Key)
+		}
+	}
+	if got, _ := cache.Scoped(ctx, loads[3].Key); string(got) != "DISK" {
+		t.Fatalf("on-disk child = %q, want the disk tier's DISK", got)
+	}
+	if got := fault.Ops()[storetest.OpGetRange]; got != 2 {
+		t.Fatalf("range GETs = %d, want 2: single and merged, not the on-disk child", got)
+	}
+	disk.WaitFills()
+	if st := disk.Stats(); st.Entries != 1 {
+		t.Fatalf("disk entries = %d, want only the one put before the read", st.Entries)
+	}
+}
+
 // TestCoalescedChildrenOfACachedObjectStayOffDisk: children cut from a
 // range the disk tier already holds inside a whole object are cached in
 // memory, not copied to disk a second time.

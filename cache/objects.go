@@ -322,7 +322,7 @@ func (c *Cache) fetchCachedOnce(ctx context.Context, key string, load func(conte
 			}
 		} else {
 			// In the background: a read never waits on a disk write.
-			if memory.GenerationOf(key) == generation {
+			if FillsDisk(ctx) && memory.GenerationOf(key) == generation {
 				c.Disk.PutAsync(flightKey, b) // flightKey is DiskKey(key, generation)
 			}
 		}
@@ -476,6 +476,21 @@ func Scoped(ctx context.Context, key string) ([]byte, bool) {
 	b, ok := results[key]
 	return b, ok
 }
+
+type noDiskFillKey struct{}
+
+// WithoutDiskFill keeps reads under ctx from filling the disk tier: they
+// still read and fill memory, and still read what the disk already holds.
+// It is for work whose objects are not worth a disk write, such as a
+// compaction reading tables it is about to delete. A read that joins
+// another caller's load of the same key follows that caller's choice.
+func WithoutDiskFill(ctx context.Context) context.Context {
+	return context.WithValue(ctx, noDiskFillKey{}, true)
+}
+
+// FillsDisk reports whether reads under ctx may fill the disk tier (see
+// WithoutDiskFill).
+func FillsDisk(ctx context.Context) bool { return ctx.Value(noDiskFillKey{}) == nil }
 
 type budgetKey struct{}
 
