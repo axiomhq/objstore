@@ -36,6 +36,9 @@ type Load struct {
 	Transient bool
 }
 
+// diskLookups bounds a wave's concurrent disk-cache lookups.
+const diskLookups = 64
+
 // FetchRanges executes one dependency stage: it reads every load not
 // already cached, coalesced by Plan, and returns ctx carrying all of the
 // stage's children (cache.WithResults; read them with cache.Scoped). It
@@ -51,9 +54,6 @@ type Load struct {
 // falls back to its own per-object reads. An invalid load, an empty Key, or
 // one Key given two different loads is ErrInvalidExtent, whatever the
 // budget; a range the store returns at the wrong length is ErrCorrupt.
-// diskLookups bounds a wave's concurrent disk-cache lookups.
-const diskLookups = 64
-
 func (r *Reader) FetchRanges(ctx context.Context, loads []Load) (context.Context, error) {
 	if err := ctx.Err(); err != nil {
 		return ctx, err
