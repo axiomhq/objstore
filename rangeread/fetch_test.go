@@ -408,8 +408,8 @@ func TestSingleChildPlanIsNotCachedTwice(t *testing.T) {
 	}
 	disk.WaitFills() // the fill is asynchronous
 	generation := objects.Memory.GenerationOf(load.Key)
-	if disk.Stats().Entries != 0 || disk.Has(cache.DiskKey(load.Key, generation)) {
-		t.Fatal("disk tier holds the parent, or a child below cache.MinDiskFill")
+	if disk.Stats().Entries != 1 || !disk.Has(cache.DiskKey(load.Key, generation)) {
+		t.Fatal("disk tier retained parent or missed child")
 	}
 	if r.IO.Gets.Load() != 1 || fault.Ops()[storetest.OpGetRange] != 1 {
 		t.Fatalf("range GETs = %d, store ops = %v", r.IO.Gets.Load(), fault.Ops())
@@ -455,8 +455,8 @@ func TestCoalescedParentIsNotCached(t *testing.T) {
 		t.Fatalf("memory charge = %d, want %d: the two 6-byte children only", charge, want)
 	}
 	disk.WaitFills() // the fill is asynchronous
-	if st := disk.Stats(); st.Entries != 0 {
-		t.Fatalf("disk entries = %d, want none: the parent is never cached, the children are below cache.MinDiskFill", st.Entries)
+	if st := disk.Stats(); st.Entries != 2 {
+		t.Fatalf("disk entries = %d, want the two children only", st.Entries)
 	}
 }
 
@@ -999,30 +999,4 @@ func charged(loads ...Load) int {
 		n += int(load.Length) + len(load.Key) + cache.EntryOverhead
 	}
 	return n
-}
-
-// TestSmallChildrenStayOffDisk: a child of cache.MinDiskFill bytes read
-// from the store gets a disk entry; one byte smaller does not.
-func TestSmallChildrenStayOffDisk(t *testing.T) {
-	s := bucket.New(t)
-	disk, err := cache.NewDisk(t.TempDir(), 1<<30)
-	if err != nil {
-		t.Fatal(err)
-	}
-	objects := cache.New(s, 1<<30, disk, cache.Keys{})
-	t.Cleanup(objects.Close)
-	const object = "ns/fill/object"
-	if err := s.Put(t.Context(), object, make([]byte, 4*cache.MinDiskFill)); err != nil {
-		t.Fatal(err)
-	}
-	big := Load{Extent: Extent{Object: object, Offset: 0, Length: cache.MinDiskFill}, Key: object + "#big"}
-	small := Load{Extent: Extent{Object: object, Offset: 2 * cache.MinDiskFill, Length: cache.MinDiskFill - 1}, Key: object + "#small"}
-	if _, err := newReader(t, s, objects, Config{}).FetchRanges(t.Context(), []Load{big, small}); err != nil {
-		t.Fatal(err)
-	}
-	disk.WaitFills()
-	has := func(l Load) bool { return disk.Has(cache.DiskKey(l.Key, objects.Memory.GenerationOf(l.Key))) }
-	if !has(big) || has(small) {
-		t.Fatalf("on disk: %d-byte child %v, %d-byte child %v; want true, false", big.Length, has(big), small.Length, has(small))
-	}
 }

@@ -321,9 +321,8 @@ func (c *Cache) fetchCachedOnce(ctx context.Context, key string, load func(conte
 				outcome = DiskHit
 			}
 		} else {
-			// In the background: a read never waits on a disk write. A
-			// small range child stays in memory (MinDiskFill).
-			if memory.GenerationOf(key) == generation && (storedBytes == 0 || storedBytes >= MinDiskFill) {
+			// In the background: a read never waits on a disk write.
+			if memory.GenerationOf(key) == generation {
 				c.Disk.PutAsync(flightKey, b) // flightKey is DiskKey(key, generation)
 			}
 		}
