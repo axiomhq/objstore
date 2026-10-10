@@ -9,8 +9,7 @@ S3 and Google Cloud Storage can write an object only if it doesn't exist yet,
 or only if it hasn't changed since you read it. That's compare-and-swap, and
 it's enough to build a write-ahead log, a leader lease, or a manifest that many
 processes update, with nothing but a bucket. objstore gives you a Store with
-those conditional writes, and builds the log, the lease and a read cache on top
-of it.
+those conditional writes, and builds the log and the lease on top of it.
 
 Objects are meant to be written once and never changed, except by deletion.
 The conditional writes cover the few that must change.
@@ -217,46 +216,6 @@ with a check of the lease.
 A long-lived caller that retries should keep one handle, from lease.New, and
 call its Acquire method in a loop. lease.Shared shares one lease among holders
 in a process by reference count.
-
-### Cache and ranged reads
-
-[Package cache][cache] puts memory and an optional disk tier in front of a
-Store. Concurrent misses of one key share one GET.
-
-[cache]: https://pkg.go.dev/github.com/axiomhq/objstore/cache
-
-```go
-disk, err := cache.NewDisk(dir, 10<<30) // 10 GiB on disk
-if err != nil {
-	return err
-}
-c := cache.New(s, 1<<30, disk, cache.Keys{}) // 1 GiB in memory
-
-b, err := c.FetchWith(ctx, key, func(ctx context.Context) ([]byte, error) {
-	return s.Get(ctx, key)
-})
-```
-
-Objects are immutable, so the cache never revalidates a key. Keys under
-`ns/<name>/` belong to namespace `<name>`, and InvalidateNamespace drops one
-namespace from every tier without touching the others.
-
-[Package rangeread][rangeread] reads many byte ranges through the cache,
-coalescing nearby ones into one GET.
-
-[rangeread]: https://pkg.go.dev/github.com/axiomhq/objstore/rangeread
-
-```go
-r, err := rangeread.New(s, c, rangeread.Config{})
-if err != nil {
-	return err
-}
-scope, err := r.FetchRanges(ctx, loads)
-if err != nil {
-	return err
-}
-b, ok := cache.Scoped(scope, loads[0].Key)
-```
 
 ### Encryption
 

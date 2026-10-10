@@ -1,5 +1,11 @@
 # Changelog
 
+## Unreleased
+
+### Breaking changes
+
+- **cache, rangeread**: removed. Caching is the caller's business, not the store's; dotwerk, their only importer, keeps its own copy.
+
 ## v0.9.0
 
 ### Breaking changes
