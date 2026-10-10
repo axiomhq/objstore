@@ -237,10 +237,9 @@ b, err := c.FetchWith(ctx, key, func(ctx context.Context) ([]byte, error) {
 })
 ```
 
-Objects are immutable, so the cache never revalidates a key. Cache.Put writes
-through both tiers, so a process reads back what it wrote from cache. Keys
-under `ns/<name>/` belong to namespace `<name>`, and InvalidateNamespace drops
-one namespace from every tier without touching the others.
+Objects are immutable, so the cache never revalidates a key. Keys under
+`ns/<name>/` belong to namespace `<name>`, and InvalidateNamespace drops one
+namespace from every tier without touching the others.
 
 [Package rangeread][rangeread] reads many byte ranges through the cache,
 coalescing nearby ones into one GET.

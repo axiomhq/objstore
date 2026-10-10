@@ -21,7 +21,6 @@ import (
 	"github.com/axiomhq/objstore"
 	"github.com/axiomhq/objstore/fs"
 	"github.com/axiomhq/objstore/storetest"
-	"github.com/axiomhq/objstore/storetest/bucket"
 )
 
 type cacheScenarioResult struct {
@@ -179,32 +178,6 @@ func TestWALPagesHaveTheirOwnBudget(t *testing.T) {
 // TestPutFillsTheDiskTier: an object this process put is on disk as well
 // as in memory, so a range read the memory tier cannot answer (here: a
 // table larger than the whole budget) is a disk hit, not a store read.
-func TestPutFillsTheDiskTier(t *testing.T) {
-	ctx := context.Background()
-	disk := newDisk(t, 1<<20)
-	c := New(bucket.New(t), 1<<10, disk, Keys{})
-	key := "ns/x/table/1"
-	data := bytes.Repeat([]byte("table"), 1000)
-	if err := c.Put(ctx, key, data); err != nil {
-		t.Fatal(err)
-	}
-	if _, ok := c.Memory.Peek(key); ok {
-		t.Fatal("a table past the memory budget was cached in memory")
-	}
-	b, fromDisk, ok := c.CachedRange(key, 100, 50)
-	if !ok || !fromDisk || !bytes.Equal(b, data[100:150]) {
-		t.Fatalf("CachedRange after a Put = %q disk %v ok %v, want a disk hit", b, fromDisk, ok)
-	}
-	// Under WithoutDiskFill (an indexer's output, deleted by a later
-	// compaction) the write leaves the disk tier alone.
-	if err := c.Put(WithoutDiskFill(ctx), "ns/x/table/2", data); err != nil {
-		t.Fatal(err)
-	}
-	if st := disk.Stats(); st.Entries != 1 {
-		t.Fatalf("disk entries = %d, want only the first table", st.Entries)
-	}
-}
-
 // waiters is the number of callers joined to key's flight.
 func (c *Cache) waiters(key string) int {
 	c.flightMu.Lock()

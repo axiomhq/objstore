@@ -177,36 +177,6 @@ func (c *Cache) InvalidateNamespace(name string) {
 // Close closes the disk tier.
 func (c *Cache) Close() { c.Disk.Close() }
 
-// Put writes an immutable object and caches it on the way past, in memory
-// and on disk (unless WithoutDiskFill), so the process that published it
-// never re-reads it: the
-// memory entry of a large object may be low priority (Keys.Low) and go
-// first, and the range reads after that (CachedRange) find it on disk.
-// The memory tier aliases data, which must not be mutated after Put.
-func (c *Cache) Put(ctx context.Context, key string, data []byte) error {
-	memory := c.ByteCacheFor(key)
-	// Read before the write: an invalidation during it retires this fill.
-	generation := memory.GenerationOf(key)
-	if err := c.Store.Put(ctx, key, data); err != nil {
-		return err
-	}
-	memory.Put(key, data, generation)
-	if FillsDisk(ctx) {
-		c.putDisk(memory, key, generation, data)
-	}
-	return nil
-}
-
-// putDisk fills the disk tier unless key's namespace was invalidated since
-// generation was read: the entry would sit under a retired disk key that
-// nothing reads again. An invalidation racing the check itself can still
-// leave one such entry; it is unreachable and ages out like any other.
-func (c *Cache) putDisk(memory *ByteCache, key string, generation uint64, data []byte) {
-	if memory.GenerationOf(key) == generation {
-		c.Disk.Put(DiskKey(key, generation), data)
-	}
-}
-
 // GateWidth is the default bound on concurrent store GETs (Cache.Gate, see
 // SetGateWidth) so a wide query
 // cannot stampede the bucket. semaphore.Weighted keeps its occupancy private, so
@@ -482,11 +452,10 @@ func Scoped(ctx context.Context, key string) ([]byte, bool) {
 
 type noDiskFillKey struct{}
 
-// WithoutDiskFill keeps reads and Puts under ctx from filling the disk
-// tier: they still read and fill memory, and still read what the disk
-// already holds. It is for work whose objects are not worth a disk write,
-// such as a compaction reading tables it is about to delete and writing
-// tables the next one deletes. A read that joins another caller's load of
+// WithoutDiskFill keeps reads under ctx from filling the disk tier: they
+// still read and fill memory, and still read what the disk already holds.
+// It is for work whose objects are not worth a disk write, such as a
+// compaction reading tables it is about to delete. A read that joins another caller's load of
 // the same key follows that caller's choice.
 func WithoutDiskFill(ctx context.Context) context.Context {
 	return context.WithValue(ctx, noDiskFillKey{}, true)
