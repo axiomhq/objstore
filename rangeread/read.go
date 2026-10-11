@@ -23,10 +23,8 @@ func Read(ctx context.Context, s *objstore.Store, extents []Extent, cfg Config) 
 		return nil, err
 	}
 	out := make([][]byte, len(extents))
-	byObject := make(map[string][]int) // object → indexes into extents
 	for i, x := range extents {
 		out[i] = make([]byte, x.Length)
-		byObject[x.Object] = append(byObject[x.Object], i)
 	}
 	inFlight := semaphore.NewWeighted(cfg.MaxInFlightBytes)
 	g, gctx := errgroup.WithContext(ctx)
@@ -37,27 +35,34 @@ func Read(ctx context.Context, s *objstore.Store, extents []Extent, cfg Config) 
 				return err
 			}
 			defer inFlight.Release(p.Length)
-			data, err := s.GetRange(gctx, p.Object, p.Offset, p.Length)
-			if err != nil {
-				return err
-			}
-			if int64(len(data)) != p.Length {
-				return fmt.Errorf("%w: %s: range at %d returned %d bytes, want %d", ErrCorrupt, p.Object, p.Offset, len(data), p.Length)
-			}
-			// Planned ranges are disjoint, so concurrent copies into one
-			// extent never touch the same bytes.
-			for _, i := range byObject[p.Object] {
-				x := extents[i]
-				lo, hi := max(p.Offset, x.Offset), min(p.Offset+p.Length, x.Offset+x.Length)
-				if lo < hi {
-					copy(out[i][lo-x.Offset:hi-x.Offset], data[lo-p.Offset:hi-p.Offset])
-				}
-			}
-			return nil
+			return ReadPlanned(gctx, s, p, extents, out)
 		})
 	}
 	if err := g.Wait(); err != nil {
 		return nil, err
 	}
 	return out, nil
+}
+
+// ReadPlanned reads one planned span with a single GetRange and copies the
+// part of it each extent covers into out[i], which must be extents[i].Length
+// bytes long; extents p does not overlap are left alone. An extent
+// longer than one span is filled by the ReadPlanned calls of each span it
+// overlaps; spans of one Plan are disjoint, so those calls may run at once.
+// A range the store returns at the wrong length is ErrCorrupt.
+func ReadPlanned(ctx context.Context, s *objstore.Store, p Planned, extents []Extent, out [][]byte) error {
+	data, err := s.GetRange(ctx, p.Object, p.Offset, p.Length)
+	if err != nil {
+		return err
+	}
+	if int64(len(data)) != p.Length {
+		return fmt.Errorf("%w: %s: range at %d returned %d bytes, want %d", ErrCorrupt, p.Object, p.Offset, len(data), p.Length)
+	}
+	for i, x := range extents {
+		lo, hi := max(p.Offset, x.Offset), min(p.Offset+p.Length, x.Offset+x.Length)
+		if x.Object == p.Object && lo < hi {
+			copy(out[i][lo-x.Offset:hi-x.Offset], data[lo-p.Offset:hi-p.Offset])
+		}
+	}
+	return nil
 }
