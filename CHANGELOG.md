@@ -1,15 +1,23 @@
 # Changelog
 
-## Unreleased
+## v0.11.0
 
 ### Breaking changes
 
-- **cache**: removed. Caching is the caller's business, not the store's; dotwerk, its only importer, keeps its own copy.
-- **rangeread**: no longer reads through a cache. `Reader`, `FetchRanges`, `Load`, `Counters` and the cache scope are gone; `Read(ctx, store, extents, cfg)` returns each extent's bytes, read with the coalesced GETs `Plan` chooses; `ReadPlanned` reads one planned span, for callers that gate or share GETs themselves. `Plan`, `Extent` and `Config` are unchanged.
+- **rangeread**: back, without a cache. `Plan`, `Extent`, `Planned` and `Config` are as in v0.9.0. `Read(ctx, store, extents, cfg)` returns each extent's bytes, read with the coalesced GETs `Plan` chooses; `ReadPlanned` reads one planned span, for callers that gate or share GETs themselves. v0.9.0's `Reader`, `FetchRanges`, `Load` and `Counters` do not return.
 
 ### Added
 
 - `mem`: an in-memory backend, for tests and for data that need not outlive the process. It passes `storetest.Conformance`; it has no streaming capabilities.
+
+## v0.10.0
+
+### Breaking changes
+
+- **cache, rangeread**: removed. Caching is the caller's business, not the store's; dotwerk, their only importer, keeps its own copy.
+
+### Added
+
 - Optional streaming `NewReader`, `Upload`, `UploadIfAbsent`, `UploadIfMatch`, `Stat`, and header-aware `Sign` capabilities exposed through `Store`, without changing mandatory `Backend`. Upload results contain the committed size and backend CAS token.
 - `UploadOptions` for explicit known or unknown length, metadata, content type, cache control, and provider storage class. Unsupported options fail explicitly; streaming ranges cap at EOF while byte `GetRange` remains exact.
 - S3 bounded multipart unconditional uploads (8 MiB parts, about 78 GiB maximum). Conditional uploads remain single PUTs with known size up to 5 GiB. ETags remain opaque and are not portable checksums.
