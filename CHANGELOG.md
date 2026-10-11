@@ -8,6 +8,7 @@
 
 ### Added
 
+- `mem`: an in-memory backend, for tests and for data that need not outlive the process. It passes `storetest.Conformance`; it has no streaming capabilities.
 - Optional streaming `NewReader`, `Upload`, `UploadIfAbsent`, `UploadIfMatch`, `Stat`, and header-aware `Sign` capabilities exposed through `Store`, without changing mandatory `Backend`. Upload results contain the committed size and backend CAS token.
 - `UploadOptions` for explicit known or unknown length, metadata, content type, cache control, and provider storage class. Unsupported options fail explicitly; streaming ranges cap at EOF while byte `GetRange` remains exact.
 - S3 bounded multipart unconditional uploads (8 MiB parts, about 78 GiB maximum). Conditional uploads remain single PUTs with known size up to 5 GiB. ETags remain opaque and are not portable checksums.
