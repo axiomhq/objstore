@@ -13,6 +13,7 @@ returns a `*objstore.Store`.
 | [gcp/gcs][gcs] | Google Cloud Storage |
 | [azure/blob][azure] | Azure block blobs; caller-supplied container client |
 | [fs][fs] | Local directory; writes are fsynced before acknowledgment |
+| [mem][mem] | Process memory, for tests or data that need not outlive the process: `mem.Open(objstore.Config{})` |
 
 The file provider requires Unix with `flock`; Solaris and AIX are unsupported.
 
@@ -334,6 +335,7 @@ Rewrite or delete them before upgrading; the new providers do not decrypt them.
 [gcs]: https://pkg.go.dev/github.com/axiomhq/objstore/gcp/gcs
 [azure]: https://pkg.go.dev/github.com/axiomhq/objstore/azure/blob
 [fs]: https://pkg.go.dev/github.com/axiomhq/objstore/fs
+[mem]: https://pkg.go.dev/github.com/axiomhq/objstore/mem
 [store]: https://pkg.go.dev/github.com/axiomhq/objstore#Store
 [wal]: https://pkg.go.dev/github.com/axiomhq/objstore/wal
 [lease]: https://pkg.go.dev/github.com/axiomhq/objstore/lease
