@@ -4,7 +4,8 @@
 
 ### Breaking changes
 
-- **cache, rangeread**: removed. Caching is the caller's business, not the store's; dotwerk, their only importer, keeps its own copy.
+- **cache**: removed. Caching is the caller's business, not the store's; dotwerk, its only importer, keeps its own copy.
+- **rangeread**: no longer reads through a cache. `Reader`, `FetchRanges`, `Load`, `Counters` and the cache scope are gone; `Read(ctx, store, extents, cfg)` returns each extent's bytes, read with the coalesced GETs `Plan` chooses. `Plan`, `Extent` and `Config` are unchanged.
 
 ### Added
 

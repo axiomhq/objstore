@@ -235,6 +235,22 @@ use the **same TTL**, with relative clock error **below TTL/2**.
 compare-and-swap or sequence check. For repeated acquisition attempts, keep one
 handle from `lease.New`. Use `lease.Shared` to share a lease within a process.
 
+## Ranged reads
+
+[rangeread][rangeread] reads many byte ranges in few GETs. `Plan` unions
+overlapping extents and merges nearby ones across small gaps; `Read` runs that
+plan with bounded concurrency and returns each extent in its own buffer.
+
+```go
+parts, err := rangeread.Read(ctx, s, []rangeread.Extent{
+	{Object: "table", Offset: 0, Length: 4096},
+	{Object: "table", Offset: 8192, Length: 512},
+}, rangeread.Config{})
+```
+
+**Nothing is cached.** Keep the bytes you will read again; caching is the
+caller's business.
+
 ## Encryption
 
 Choose a server-side KMS key per object:
@@ -321,5 +337,6 @@ Rewrite or delete them before upgrading; the new providers do not decrypt them.
 [store]: https://pkg.go.dev/github.com/axiomhq/objstore#Store
 [wal]: https://pkg.go.dev/github.com/axiomhq/objstore/wal
 [lease]: https://pkg.go.dev/github.com/axiomhq/objstore/lease
+[rangeread]: https://pkg.go.dev/github.com/axiomhq/objstore/rangeread
 [storetest]: https://pkg.go.dev/github.com/axiomhq/objstore/storetest
 [bucket]: https://pkg.go.dev/github.com/axiomhq/objstore/storetest/bucket

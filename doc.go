@@ -16,5 +16,6 @@
 // (kmsKeyName) encrypt it under that key.
 //
 // Package wal is a write-ahead log on a Store, package lease a
-// single-holder lease on one key. Caching reads is the caller's business.
+// single-holder lease on one key, package rangeread coalesced ranged reads.
+// Caching reads is the caller's business.
 package objstore
