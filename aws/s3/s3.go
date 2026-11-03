@@ -28,11 +28,12 @@ import (
 
 // Backend is the S3 backend: AWS S3, MinIO, Ceph RGW (Hetzner), R2.
 type Backend struct {
-	client   *awss3.Client
-	bucket   string
-	endpoint string
-	sse      string
-	kmsKeyID string
+	client     *awss3.Client
+	bucket     string
+	endpoint   string
+	sse        string
+	kmsKeyID   string
+	quoteETags bool
 }
 
 // httpTimeout bounds one request end to end; a hung store never pins a
@@ -51,6 +52,9 @@ type Config struct {
 	Endpoint string
 	// Bucket is the bucket every key lives in.
 	Bucket string
+	// QuoteETags sends RFC 9110 quoted If-Match values, required by R2's
+	// local S3 endpoint. The default retains bare values for Ceph RGW.
+	QuoteETags bool
 	// AWS, when non-nil, replaces the SDK's default config loading. It is
 	// copied; credentials, region and HTTP client are used as supplied.
 	// A nil HTTP client uses this backend's bounded, pooled default.
@@ -143,7 +147,7 @@ func New(ctx context.Context, cfg Config) (*Backend, error) {
 		// otherwise log a warning on every GET.
 		o.ResponseChecksumValidation = aws.ResponseChecksumValidationWhenRequired
 	})
-	return &Backend{client: client, bucket: bucket, endpoint: endpoint, sse: sse, kmsKeyID: kmsKeyID}, nil
+	return &Backend{client: client, bucket: bucket, endpoint: endpoint, sse: sse, kmsKeyID: kmsKeyID, quoteETags: cfg.QuoteETags}, nil
 }
 
 // ID is the endpoint and bucket, or s3://bucket on AWS's default endpoint.
@@ -492,12 +496,16 @@ func (s *Backend) GetIfChanged(ctx context.Context, key, etag string) ([]byte, s
 // and accepts either form in If-Match, but Ceph RGW (Hetzner Object Storage)
 // compares the quoted header literally against the bare stored value and
 // answers 412 for every conditional PUT, which would make manifest CAS
-// publication impossible there. Cloudflare R2 documents If-Match per RFC
-// 9110 (quoted); whether it accepts the unquoted form is unverified, and
-// TestR2 is the check. TestS3PutIfMatchSendsUnquotedETag pins the header.
+// publication impossible there. Set Config.QuoteETags for RFC 9110 quoted
+// values: R2's local S3 endpoint rejects bare values. No retry with a different
+// header is attempted, since a failed PUT can have an unknown outcome.
 func (s *Backend) PutIfMatch(ctx context.Context, key string, data []byte, etag string) (bool, error) {
 	in := s.putInput(ctx, key, data)
-	in.IfMatch = aws.String(strings.Trim(etag, `"`))
+	etag = strings.Trim(etag, `"`)
+	if s.quoteETags {
+		etag = `"` + etag + `"`
+	}
+	in.IfMatch = &etag
 	_, err := s.client.PutObject(ctx, in)
 	if err != nil {
 		switch apiErrorCode(err) {

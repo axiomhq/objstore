@@ -255,6 +255,41 @@ func TestS3PutIfMatchSendsUnquotedETag(t *testing.T) {
 	}
 }
 
+func TestS3PutIfMatchQuotedETags(t *testing.T) {
+	t.Parallel()
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.Header.Get("If-Match") != `"abc123"` {
+			s3Error(w, http.StatusPreconditionFailed, "PreconditionFailed")
+			return
+		}
+		w.WriteHeader(http.StatusOK)
+	}))
+	t.Cleanup(srv.Close)
+	s, err := New(t.Context(), Config{Endpoint: srv.URL, Bucket: "b", QuoteETags: true, AWS: &aws.Config{
+		Region: "us-east-1", HTTPClient: srv.Client(),
+		Credentials: aws.CredentialsProviderFunc(func(context.Context) (aws.Credentials, error) {
+			return aws.Credentials{AccessKeyID: "test", SecretAccessKey: "test"}, nil
+		}),
+	}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, tc := range []struct {
+		name, etag string
+		want       bool
+	}{
+		{"quoted", `"abc123"`, true},
+		{"bare", "abc123", true},
+		{"stale", `"different"`, false},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			if ok, err := s.PutIfMatch(t.Context(), "k", []byte("x"), tc.etag); ok != tc.want || err != nil {
+				t.Fatalf("PutIfMatch(%s): ok=%v err=%v", tc.etag, ok, err)
+			}
+		})
+	}
+}
+
 // TestS3DeleteManyReportsPerKeyErrors: a batch DELETE is 200 even when keys
 // failed; the failures ride in the body and must not be swallowed, or
 // DropBucket's list-delete loop spins on an undeletable key forever.
