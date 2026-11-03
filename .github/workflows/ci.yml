@@ -45,6 +45,29 @@ jobs:
           GOOS=solaris go vet ./...
           GOOS=aix GOARCH=ppc64 go vet ./...
 
+  r2-binding:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v5
+      - uses: actions/setup-go@v6
+        with:
+          go-version-file: go.mod
+      - uses: actions/setup-node@v6
+        with:
+          node-version: '24'
+      - run: npm ci --prefix cloudflare/r2/testdata
+      - name: vet and test Go/Wasm against local R2
+        env:
+          GOOS: js
+          GOARCH: wasm
+        # Bindings cannot delete/recreate buckets. Refusal is tested separately.
+        run: |
+          go vet -tags=integration ./cloudflare/r2
+          go test -tags=integration -count=1 -v \
+            -exec="node $PWD/cloudflare/r2/testdata/exec.mjs" \
+            -skip='TestConformance/MissingBucket' ./cloudflare/r2
+
   s3:
     runs-on: ubuntu-latest
     timeout-minutes: 20

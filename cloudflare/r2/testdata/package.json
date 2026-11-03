@@ -1,0 +1,7 @@
+{
+  "private": true,
+  "type": "module",
+  "devDependencies": {
+    "miniflare": "5.20261102.0-beta"
+  }
+}

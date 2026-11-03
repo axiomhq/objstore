@@ -10,6 +10,7 @@ returns a `*objstore.Store`.
 | Package | Storage |
 | --- | --- |
 | [aws/s3][s3] | AWS S3 and S3-compatible stores: R2, MinIO, Ceph, Hetzner |
+| [cloudflare/r2](cloudflare/r2) | Cloudflare Worker R2 bucket bindings, Go `js/wasm` only |
 | [gcp/gcs][gcs] | Google Cloud Storage |
 | [azure/blob][azure] | Azure block blobs; caller-supplied container client |
 | [fs][fs] | Local directory; writes are fsynced before acknowledgment |
@@ -31,6 +32,18 @@ defer s.Close()
 For GCS, use `gcs.Open(ctx, gcs.Config{Bucket: "my-bucket"}, objstore.Config{})`.
 For R2, set the S3 endpoint to `https://<account-id>.r2.cloudflarestorage.com`
 and `AWS_REGION=auto`. Custom backends use `objstore.Open(backend, cfg)`.
+
+Inside a Go/Wasm Worker, use `r2.Open(env.Get("BUCKET"), objstore.Config{})`
+with a caller-supplied `syscall/js.Value` R2 binding instead of the S3 SDK.
+`r2.New(binding)` exposes the backend directly for consumers with a narrower
+interface. The provider owns only object operations, not Worker/DO lifecycle,
+application keys, WAL publication or retries. `EnsureBucket` checks access to
+the already-provisioned bucket; `DropBucket` returns `errors.ErrUnsupported`
+without deleting any objects. Streaming, signing and per-object KMS overrides
+are unsupported. Context cancellation prevents dispatch, but R2 offers no
+AbortSignal option: dispatched Promises are awaited and write errors may be
+ambiguous. Go callers must run outside synchronous JS callbacks so the event
+loop can resolve those Promises.
 
 For Azure, construct an SDK `*container.Client` with your credentials, retry and
 transport options, then call `blob.Open(blob.Config{Client: client}, cfg)`.
@@ -285,6 +298,22 @@ To run this repository's tests:
 ```sh
 go test -race ./...
 ```
+
+The R2 binding tests run Go's shared conformance suite inside local workerd,
+with a fresh disposable R2 bucket. Node.js 22 or later is required:
+
+```sh
+npm ci --prefix cloudflare/r2/testdata
+GOOS=js GOARCH=wasm go test -tags=integration -count=1 -v \
+  -exec="node $PWD/cloudflare/r2/testdata/exec.mjs" \
+  -skip='TestConformance/MissingBucket' ./cloudflare/r2
+```
+
+Only the missing-bucket lifecycle subtest is excluded: a binding cannot delete
+or recreate its bucket. A separate test checks that `DropBucket` refuses without
+changing data. The tests also exercise lost replies after actual commits,
+lexical pagination, exact ranges and multi-batch deletes. This is local emulator
+evidence, not proof of production R2 permissions or Worker memory capacity.
 
 No cloud credentials are needed: tests use temporary files and fake servers.
 Real-store tests are opt-in:
