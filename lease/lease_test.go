@@ -539,6 +539,35 @@ func (b *lockedBuffer) String() string {
 	return b.buf.String()
 }
 
+// TestRenewsEveryQuarterTTL: the first renewal lands at TTL/4, not before
+// and not at TTL/2.
+func TestRenewsEveryQuarterTTL(t *testing.T) {
+	synctest.Test(t, func(t *testing.T) {
+		ctx := context.Background()
+		const ttl = 400 * time.Millisecond
+		base := newMemStore()
+		var renewals atomic.Int32
+		s := &stubStore{Store: base, match: func(ctx context.Context, key string, data []byte, etag string) (bool, error) {
+			renewals.Add(1)
+			return base.PutIfMatch(ctx, key, data, etag)
+		}}
+		l, err := Acquire(ctx, s, "q/lease", "owner", ttl)
+		if err != nil {
+			t.Fatal(err)
+		}
+		l.Start(func() {})
+		time.Sleep(ttl/4 - time.Millisecond)
+		if n := renewals.Load(); n != 0 {
+			t.Fatalf("%d renewals before TTL/4", n)
+		}
+		time.Sleep(2 * time.Millisecond)
+		if n := renewals.Load(); n != 1 {
+			t.Fatalf("%d renewals just after TTL/4, want 1", n)
+		}
+		l.Release(ctx)
+	})
+}
+
 // TestReleaseDuringRenewal: A Release while a renewal PUT is in flight
 // is a deliberate stop: no fence callback, no "lease fenced" log, and the
 // handover still lands on the renewal's nonce, so the next holder takes

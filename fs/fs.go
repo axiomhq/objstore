@@ -57,6 +57,16 @@ type Backend struct {
 	// syncFault, when set by a test, fails the directory sync of dir with
 	// its result.
 	syncFault func(dir string) error
+	// fsync, when set by a test, replaces (*os.File).Sync so a test can see
+	// every file and directory sync.
+	fsync func(*os.File) error
+}
+
+func (f *Backend) sync(file *os.File) error {
+	if f.fsync != nil {
+		return f.fsync(file)
+	}
+	return file.Sync()
 }
 
 var _ objstore.Backend = (*Backend)(nil)
@@ -164,7 +174,7 @@ func (f *Backend) writeTemp(ctx context.Context, dst string, data []byte, urgent
 		return "", err
 	}
 	start = time.Now()
-	err = tmp.Sync()
+	err = f.sync(tmp)
 	t.Since(objstore.CallFsync, start)
 	if err != nil {
 		return "", err
@@ -194,7 +204,7 @@ func (f *Backend) syncDir(dir string) error {
 	if err != nil {
 		return err
 	}
-	err = d.Sync()
+	err = f.sync(d)
 	cerr := d.Close()
 	f.dirSyncs.Add(1)
 	if err != nil {
