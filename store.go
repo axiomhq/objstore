@@ -27,9 +27,9 @@ var ErrInvalidKey = errors.New("store: invalid key")
 
 // ErrConflict is a conditional write whose outcome the backend never
 // decided: another conditional write on the same key was in flight (S3's
-// 409 ConditionalRequestConflict, and Azure's equivalent). The object may or may not have been
-// written; the caller retries. It is never a lost race, which is
-// (false, nil).
+// 409 ConditionalRequestConflict, and Azure's equivalent). The object may or
+// may not have been written; the caller retries. It is never a lost race,
+// which is (false, nil).
 var ErrConflict = errors.New("store: conditional write conflict, retry")
 
 // ErrAccessDenied is wrapped by every error for a request the store refused
