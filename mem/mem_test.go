@@ -1,6 +1,7 @@
 package mem_test
 
 import (
+	"errors"
 	"testing"
 
 	"github.com/axiomhq/objstore"
@@ -25,5 +26,12 @@ func TestBuffersAreCopied(t *testing.T) {
 	got[1] = 'X'
 	if again, _ := s.Get(t.Context(), "k"); string(again) != "v1" {
 		t.Fatalf("stored object = %q, want v1", again)
+	}
+}
+
+// TestEmptyKeyIsInvalid: the Backend contract refuses an empty key.
+func TestEmptyKeyIsInvalid(t *testing.T) {
+	if err := mem.New().Put(t.Context(), "", nil); !errors.Is(err, objstore.ErrInvalidKey) {
+		t.Fatalf("Put of an empty key: %v, want ErrInvalidKey", err)
 	}
 }

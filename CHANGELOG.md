@@ -1,5 +1,16 @@
 # Changelog
 
+## Unreleased
+
+### Fixed
+
+- **wal**: a failed read of an accepted descriptor or page is `ErrCorrupt` only when the object is missing or short. Timeouts, cancellation and access errors no longer wrap `ErrCorrupt`, which callers treat as permanent.
+- **fs**: keys with `.lock` or `.tmp-*` in any element are `ErrInvalidKey`, not only the last. Such a key made a directory that shadowed the lock file and failed every later write. `GetRange` returns `ErrRange` for a negative offset or length instead of an OS error or a panic.
+
+### Changed
+
+- **wal**: `Encode` and the writer skip per-record `Counter` and `Weigher` assertions when the record type has no such method: `SplitBatch` is about 30% faster with 4,100 fewer allocations for 1,024 records. Page bytes are unchanged.
+
 ## v0.11.0
 
 ### Breaking changes

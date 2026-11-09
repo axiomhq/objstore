@@ -80,14 +80,15 @@ func Open(root, bucket string, cfg objstore.Config) *objstore.Store {
 // which filepath.Join would silently collapse onto "a/b"), and traversal
 // elements (".." and ".") are rejected, never resolved. Dot-prefixed nested
 // elements are valid because namespace names may begin with a dot; the
-// backend's own terminal .lock and .tmp-* files remain reserved.
+// backend's own .lock and .tmp-* names are reserved in every element, since
+// a directory of that name would shadow the lock or temp file.
 func (f *Backend) path(key string) (string, error) {
 	if key == "" {
 		return "", fmt.Errorf("%w %q", objstore.ErrInvalidKey, key)
 	}
 	parts := strings.Split(key, "/")
-	for i, el := range parts {
-		if el == "" || el == "." || el == ".." || i == len(parts)-1 && reserved(el) {
+	for _, el := range parts {
+		if el == "" || el == "." || el == ".." || reserved(el) {
 			return "", fmt.Errorf("%w %q", objstore.ErrInvalidKey, key)
 		}
 	}
@@ -833,7 +834,7 @@ func (f *Backend) GetRange(ctx context.Context, key string, offset, length int64
 	if err != nil {
 		return nil, objstore.OpErr("get-range", key, err)
 	}
-	if offset > info.Size() || length > info.Size()-offset {
+	if offset < 0 || length < 0 || offset > info.Size() || length > info.Size()-offset {
 		return nil, objstore.OpErr("get-range", key, objstore.ErrRange)
 	}
 	// One exact-size buffer: ReadAll would grow a fresh buffer for every

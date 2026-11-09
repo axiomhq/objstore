@@ -208,6 +208,11 @@ func TestFSGetRangeEdges(t *testing.T) {
 	if got, err := f.GetRange(ctx, "k", 10, 0); err != nil || len(got) != 0 {
 		t.Fatalf("zero-length read at EOF: %q %v", got, err)
 	}
+	for _, r := range [][2]int64{{-1, 1}, {0, -1}, {11, 0}, {5, 6}} {
+		if _, err := f.GetRange(ctx, "k", r[0], r[1]); !errors.Is(err, objstore.ErrRange) {
+			t.Fatalf("GetRange(%d, %d): %v, want ErrRange", r[0], r[1], err)
+		}
+	}
 }
 
 // TestFSHonoursContext: the file backend's ops answer a cancelled context

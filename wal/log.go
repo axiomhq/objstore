@@ -657,7 +657,7 @@ func (b Batch) Read(ctx context.Context) ([][]byte, error) {
 		// cannot force an unbounded Get allocation.
 		p, err := b.log.store.GetRange(ctx, key, 0, int64(page.Bytes))
 		if err != nil {
-			return nil, fmt.Errorf("%w: accepted page: %w", ErrCorrupt, err)
+			return nil, readErr("accepted page", err)
 		}
 		if len(p) != page.Bytes || logHash(p) != page.Hash {
 			return nil, fmt.Errorf("%w: page hash", ErrCorrupt)
@@ -741,7 +741,7 @@ func (l *Log) readDescriptor(ctx context.Context, c Cursor, budget int64) (*logD
 	}
 	p, err := l.store.GetRange(ctx, l.prefix+"groups/"+c.hash, 0, int64(c.bytes))
 	if err != nil {
-		return nil, 0, fmt.Errorf("%w: accepted descriptor: %w", ErrCorrupt, err)
+		return nil, 0, readErr("accepted descriptor", err)
 	}
 	if len(p) != c.bytes || logHash(p) != c.hash {
 		return nil, 0, fmt.Errorf("%w: descriptor hash", ErrCorrupt)
@@ -821,4 +821,15 @@ func validLogPrefix(prefix string) bool {
 		}
 	}
 	return true
+}
+
+// readErr wraps a failed read of an object the accepted descriptor names.
+// Only a missing or short object is ErrCorrupt; a timeout, cancellation or
+// access error says nothing about the log, and callers treat ErrCorrupt as
+// permanent.
+func readErr(what string, err error) error {
+	if errors.Is(err, objstore.ErrNotFound) || errors.Is(err, objstore.ErrRange) {
+		return fmt.Errorf("%w: %s: %w", ErrCorrupt, what, err)
+	}
+	return fmt.Errorf("wal: %s: %w", what, err)
 }

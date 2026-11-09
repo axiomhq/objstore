@@ -33,6 +33,13 @@ jobs:
         run: go run honnef.co/go/tools/cmd/staticcheck@v0.8.1 ./...
       - name: go test
         run: go test -race -count=1 ./...
+      # go test accepts one -fuzz target per invocation.
+      - name: short fuzz
+        run: |
+          for t in FuzzDecode FuzzScan FuzzSeqFromKey; do
+            go test ./wal -run '^$' -fuzz "^$t\$" -fuzztime 10s
+          done
+          go test ./lease -run '^$' -fuzz '^FuzzLoad$' -fuzztime 10s
       # vet type-checks the tests too, which go build skips.
       - name: cross-compile windows
         run: GOOS=windows go vet ./...
