@@ -4,6 +4,8 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -62,6 +64,48 @@ func TestNegativeMaxInflightWritesIsUnbounded(t *testing.T) {
 	if err := receiveWrite(t, ctx, first); err != nil {
 		t.Fatal(err)
 	}
+}
+
+// gatedPuts holds every Put until release closes and counts those in flight.
+type gatedPuts struct {
+	objstore.Backend
+	release  chan struct{}
+	inflight atomic.Int32
+}
+
+func (g *gatedPuts) Put(ctx context.Context, key string, data []byte) error {
+	g.inflight.Add(1)
+	<-g.release
+	return g.Backend.Put(ctx, key, data)
+}
+
+// TestDefaultMaxInflightWritesIsSixteen: a zero Config bounds bulk writes
+// at 16, the documented default; not unbounded, not smaller.
+func TestDefaultMaxInflightWritesIsSixteen(t *testing.T) {
+	ctx, cancel := context.WithTimeout(t.Context(), 10*time.Second)
+	t.Cleanup(cancel)
+	g := &gatedPuts{release: make(chan struct{})}
+	s := openFS(t, objstore.Config{}).WithBackend(func(b objstore.Backend) objstore.Backend {
+		g.Backend = b
+		return g
+	})
+	var wg sync.WaitGroup
+	for i := range 20 {
+		wg.Go(func() { _ = s.Put(ctx, fmt.Sprintf("k%d", i), []byte("v")) })
+	}
+	for g.inflight.Load() < 16 {
+		select {
+		case <-time.After(time.Millisecond):
+		case <-ctx.Done():
+			t.Fatalf("only %d writes in flight, want 16", g.inflight.Load())
+		}
+	}
+	time.Sleep(100 * time.Millisecond) // let a 17th through if the bound is looser
+	if n := g.inflight.Load(); n != 16 {
+		t.Fatalf("%d writes in flight, want exactly 16", n)
+	}
+	close(g.release)
+	wg.Wait()
 }
 
 func TestDeleteManyEmptyBypassesWriteGate(t *testing.T) {
