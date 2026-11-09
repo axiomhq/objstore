@@ -123,16 +123,24 @@ type call struct {
 	ch  chan error
 	n   int
 	err error
+	// receipt is used only by the owned Log; delivery broadcasts without
+	// a goroutine per caller. Legacy Writer receipts remain single-consumer.
+	receipt *Receipt
 }
 
 // deliver sends each call its own error, or verdict when it has none.
 func deliver(calls []call, verdict error) {
 	for _, c := range calls {
+		err := verdict
 		if c.err != nil {
-			c.ch <- c.err
-		} else {
-			c.ch <- verdict
+			err = c.err
 		}
+		if c.receipt != nil {
+			c.receipt.err = err
+			close(c.receipt.done)
+			continue
+		}
+		c.ch <- err
 	}
 }
 
@@ -154,11 +162,12 @@ var entryHeaderReserve = headerReserve(32)
 // nonce is minted once and never reused: a read-back returning this nonce
 // proves THIS batch (not merely this writer) is durable at the contested seq.
 type batch[R Record] struct {
-	records   []R
-	bytes     int // framed records plus a conservative header reserve
-	pageLimit int // zero means the codec's page limit (standalone callers)
-	calls     []call
-	nonce     string
+	records       []R
+	bytes         int   // framed records plus a conservative header reserve
+	pageLimit     int   // zero means the codec's page limit (standalone callers)
+	metadataBytes int64 // owned-mode descriptor reservation
+	calls         []call
+	nonce         string
 	// enqueued is when the OLDEST record in this batch was accepted, carried
 	// over from pendingSince. It is what "how old is the oldest un-acked
 	// write" means: a batch retrying against a hung store keeps it.
@@ -190,6 +199,12 @@ type Writer[R Record] struct {
 	store  *objstore.Store
 	prefix string
 	ctx    context.Context // values for store and floor calls, not caller cancellation
+	// Owned mode is private: Log installs publication before starting this
+	// same engine. Its context is a lifetime, and collection never pre-seals.
+	publish          func(context.Context, *batch[R], uint64) error
+	collectionWindow time.Duration
+	cancel           context.CancelFunc
+	pendingMetadata  int64
 	// onCommit applies a durable batch: its records in append order, and
 	// the sequence of its last page. It must not wait on this writer's flush
 	// goroutine (NewWriter).
@@ -500,6 +515,9 @@ func (w *Writer[R]) Enqueue(ctx context.Context, records []R) (<-chan error, err
 // errors.Is(err, ErrUnresolved) must not say they may be durable. Caller
 // holds w.mu.
 func (w *Writer[R]) failedLocked() error {
+	if w.publish != nil {
+		return errors.Join(ErrWriterFailed, w.terminal)
+	}
 	return fmt.Errorf("%w (cause: %v)", ErrWriterFailed, w.terminal)
 }
 
@@ -540,21 +558,40 @@ func (w *Writer[R]) Close() {
 
 func (w *Writer[R]) loop() {
 	defer close(w.stopped)
+	var lifetime <-chan struct{}
+	if w.publish != nil {
+		lifetime = w.ctx.Done()
+		defer w.cancel()
+	}
+	done := w.done
+	closing := false
 	timer := time.NewTimer(time.Hour)
 	timer.Stop()
 	defer timer.Stop()
 	for {
+		if w.publish != nil && w.ctx.Err() != nil {
+			w.abortOwned(w.ctx.Err())
+			return
+		}
 		w.mu.Lock()
 		hasWork := w.inflight != nil || len(w.pending) > 0
+		if w.publish != nil && (w.terminal != nil || closing && !hasWork) {
+			w.mu.Unlock()
+			return
+		}
 		due := w.lastCommit.Add(w.commitInterval)
-		if w.inflight == nil && !w.pendingSince.IsZero() && due.Before(w.pendingSince.Add(idleCoalesceDelay)) {
-			due = w.pendingSince.Add(idleCoalesceDelay)
+		coalesce := idleCoalesceDelay
+		if w.publish != nil {
+			coalesce = w.collectionWindow
+		}
+		if w.inflight == nil && !w.pendingSince.IsZero() && due.Before(w.pendingSince.Add(coalesce)) {
+			due = w.pendingSince.Add(coalesce)
 		}
 		if due.Before(w.nextRetry) {
 			due = w.nextRetry
 		}
 		ready := due
-		if w.inflight == nil && !w.pendingSince.IsZero() {
+		if w.publish == nil && w.inflight == nil && !w.pendingSince.IsZero() {
 			ready = due.Add(-precommitPrepareLead)
 			if coalesced := w.pendingSince.Add(idleCoalesceDelay); ready.Before(coalesced) {
 				ready = coalesced
@@ -562,11 +599,13 @@ func (w *Writer[R]) loop() {
 		}
 		w.mu.Unlock()
 		if hasWork && !time.Now().Before(ready) {
-			select {
-			case <-w.done:
-				w.finalDrain()
-				return
-			default:
+			if w.publish == nil {
+				select {
+				case <-w.done:
+					w.finalDrain()
+					return
+				default:
+				}
 			}
 			w.flush()
 			continue
@@ -579,9 +618,15 @@ func (w *Writer[R]) loop() {
 		select {
 		case <-timerC:
 		case <-w.kick:
-		case <-w.done:
-			w.finalDrain()
+		case <-lifetime:
+			w.abortOwned(w.ctx.Err())
 			return
+		case <-done:
+			if w.publish == nil {
+				w.finalDrain()
+				return
+			}
+			closing, done = true, nil
 		}
 		timer.Stop() // since Go 1.23 a stopped timer's channel holds nothing stale
 	}
@@ -605,13 +650,18 @@ func (w *Writer[R]) flush() {
 		}
 		w.inflight = &batch[R]{records: w.pending, bytes: reservedEntryBytes(w.pendingBytes, len(w.pending)),
 			pageLimit: maxEntryBytes, calls: w.calls, nonce: w.mintNonceLocked(),
-			enqueued: w.pendingSince, at: time.Now().UTC().Truncate(time.Millisecond)}
+			enqueued: w.pendingSince, at: time.Now().UTC().Truncate(time.Millisecond), metadataBytes: w.pendingMetadata}
 		w.pending, w.pendingBytes, w.calls, w.pendingSince = nil, 0, nil, time.Time{}
+		w.pendingMetadata = 0
 	}
 	b := w.inflight
 	w.mu.Unlock()
 
 	err := w.commit(b)
+	if w.publish != nil {
+		w.finishOwned(b, err)
+		return
+	}
 	if errors.Is(err, errRetry) {
 		w.mu.Lock()
 		w.nextRetry = time.Now().Add(w.commitInterval)
@@ -703,6 +753,9 @@ func (w *Writer[R]) mintNonceLocked() string {
 // writer (ErrLostRace, ErrUnresolved): the log keeps those pages as an
 // abandoned batch, which a walk reports as a marker.
 func (w *Writer[R]) commit(b *batch[R]) error {
+	if w.publish != nil {
+		return w.commitOwned(b)
+	}
 	if b.pages == nil {
 		pages, kept, err := splitBatch(w.nextSeq, b)
 		if kept != nil {
