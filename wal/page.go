@@ -56,7 +56,24 @@ type Counter interface {
 	Rows() int
 }
 
+// lacks reports whether R's static type does not implement T, so no record
+// can. An interface R has no static type (its zero value is a nil any) and
+// must be asserted per record. Skipping the per-record assertion avoids
+// boxing every record into an interface.
+func lacks[R Record, T any]() bool {
+	var zero R
+	v := any(zero)
+	if v == nil {
+		return false
+	}
+	_, ok := v.(T)
+	return !ok
+}
+
 func rowsOf[R Record](records []R) int {
+	if lacks[R, Counter]() {
+		return len(records)
+	}
 	n := 0
 	for _, r := range records {
 		if c, ok := any(r).(Counter); ok {
@@ -69,6 +86,9 @@ func rowsOf[R Record](records []R) int {
 }
 
 func weightOf[R Record](records []R) (uint64, error) {
+	if lacks[R, Weigher]() {
+		return 0, nil
+	}
 	var w uint64
 	for _, r := range records {
 		if x, ok := any(r).(Weigher); ok {

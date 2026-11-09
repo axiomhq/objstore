@@ -790,3 +790,43 @@ func TestLogStagingFailureTerminatesSuccessors(t *testing.T) {
 		}
 	})
 }
+
+type getRangeFault struct {
+	objstore.Backend
+	err error
+}
+
+func (b *getRangeFault) GetRange(ctx context.Context, key string, off, n int64) ([]byte, error) {
+	if strings.Contains(key, "/groups/") {
+		return nil, b.err
+	}
+	return b.Backend.GetRange(ctx, key, off, n)
+}
+
+// A failed read of the accepted descriptor is ErrCorrupt only when the object
+// is missing; a transient or access error must not look like a corrupt log.
+func TestLogReadErrorIsCorruptOnlyWhenObjectMissing(t *testing.T) {
+	base := mem.Open(objstore.Config{})
+	s := acquireOwned(t, openOwned(t, base, "log/"), wal.SessionOptions{})
+	if err := enqueueOwned(t, s, "x", "").Wait(t.Context()); err != nil {
+		t.Fatal(err)
+	}
+	for name, tc := range map[string]struct {
+		err     error
+		corrupt bool
+	}{
+		"missing":   {objstore.ErrNotFound, true},
+		"transient": {errors.New("connection reset"), false},
+		"denied":    {objstore.ErrAccessDenied, false},
+	} {
+		t.Run(name, func(t *testing.T) {
+			faulty := base.WithBackend(func(b objstore.Backend) objstore.Backend {
+				return &getRangeFault{b, tc.err}
+			})
+			_, err := openOwned(t, faulty, "log/").Snapshot(t.Context())
+			if !errors.Is(err, tc.err) || errors.Is(err, wal.ErrCorrupt) != tc.corrupt {
+				t.Fatalf("Snapshot: %v; want %v, ErrCorrupt=%v", err, tc.err, tc.corrupt)
+			}
+		})
+	}
+}

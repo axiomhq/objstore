@@ -93,7 +93,7 @@ for {
 | --- | --- |
 | `true, nil` | Write succeeded |
 | `false, nil` | Condition failed: key exists (`PutIfAbsent`) or ETag no longer matches (`PutIfMatch`) |
-| `ErrConflict` | S3 returned 409 for a concurrent conditional write; retry |
+| `ErrConflict` | S3 (409) or Azure reported a concurrent conditional write; retry |
 | `ErrNotFound` | Missing object or bucket; test with `errors.Is` |
 
 `GetIfChanged` polls using the last ETag. S3 and GCS use a conditional request;

@@ -31,7 +31,10 @@ const uploadPartSize = 8 << 20
 // MaxUploadSize is the streaming multipart limit: 10,000 fixed 8 MiB parts
 // (about 78 GiB). Known larger sizes fail before a request; unknown streams
 // fail and abort when they exceed this limit.
-const MaxUploadSize int64 = 10000 * uploadPartSize
+const MaxUploadSize int64 = maxParts * uploadPartSize
+
+// maxParts is S3's multipart part-count limit.
+const maxParts = 10000
 
 func (s *Backend) Stat(ctx context.Context, key string) (objstore.ObjectInfo, error) {
 	o, err := s.client.HeadObject(ctx, &awss3.HeadObjectInput{Bucket: &s.bucket, Key: &key})
@@ -172,8 +175,8 @@ func (s *Backend) multipart(ctx context.Context, in *awss3.PutObjectInput, r *st
 		if n == 0 && number > 1 {
 			break
 		}
-		if number > 10000 {
-			return objstore.ObjectInfo{}, errors.New("multipart exceeds 10000 parts")
+		if number > maxParts {
+			return objstore.ObjectInfo{}, fmt.Errorf("multipart exceeds %d parts", maxParts)
 		}
 		o, err := s.client.UploadPart(ctx, &awss3.UploadPartInput{Bucket: in.Bucket, Key: in.Key,
 			UploadId: created.UploadId, PartNumber: &number, Body: bytes.NewReader(buf[:n]), ContentLength: aws.Int64(int64(n))})

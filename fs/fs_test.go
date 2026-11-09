@@ -208,6 +208,37 @@ func TestFSGetRangeEdges(t *testing.T) {
 	if got, err := f.GetRange(ctx, "k", 10, 0); err != nil || len(got) != 0 {
 		t.Fatalf("zero-length read at EOF: %q %v", got, err)
 	}
+	for _, r := range [][2]int64{{-1, 1}, {0, -1}, {11, 0}, {5, 6}} {
+		if _, err := f.GetRange(ctx, "k", r[0], r[1]); !errors.Is(err, objstore.ErrRange) {
+			t.Fatalf("GetRange(%d, %d): %v, want ErrRange", r[0], r[1], err)
+		}
+	}
+}
+
+// TestFSPutSyncsFileThenDirectory: an acknowledged Put has fsynced its data
+// file and the directory that publishes it. The hook sees every sync; the
+// durability claim in the package doc rests on both.
+func TestFSPutSyncsFileThenDirectory(t *testing.T) {
+	f := New(t.TempDir(), "b")
+	ctx := context.Background()
+	if err := f.EnsureBucket(ctx); err != nil {
+		t.Fatal(err)
+	}
+	var files, dirs int
+	f.fsync = func(file *os.File) error {
+		if info, err := file.Stat(); err == nil && info.IsDir() {
+			dirs++
+		} else {
+			files++
+		}
+		return file.Sync()
+	}
+	if err := f.Put(ctx, "k", []byte("v")); err != nil {
+		t.Fatal(err)
+	}
+	if files != 1 || dirs == 0 {
+		t.Fatalf("Put synced %d files and %d directories, want 1 and at least 1", files, dirs)
+	}
 }
 
 // TestFSHonoursContext: the file backend's ops answer a cancelled context

@@ -530,3 +530,34 @@ func BenchmarkDecode(b *testing.B) {
 		}
 	}
 }
+
+// TestChecksumCatchesBodyFlip: a flipped record byte leaves the page
+// structurally valid, so only the checksum can refuse it.
+func TestChecksumCatchesBodyFlip(t *testing.T) {
+	data, err := Encode(Header{Seq: 1}, []Bytes{Bytes("alpha"), Bytes("beta")})
+	if err != nil {
+		t.Fatal(err)
+	}
+	data[len(data)-4-1] ^= 1 // last record byte, before the 4-byte CRC32C
+	if _, _, err := Decode(data); !errors.Is(err, ErrCorrupt) {
+		t.Fatalf("Decode of a flipped body byte: %v, want ErrCorrupt", err)
+	}
+	if _, err := Scan(data, func([]byte) error { return nil }); !errors.Is(err, ErrCorrupt) {
+		t.Fatalf("Scan of a flipped body byte: %v, want ErrCorrupt", err)
+	}
+}
+
+// TestHeaderCountsThroughInterfaceRecords: rowsOf and weightOf skip the
+// per-record assertion for a static type that lacks the method, but an
+// interface R still honours it per record.
+func TestHeaderCountsThroughInterfaceRecords(t *testing.T) {
+	records := []Record{Bytes("plain"), counted{weighed{Bytes("c"), 0}, 5}, weighed{Bytes("w"), 7}}
+	data, err := Encode(Header{Seq: 1}, records)
+	if err != nil {
+		t.Fatal(err)
+	}
+	h, _, err := Decode(data)
+	if err != nil || h.Records != 3 || h.Rows != 7 || h.Weight != 7 {
+		t.Fatalf("mixed records: %+v, %v; want 3 records, 7 rows, weight 7", h, err)
+	}
+}

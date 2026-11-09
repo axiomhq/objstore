@@ -602,6 +602,15 @@ func TestS3TranslationsPreserveCause(t *testing.T) {
 	}
 }
 
+// TestS3NotFoundCodeIsErrNotFound: a HEAD has no body, so S3 reports a
+// missing object there as the code "NotFound", not "NoSuchKey".
+func TestS3NotFoundCodeIsErrNotFound(t *testing.T) {
+	b := fakeS3(t, func(w http.ResponseWriter, _ *http.Request) { w.WriteHeader(http.StatusNotFound) })
+	if _, err := b.Stat(t.Context(), "k"); !errors.Is(err, objstore.ErrNotFound) {
+		t.Fatalf("Stat of a missing key: %v, want ErrNotFound", err)
+	}
+}
+
 func TestS3MissingBucketPreservesCause(t *testing.T) {
 	ctx, cancel := context.WithTimeout(t.Context(), time.Minute)
 	defer cancel()
