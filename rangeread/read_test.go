@@ -2,6 +2,7 @@ package rangeread
 
 import (
 	"bytes"
+	"math/rand/v2"
 	"testing"
 
 	"github.com/axiomhq/objstore/storetest"
@@ -40,5 +41,29 @@ func TestReadCoalescesAndSplits(t *testing.T) {
 	}
 	if n := fault.Ops()[storetest.OpGetRange]; n != 3 {
 		t.Fatalf("range GETs = %d, want 3: one for a, two for b", n)
+	}
+}
+
+// TestExtentIndexFindsEveryOverlap: the index misses no extent that overlaps
+// a span, however the extents nest (a long extent early in offset order
+// reaches past many short ones after it).
+func TestExtentIndexFindsEveryOverlap(t *testing.T) {
+	rng := rand.New(rand.NewPCG(1, 2))
+	for range 200 {
+		extents := make([]Extent, 1+rng.IntN(40))
+		for i := range extents {
+			extents[i] = Extent{string(rune('a' + rng.IntN(3))), int64(rng.IntN(100)), int64(1 + rng.IntN(60))}
+		}
+		idx := newExtentIndex(extents)
+		p := Planned{Extent: Extent{string(rune('a' + rng.IntN(3))), int64(rng.IntN(120)), int64(1 + rng.IntN(30))}}
+		got := map[int]bool{}
+		for _, i := range idx.overlapping(p) {
+			got[i] = true
+		}
+		for i, x := range extents {
+			if x.Object == p.Object && max(p.Offset, x.Offset) < min(p.Offset+p.Length, x.Offset+x.Length) && !got[i] {
+				t.Fatalf("extent %d %+v overlaps %+v but the index skipped it", i, x, p.Extent)
+			}
+		}
 	}
 }
