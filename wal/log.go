@@ -42,11 +42,11 @@ type Cursor struct {
 }
 
 type cursorJSON struct {
-	Format      int
-	Incarnation string
-	Sequence    uint64
-	Hash        string
-	Bytes       int
+	Format      int    `json:"format"`
+	Incarnation string `json:"incarnation"`
+	Sequence    uint64 `json:"sequence"`
+	Hash        string `json:"hash"`
+	Bytes       int    `json:"bytes"`
 }
 
 // Sequence returns the logical group sequence; genesis has sequence zero.
@@ -104,13 +104,13 @@ type Log struct {
 }
 
 type logHead struct {
-	Format        int
-	Prefix        string
-	Incarnation   string
-	Configuration []byte
-	Owner         string
-	Revision      string
-	Tip           Cursor
+	Format        int    `json:"format"`
+	Prefix        string `json:"prefix"`
+	Incarnation   string `json:"incarnation"`
+	Configuration []byte `json:"configuration"`
+	Owner         string `json:"owner"`
+	Revision      string `json:"revision"`
+	Tip           Cursor `json:"tip"`
 }
 
 // OpenLog opens or initializes a log. Configuration is opaque, immutable,
@@ -463,22 +463,22 @@ func (l *Log) swapHead(ctx context.Context, h logHead, tag string) (string, erro
 }
 
 type logPage struct {
-	Hash    string
-	Bytes   int
-	Records int
+	Hash    string `json:"hash"`
+	Bytes   int    `json:"bytes"`
+	Records int    `json:"records"`
 }
 
 type logDescriptor struct {
-	Format    int
-	Previous  Cursor
-	Sequence  uint64
-	Owner     string
-	Nonce     string
-	First     uint64
-	At        int64
-	ReadLimit int64
-	Pages     []logPage
-	Metadata  [][]byte
+	Format    int       `json:"format"`
+	Previous  Cursor    `json:"previous"`
+	Sequence  uint64    `json:"sequence"`
+	Owner     string    `json:"owner"`
+	Nonce     string    `json:"nonce"`
+	First     uint64    `json:"first"`
+	At        int64     `json:"at"`
+	ReadLimit int64     `json:"read_limit"`
+	Pages     []logPage `json:"pages"`
+	Metadata  [][]byte  `json:"metadata"`
 }
 
 func (s *Session) publish(ctx context.Context, b *batch[logRecord], first uint64) error {

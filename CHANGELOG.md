@@ -11,6 +11,7 @@
 
 - **wal**: `Encode` and the writer skip per-record `Counter` and `Weigher` assertions when the record type has no such method: `SplitBatch` is about 30% faster with 4,100 fewer allocations for 1,024 records. Page bytes are unchanged.
 - **rangeread**: `Read` finds the extents each span covers with a binary search instead of scanning all of them: 10,000 one-KiB extents read 64% faster on `mem`. `ReadPlanned` is unchanged.
+- **wal**: `Log` JSON uses lowercase snake_case keys, as `lease` does: cursors (`{"format":1,"incarnation":...,"sequence":...}`), HEAD, descriptors and page entries. Logs written by earlier unreleased commits do not open.
 
 ## v0.11.0
 

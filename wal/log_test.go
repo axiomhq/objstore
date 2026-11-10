@@ -352,7 +352,10 @@ func TestLogWaitersAndCopies(t *testing.T) {
 		if err := json.Unmarshal(encoded, &future); err != nil {
 			t.Fatal(err)
 		}
-		future["Format"] = json.RawMessage("2")
+		if _, ok := future["format"]; !ok {
+			t.Fatalf("cursor JSON keys are not lowercase: %s", encoded)
+		}
+		future["format"] = json.RawMessage("2")
 		unknown, err := json.Marshal(future)
 		if err != nil {
 			t.Fatal(err)
