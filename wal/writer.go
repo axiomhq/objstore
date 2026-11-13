@@ -2,8 +2,6 @@ package wal
 
 import (
 	"context"
-	"crypto/rand"
-	"encoding/hex"
 	"errors"
 	"fmt"
 	"log/slog"
@@ -649,7 +647,7 @@ func (w *Writer[R]) flush() {
 			return
 		}
 		w.inflight = &batch[R]{records: w.pending, bytes: reservedEntryBytes(w.pendingBytes, len(w.pending)),
-			pageLimit: maxEntryBytes, calls: w.calls, nonce: w.mintNonceLocked(),
+			pageLimit: maxEntryBytes, calls: w.calls, nonce: logToken(),
 			enqueued: w.pendingSince, at: time.Now().UTC().Truncate(time.Millisecond), metadataBytes: w.pendingMetadata}
 		w.pending, w.pendingBytes, w.calls, w.pendingSince = nil, 0, nil, time.Time{}
 		w.pendingMetadata = 0
@@ -724,14 +722,6 @@ func (w *Writer[R]) finalDrain() {
 		deliver(b.calls, ErrUnresolved)
 	}
 	deliver(queued, ErrWriterClosed)
-}
-
-// mintNonceLocked returns a fresh random identity for one batch. Caller
-// holds w.mu.
-func (w *Writer[R]) mintNonceLocked() string {
-	buf := make([]byte, 16)
-	rand.Read(buf) // never fails: since Go 1.24 it crashes the program instead
-	return hex.EncodeToString(buf)
 }
 
 // commit claims nextSeq for batch b. In the common case that is ONE
