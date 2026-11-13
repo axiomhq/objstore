@@ -268,6 +268,7 @@ func (f *Backend) syncDirs(dst string) error {
 // never be unlinked while the bucket is live (waiters hold their inodes).
 // Keys IsolatedKeys selects have stripes of their own.
 func (f *Backend) lockKey(ctx context.Context, key string) (func(), error) {
+	defer objstore.TimingsOf(ctx).Since(objstore.CallLock, time.Now())
 	rootUnlock, err := flock(ctx, filepath.Join(f.root, ".lock"), syscall.LOCK_SH)
 	if err != nil {
 		return nil, err
@@ -349,15 +350,13 @@ func (f *Backend) put(ctx context.Context, key string, data []byte) error {
 		return err
 	}
 	t := objstore.TimingsOf(ctx)
-	start := time.Now()
 	unlock, err := f.lockKey(ctx, key)
-	t.Since(objstore.CallLock, start)
 	if err != nil {
 		os.Remove(tmp)
 		return err
 	}
 	defer unlock()
-	start = time.Now()
+	start := time.Now()
 	err = os.Rename(tmp, dst)
 	t.Since(objstore.CallLink, start)
 	if err != nil {
@@ -391,16 +390,14 @@ func (f *Backend) putIfAbsent(ctx context.Context, key string, data []byte) (boo
 	}
 	defer os.Remove(tmp)
 	t := objstore.TimingsOf(ctx)
-	start := time.Now()
 	unlock, err := f.lockKey(ctx, key)
-	t.Since(objstore.CallLock, start)
 	if err != nil {
 		return false, err
 	}
 	defer unlock()
 	// link(2) fails with EEXIST atomically AND publishes complete content —
 	// unlike O_EXCL+write, a crash can never leave a half-written winner.
-	start = time.Now()
+	start := time.Now()
 	err = os.Link(tmp, dst)
 	t.Since(objstore.CallLink, start)
 	if err != nil {
@@ -484,14 +481,12 @@ func (f *Backend) putIfMatch(ctx context.Context, key string, data []byte, etag 
 		return false, err
 	}
 	defer os.Remove(tmp)
-	start := time.Now()
 	unlock, err := f.lockKey(ctx, key)
-	t.Since(objstore.CallLock, start)
 	if err != nil {
 		return false, err
 	}
 	defer unlock()
-	start = time.Now()
+	start := time.Now()
 	cur, err := os.ReadFile(dst)
 	t.Since(objstore.CallRead, start)
 	if errors.Is(err, iofs.ErrNotExist) {
@@ -699,9 +694,7 @@ func (f *Backend) delete(ctx context.Context, key string, dirs map[string]string
 		return err
 	}
 	t := objstore.TimingsOf(ctx)
-	start := time.Now()
 	unlock, err := f.lockKey(ctx, key)
-	t.Since(objstore.CallLock, start)
 	if err != nil {
 		return f.bucketErr(err) // the lock files live in the bucket root
 	}
