@@ -663,31 +663,52 @@ func TestLostRaceLatches(t *testing.T) {
 }
 
 // TestMultiPageBatchWithinOneAttempt: a batch's pages are one entry and are
-// paced once, so a multi-page batch fits an attempt no longer than the
-// commit interval (per-page pacing needed two intervals and retried
-// forever).
+// paced once, so they go out back to back within one attempt (per-page
+// pacing needed two intervals and retried forever). That does not depend on
+// the store or its speed. The attempt deadline here cannot fire, so a slow
+// runner cannot force a retry. Pacing between pages would show as a gap of
+// nearly the interval between one PUT's return and the next PUT.
 func TestMultiPageBatchWithinOneAttempt(t *testing.T) {
-	const interval = 500 * time.Millisecond
-	// The file backend: the property is that the pages of one batch go out
-	// back to back within one attempt, which does not depend on the store,
-	// and a real S3 endpoint's PUT of a 17 MiB page can outlast the short
-	// attempt used here.
+	const interval = MaxCommitInterval
 	s, f := storetest.Faulty(t, bucket.NewFS(t))
+	gaps := &putGaps{}
+	s = s.WithBackend(func(b objstore.Backend) objstore.Backend { gaps.Backend = b; return gaps })
 	w := NewWriter[Bytes](s, testPrefix, 1, nil, WithCommitInterval(interval))
-	w.SetAttemptTimeout(interval)
+	w.SetAttemptTimeout(time.Hour)
 	defer w.Close()
 	f.ResetOps()
-	start := time.Now()
 	records := []Bytes{filled('a', 17<<20), filled('b', 17<<20), filled('c', 17<<20)}
 	if err := w.Append(context.Background(), records); err != nil {
 		t.Fatal(err)
 	}
-	if elapsed := time.Since(start); elapsed > 3*time.Second {
-		t.Fatalf("three pages took %s", elapsed)
-	}
 	if ops := f.Ops(); ops[storetest.OpPutIfAbsent] != 3 || ops[storetest.OpGet] != 0 {
 		t.Fatalf("ops %v, want 3 conditional PUTs and no read-back", ops)
 	}
+	if gaps.max > interval/2 {
+		t.Fatalf("pages went out %s apart; want back to back", gaps.max)
+	}
+}
+
+// putGaps records the longest idle time between one PutIfAbsent returning
+// and the next starting.
+type putGaps struct {
+	objstore.Backend
+	mu   sync.Mutex
+	last time.Time
+	max  time.Duration
+}
+
+func (p *putGaps) PutIfAbsent(ctx context.Context, key string, data []byte) (bool, error) {
+	p.mu.Lock()
+	if !p.last.IsZero() {
+		p.max = max(p.max, time.Since(p.last))
+	}
+	p.mu.Unlock()
+	ok, err := p.Backend.PutIfAbsent(ctx, key, data)
+	p.mu.Lock()
+	p.last = time.Now()
+	p.mu.Unlock()
+	return ok, err
 }
 
 // TestAdoptionDoesNotRearmPacing: adopting our own earlier PUT starts no
