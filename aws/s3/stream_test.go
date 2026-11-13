@@ -16,12 +16,9 @@ import (
 
 	"github.com/aws/aws-sdk-go-v2/aws"
 	awss3 "github.com/aws/aws-sdk-go-v2/service/s3"
+	smithyhttp "github.com/aws/smithy-go/transport/http"
 	"github.com/axiomhq/objstore"
 )
-
-type httpDoFunc func(*http.Request) (*http.Response, error)
-
-func (f httpDoFunc) Do(r *http.Request) (*http.Response, error) { return f(r) }
 
 func TestStatStorageClass(t *testing.T) {
 	for _, class := range []string{"", "STANDARD_IA"} {
@@ -63,7 +60,7 @@ func TestStreamingDownloadIntegrity(t *testing.T) {
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			body := &objectBody{data: []byte(tc.body), finalErr: tc.terminal}
-			client := awss3.NewFromConfig(aws.Config{Region: "us-east-1", Credentials: aws.AnonymousCredentials{}, HTTPClient: httpDoFunc(func(r *http.Request) (*http.Response, error) {
+			client := awss3.NewFromConfig(aws.Config{Region: "us-east-1", Credentials: aws.AnonymousCredentials{}, HTTPClient: smithyhttp.ClientDoFunc(func(r *http.Request) (*http.Response, error) {
 				h := http.Header{"Content-Length": {fmt.Sprint(tc.declared)}}
 				if tc.span != "" {
 					h.Set("Content-Range", tc.span)
