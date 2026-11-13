@@ -66,21 +66,7 @@ func (f *Fault) upload(ctx context.Context, op Op, key string, body io.Reader, e
 	if !hit {
 		body = &shapedReader{Reader: body, f: f, ctx: ctx}
 	}
-	var info objstore.ObjectInfo
-	var ok bool
-	err := error(errors.ErrUnsupported)
-	if op == OpPut {
-		if b, capable := f.b.(objstore.UploadBackend); capable {
-			info, err = b.Upload(ctx, key, body, opts)
-			ok = err == nil
-		}
-	} else if b, capable := f.b.(objstore.ConditionalUploadBackend); capable {
-		if op == OpPutIfAbsent {
-			info, ok, err = b.UploadIfAbsent(ctx, key, body, opts)
-		} else {
-			info, ok, err = b.UploadIfMatch(ctx, key, body, etag, opts)
-		}
-	}
+	info, ok, err := upload(ctx, f.b, op, key, body, etag, opts)
 	if ok && err == nil {
 		f.wroteDigest(key, info.Size, [32]byte(h.Sum(nil)), watching)
 	}
@@ -173,21 +159,7 @@ func (k *KMS) upload(ctx context.Context, op Op, key string, body io.Reader, eta
 	if err := k.denied(objstore.KMSKey(ctx)); err != nil {
 		return objstore.ObjectInfo{}, false, err
 	}
-	var info objstore.ObjectInfo
-	var ok bool
-	err := error(errors.ErrUnsupported)
-	if op == OpPut {
-		if b, capable := k.Backend.(objstore.UploadBackend); capable {
-			info, err = b.Upload(plain(ctx), key, body, opts)
-			ok = err == nil
-		}
-	} else if b, capable := k.Backend.(objstore.ConditionalUploadBackend); capable {
-		if op == OpPutIfAbsent {
-			info, ok, err = b.UploadIfAbsent(plain(ctx), key, body, opts)
-		} else {
-			info, ok, err = b.UploadIfMatch(plain(ctx), key, body, etag, opts)
-		}
-	}
+	info, ok, err := upload(plain(ctx), k.Backend, op, key, body, etag, opts)
 	if ok && err == nil {
 		k.wrote(ctx, key)
 	}
@@ -217,4 +189,21 @@ func (k *KMS) Stat(ctx context.Context, key string) (objstore.ObjectInfo, error)
 // Sign cannot simulate revocation after credentials leave the wrapper.
 func (k *KMS) Sign(context.Context, string, objstore.SignOptions) (objstore.SignedRequest, error) {
 	return objstore.SignedRequest{}, errors.ErrUnsupported
+}
+
+// upload sends one streaming write of kind op to b, or ErrUnsupported if b
+// cannot stream it.
+func upload(ctx context.Context, b objstore.Backend, op Op, key string, body io.Reader, etag string, opts objstore.UploadOptions) (objstore.ObjectInfo, bool, error) {
+	if op == OpPut {
+		if u, ok := b.(objstore.UploadBackend); ok {
+			info, err := u.Upload(ctx, key, body, opts)
+			return info, err == nil, err
+		}
+	} else if u, ok := b.(objstore.ConditionalUploadBackend); ok {
+		if op == OpPutIfAbsent {
+			return u.UploadIfAbsent(ctx, key, body, opts)
+		}
+		return u.UploadIfMatch(ctx, key, body, etag, opts)
+	}
+	return objstore.ObjectInfo{}, false, errors.ErrUnsupported
 }
