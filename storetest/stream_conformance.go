@@ -7,14 +7,11 @@ import (
 	"maps"
 	"strings"
 	"testing"
+	"testing/iotest"
 	"time"
 
 	"github.com/axiomhq/objstore"
 )
-
-type sourceError struct{ err error }
-
-func (r sourceError) Read([]byte) (int, error) { return 0, r.err }
 
 // StreamingConformance exercises optional reads, uploads and Stat. Unlike the
 // base Conformance it requires these capabilities; legacy backends can continue
@@ -98,7 +95,7 @@ func StreamingConformance(t *testing.T, s *objstore.Store, storageClass string) 
 		if _, err := s.Upload(ctx, "stream/short", strings.NewReader("short"), objstore.UploadOptions{Size: &size}); err == nil {
 			t.Fatal("short input succeeded")
 		}
-		body := io.MultiReader(strings.NewReader("prefix"), sourceError{io.ErrUnexpectedEOF})
+		body := io.MultiReader(strings.NewReader("prefix"), iotest.ErrReader(io.ErrUnexpectedEOF))
 		if _, err := s.Upload(ctx, "stream/source-error", body, objstore.UploadOptions{}); !errors.Is(err, io.ErrUnexpectedEOF) {
 			t.Fatalf("source error lost: %v", err)
 		}

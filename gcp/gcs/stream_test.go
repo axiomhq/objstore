@@ -13,6 +13,7 @@ import (
 	"net/url"
 	"strings"
 	"testing"
+	"testing/iotest"
 	"time"
 
 	"cloud.google.com/go/storage"
@@ -26,10 +27,6 @@ import (
 type streamTransport func(*http.Request) (*http.Response, error)
 
 func (f streamTransport) RoundTrip(r *http.Request) (*http.Response, error) { return f(r) }
-
-type errorReader struct{ error }
-
-func (r errorReader) Read([]byte) (int, error) { return 0, r.error }
 
 func TestStreamingDownloadIntegrity(t *testing.T) {
 	for _, tc := range []struct {
@@ -55,7 +52,7 @@ func TestStreamingDownloadIntegrity(t *testing.T) {
 					h.Set("Content-Range", tc.span)
 					h.Set("Content-Length", "2")
 				}
-				return &http.Response{StatusCode: status, Header: h, ContentLength: int64(len(tc.body)), Body: io.NopCloser(io.MultiReader(strings.NewReader(tc.body), errorReader{tc.terminal})), Request: req}, nil
+				return &http.Response{StatusCode: status, Header: h, ContentLength: int64(len(tc.body)), Body: io.NopCloser(io.MultiReader(strings.NewReader(tc.body), iotest.ErrReader(tc.terminal))), Request: req}, nil
 			})
 			b := newBackend(t, ctx, gcs.Config{Bucket: "b", Options: []option.ClientOption{option.WithoutAuthentication(), option.WithHTTPClient(&http.Client{Transport: tr})}})
 			r, err := b.NewReader(ctx, "key", tc.offset, tc.length)

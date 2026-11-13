@@ -11,6 +11,7 @@ import (
 	"strings"
 	"sync/atomic"
 	"testing"
+	"testing/iotest"
 	"time"
 
 	"github.com/aws/aws-sdk-go-v2/aws"
@@ -21,10 +22,6 @@ import (
 type httpDoFunc func(*http.Request) (*http.Response, error)
 
 func (f httpDoFunc) Do(r *http.Request) (*http.Response, error) { return f(r) }
-
-type errorReader struct{ err error }
-
-func (r errorReader) Read([]byte) (int, error) { return 0, r.err }
 
 func TestStatStorageClass(t *testing.T) {
 	for _, class := range []string{"", "STANDARD_IA"} {
@@ -175,9 +172,9 @@ func TestMultipartStreamingAbortAndSourceErrors(t *testing.T) {
 			opts := objstore.UploadOptions{}
 			switch name {
 			case "upstream short":
-				source = io.MultiReader(strings.NewReader("prefix"), errorReader{io.ErrUnexpectedEOF})
+				source = io.MultiReader(strings.NewReader("prefix"), iotest.ErrReader(io.ErrUnexpectedEOF))
 			case "upstream boundary":
-				source = io.MultiReader(bytes.NewReader(data[:uploadPartSize]), errorReader{io.ErrUnexpectedEOF})
+				source = io.MultiReader(bytes.NewReader(data[:uploadPartSize]), iotest.ErrReader(io.ErrUnexpectedEOF))
 			case "declared short":
 				size := int64(len(data) + 1)
 				opts.Size = &size

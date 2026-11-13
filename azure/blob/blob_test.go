@@ -13,6 +13,7 @@ import (
 	"strings"
 	"sync/atomic"
 	"testing"
+	"testing/iotest"
 	"time"
 
 	"github.com/Azure/azure-sdk-for-go/sdk/azcore"
@@ -102,10 +103,6 @@ func TestUploadCommitConditionAndKMS(t *testing.T) {
 	}
 }
 
-type failingReader struct{ err error }
-
-func (r failingReader) Read([]byte) (int, error) { return 0, r.err }
-
 func TestLeasePreconditionIsNotCASMiss(t *testing.T) {
 	for _, code := range []string{"LeaseIdMissing", "LeaseLost", "LeaseIdMismatchWithBlobOperation"} {
 		t.Run(code, func(t *testing.T) {
@@ -130,7 +127,7 @@ func (d downloadTransport) Do(req *http.Request) (*http.Response, error) {
 
 func TestDownloadTerminalError(t *testing.T) {
 	terminal := errors.New("terminal checksum failure")
-	c, err := container.NewClientWithNoCredential("https://fixture.invalid/b", &container.ClientOptions{ClientOptions: azcore.ClientOptions{Transport: downloadTransport{io.NopCloser(io.MultiReader(strings.NewReader("abcde"), failingReader{terminal}))}}})
+	c, err := container.NewClientWithNoCredential("https://fixture.invalid/b", &container.ClientOptions{ClientOptions: azcore.ClientOptions{Transport: downloadTransport{io.NopCloser(io.MultiReader(strings.NewReader("abcde"), iotest.ErrReader(terminal)))}}})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -159,7 +156,7 @@ func TestUploadFailedSourceDoesNotCommit(t *testing.T) {
 				}
 				w.WriteHeader(201)
 			})
-			source := io.MultiReader(bytes.NewReader(bytes.Repeat([]byte("x"), boundary)), failingReader{io.ErrUnexpectedEOF})
+			source := io.MultiReader(bytes.NewReader(bytes.Repeat([]byte("x"), boundary)), iotest.ErrReader(io.ErrUnexpectedEOF))
 			_, err := b.Upload(t.Context(), "key", source, objstore.UploadOptions{})
 			if !errors.Is(err, io.ErrUnexpectedEOF) || commits.Load() != 0 {
 				t.Fatalf("err=%v commits=%d", err, commits.Load())
