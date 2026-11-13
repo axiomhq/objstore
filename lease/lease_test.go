@@ -4,12 +4,10 @@ import (
 	"bytes"
 	"context"
 	"crypto/rand"
-	"crypto/sha256"
 	"encoding/json"
 	"errors"
 	"fmt"
 	"log/slog"
-	"slices"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -18,7 +16,7 @@ import (
 	"time"
 
 	"github.com/axiomhq/objstore"
-
+	"github.com/axiomhq/objstore/mem"
 	"github.com/axiomhq/objstore/storetest"
 	"github.com/axiomhq/objstore/storetest/bucket"
 )
@@ -841,58 +839,7 @@ func runUnit(t *testing.T, name string, f func(*testing.T)) {
 	t.Run(name, func(t *testing.T) { synctest.Test(t, f) })
 }
 
-// memStore implements only the lease operations; no flock or external I/O in a bubble.
-type memStore struct {
-	objstore.Backend
-	mu      sync.Mutex
-	objects map[string][]byte
-}
-
-func newMemStore() *objstore.Store {
-	return objstore.Open(&memStore{objects: make(map[string][]byte)}, objstore.Config{})
-}
-
-func memETag(data []byte) string { return fmt.Sprintf("%x", sha256.Sum256(data)) }
-
-func (s *memStore) GetWithETag(ctx context.Context, key string) ([]byte, string, error) {
-	s.mu.Lock()
-	defer s.mu.Unlock()
-	if err := ctx.Err(); err != nil {
-		return nil, "", err
-	}
-	data, ok := s.objects[key]
-	if !ok {
-		return nil, "", objstore.ErrNotFound
-	}
-	return slices.Clone(data), memETag(data), nil
-}
-
-func (s *memStore) PutIfAbsent(ctx context.Context, key string, data []byte) (bool, error) {
-	s.mu.Lock()
-	defer s.mu.Unlock()
-	if err := ctx.Err(); err != nil {
-		return false, err
-	}
-	if _, ok := s.objects[key]; ok {
-		return false, nil
-	}
-	s.objects[key] = slices.Clone(data)
-	return true, nil
-}
-
-func (s *memStore) PutIfMatch(ctx context.Context, key string, data []byte, etag string) (bool, error) {
-	s.mu.Lock()
-	defer s.mu.Unlock()
-	if err := ctx.Err(); err != nil {
-		return false, err
-	}
-	cur, ok := s.objects[key]
-	if !ok || memETag(cur) != etag {
-		return false, nil
-	}
-	s.objects[key] = slices.Clone(data)
-	return true, nil
-}
+func newMemStore() *objstore.Store { return mem.Open(objstore.Config{}) }
 
 // expireStored zeroes l's local deadline and the stored expiry, keeping the
 // owner and nonce: the acquisition has lapsed and is takeable at once.
