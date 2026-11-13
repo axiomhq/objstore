@@ -525,9 +525,9 @@ func (s *Backend) PutIfMatch(ctx context.Context, key string, data []byte, etag 
 // only on HTTP/1.1 requests.
 // ponytail: a 503 SlowDown, a 429 or a dial error reaches the caller instead
 // of being retried here. The owned WAL resends with backoff: page and
-// descriptor PUTs after reading a 412 back, HEAD swaps after reading HEAD
-// back. Other callers see an error. Upgrade: a retryer that resends only on
-// answers proving no commit.
+// descriptor PUTs (a 412 is read back and compared) and HEAD swaps (after
+// reading HEAD back). Other callers see an error. Upgrade: a retryer that
+// resends only on answers proving no commit.
 func conditionalPut(o *awss3.Options) {
 	o.RetryMaxAttempts = 1
 	o.ContinueHeaderThresholdBytes = 1
