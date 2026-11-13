@@ -123,7 +123,8 @@ const writeBackChunk = 256 << 10
 // key sub-directories beneath it are created here. An urgent write (a log
 // commit) is written whole; others over writeBackChunk are written back as
 // they are written (see writeBackChunk).
-func (f *Backend) writeTemp(ctx context.Context, dst string, data []byte, urgent bool, t *objstore.Timings) (string, error) {
+func (f *Backend) writeTemp(ctx context.Context, dst string, data []byte) (string, error) {
+	t := objstore.TimingsOf(ctx)
 	if _, err := os.Stat(f.root); errors.Is(err, iofs.ErrNotExist) {
 		return "", fmt.Errorf("store: bucket %s: %w", f.root, objstore.ErrNotFound)
 	} else if err != nil {
@@ -147,7 +148,7 @@ func (f *Backend) writeTemp(ctx context.Context, dst string, data []byte, urgent
 		}
 	}()
 	chunk := writeBackChunk
-	if urgent || len(data) <= chunk {
+	if objstore.IsUrgent(ctx) || len(data) <= chunk {
 		chunk = len(data) // one write, left to the fsync
 	}
 	for off := 0; off < len(data); off += chunk {
@@ -343,7 +344,7 @@ func (f *Backend) put(ctx context.Context, key string, data []byte) error {
 	if err := ctx.Err(); err != nil {
 		return err
 	}
-	tmp, err := f.writeTemp(ctx, dst, data, objstore.IsUrgent(ctx), objstore.TimingsOf(ctx))
+	tmp, err := f.writeTemp(ctx, dst, data)
 	if err != nil {
 		return err
 	}
@@ -384,7 +385,7 @@ func (f *Backend) putIfAbsent(ctx context.Context, key string, data []byte) (boo
 	if err := ctx.Err(); err != nil {
 		return false, err
 	}
-	tmp, err := f.writeTemp(ctx, dst, data, objstore.IsUrgent(ctx), objstore.TimingsOf(ctx))
+	tmp, err := f.writeTemp(ctx, dst, data)
 	if err != nil {
 		return false, err
 	}
@@ -478,7 +479,7 @@ func (f *Backend) putIfMatch(ctx context.Context, key string, data []byte, etag 
 		return false, err
 	}
 	t := objstore.TimingsOf(ctx)
-	tmp, err := f.writeTemp(ctx, dst, data, objstore.IsUrgent(ctx), t)
+	tmp, err := f.writeTemp(ctx, dst, data)
 	if err != nil {
 		return false, err
 	}
