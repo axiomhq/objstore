@@ -220,14 +220,10 @@ func (m *Backend) DeleteMany(ctx context.Context, keys ...string) error {
 		}
 		return nil
 	})
-	if err == nil || len(keys) == 0 {
+	if len(keys) == 0 {
 		return err
 	}
-	e := &objstore.DeleteError{}
-	for _, k := range keys {
-		e.Failures = append(e.Failures, objstore.DeleteFailure{Key: k, Err: err, Unattempted: true})
-	}
-	return e
+	return objstore.DeleteFailures(keys, err, true)
 }
 
 // EnsureBucket creates the bucket if it is missing.
