@@ -418,23 +418,21 @@ func (s *Session) Close(ctx context.Context) error {
 
 // swapHead settles ambiguous publication only with a positive CAS, never
 // readback alone (fs can expose a rename before directory sync succeeds).
+// A failed CAS that left HEAD unchanged is resent with backoff, so one
+// throttled or dropped request does not end the session.
 // A successful CAS remains successful after takeover; terminal then prevents
 // dependent successors. Ambiguous takeover is unresolved, not fenced success.
 func (l *Log) swapHead(ctx context.Context, h logHead, tag string) (string, error, error) {
 	var ambiguous error
-	for range 3 {
-		h.Revision = logToken()
+	h.Revision = logToken()
+	backoff := 100 * time.Millisecond
+	for range 6 {
 		p, err := json.Marshal(h)
 		if err != nil {
 			return "", nil, err
 		}
 		ok, err := l.store.PutIfMatch(objstore.Urgent(ctx), l.prefix+"HEAD", p, tag)
-		if err == nil && !ok {
-			if ambiguous != nil {
-				// The settlement lost authority, but the original publication
-				// may have landed. Do not classify its receipt as a fenced write.
-				return "", nil, errors.Join(ErrUnresolved, ambiguous)
-			}
+		if err == nil && !ok && ambiguous == nil {
 			return "", nil, ErrFenced
 		}
 		current, nextTag, readErr := l.readHead(ctx)
@@ -447,17 +445,34 @@ func (l *Log) swapHead(ctx context.Context, h logHead, tag string) (string, erro
 			}
 			return nextTag, nil, nil
 		}
+		// An error, or a 412 after an ambiguous attempt: only the readback
+		// tells whether one of ours landed.
 		ambiguous = errors.Join(ambiguous, err)
 		if readErr != nil {
 			return "", nil, errors.Join(ErrUnresolved, ambiguous, readErr)
 		}
-		if current.Owner != h.Owner || current.Tip != h.Tip || current.Revision != h.Revision {
+		switch {
+		case current.Owner == h.Owner && current.Tip == h.Tip && current.Revision == h.Revision:
+			// Ours landed, perhaps late, making a resend 412. Settle it with
+			// a positive CAS under a fresh revision.
+			tag, h.Revision = nextTag, logToken()
+		case err != nil && nextTag == tag:
+			// HEAD unchanged: this PUT has not landed (a 503 SlowDown, a 429,
+			// a dropped connection). Resend the same bytes; if the first
+			// lands late, the resend's 412 reads back as ours above.
+			select {
+			case <-ctx.Done():
+			case <-time.After(backoff):
+			}
+			backoff *= 2
+		default:
+			// The settlement lost authority, but the original publication
+			// may have landed. Do not classify its receipt as a fenced write.
 			return "", nil, errors.Join(ErrUnresolved, ambiguous)
 		}
 		if ctx.Err() != nil {
 			return "", nil, errors.Join(ErrUnresolved, ambiguous, ctx.Err())
 		}
-		tag = nextTag
 	}
 	return "", nil, errors.Join(ErrUnresolved, ambiguous)
 }

@@ -699,6 +699,60 @@ func TestLogFSLostResponses(t *testing.T) {
 	}
 }
 
+// TestLogHeadSwapTransientFailure: one failed HEAD swap does not end an
+// owned session, whether the store refused it (a 503 SlowDown: nothing
+// written), committed it and lost the answer (a 500 after commit), or
+// committed it late, just before the resend. The record commits once, and
+// the session takes the next one.
+func TestLogHeadSwapTransientFailure(t *testing.T) {
+	for _, mode := range []string{"refused", "committed", "late"} {
+		t.Run(mode, func(t *testing.T) {
+			var calls atomic.Int32
+			var first []byte
+			var firstTag string
+			store := mem.Open(objstore.Config{}).WithBackend(func(b objstore.Backend) objstore.Backend {
+				return &logBackend{Backend: b, cas: func(ctx context.Context, key string, p []byte, tag string) (bool, error) {
+					var h struct{ Tip wal.Cursor }
+					if err := json.Unmarshal(p, &h); err != nil {
+						return false, err
+					}
+					if h.Tip.Sequence() == 0 {
+						return b.PutIfMatch(ctx, key, p, tag)
+					}
+					switch calls.Add(1) {
+					case 1:
+						if mode == "committed" {
+							if ok, err := b.PutIfMatch(ctx, key, p, tag); err != nil || !ok {
+								return ok, err
+							}
+						}
+						first, firstTag = p, tag
+						return false, errors.New("transient store failure")
+					case 2:
+						if mode == "late" {
+							if ok, err := b.PutIfMatch(ctx, key, first, firstTag); err != nil || !ok {
+								return ok, err
+							}
+						}
+					}
+					return b.PutIfMatch(ctx, key, p, tag)
+				}}
+			})
+			l := openOwned(t, store, "log/")
+			s := acquireOwned(t, l, wal.SessionOptions{CollectionWindow: time.Millisecond})
+			defer s.Close(t.Context())
+			for _, record := range []string{"first", "second"} {
+				if err := enqueueOwned(t, s, record, "m").Wait(t.Context()); err != nil {
+					t.Fatalf("%s: %v", record, err)
+				}
+			}
+			if got := replayOwned(t, l, snapshotOwned(t, l)); !reflect.DeepEqual(got, []string{"first", "second"}) {
+				t.Fatalf("replay %v", got)
+			}
+		})
+	}
+}
+
 func TestLogOpenValidation(t *testing.T) {
 	for _, factory := range []struct {
 		name string

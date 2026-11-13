@@ -520,9 +520,12 @@ func (s *Backend) PutIfMatch(ctx context.Context, key string, data []byte, etag 
 // committed, and a resend would then meet our own write as a 412: a won race
 // reported as lost. With Expect: 100-continue, MinIO marks an early 412
 // Connection: close; without it, MinIO drops the connection silently and the
-// next PUT on it fails.
-// ponytail: a 503 SlowDown or a dial error is no longer retried inside the
-// call either; the caller sees it. Upgrade: a retryer that resends only on
+// next PUT on it fails. The SDK still sends the body without waiting for
+// 100 Continue: smithy leaves the request's Proto unset, and net/http waits
+// only on HTTP/1.1 requests.
+// ponytail: a 503 SlowDown, a 429 or a dial error reaches the caller instead
+// of being retried here. The WAL's HEAD swap resends after reading HEAD back;
+// other callers see an error. Upgrade: a retryer that resends only on
 // answers proving no commit.
 func conditionalPut(o *awss3.Options) {
 	o.RetryMaxAttempts = 1
