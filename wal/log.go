@@ -603,9 +603,21 @@ func (w *Writer[R]) abortOwned(err error) {
 	deliver(calls, err)
 }
 
+// putLogImmutable writes an immutable page or descriptor. A failed PUT is
+// resent with backoff (as in swapHead), so a throttled store has time to
+// recover; a resend is safe because a 412 is read back and compared.
 func putLogImmutable(ctx context.Context, store *objstore.Store, key string, p []byte) error {
 	var err error
-	for range 3 {
+	backoff := 100 * time.Millisecond
+	for attempt := range 6 {
+		if attempt > 0 {
+			select {
+			case <-ctx.Done():
+				return err
+			case <-time.After(backoff):
+			}
+			backoff *= 2
+		}
 		var ok bool
 		ok, err = store.PutIfAbsent(objstore.Urgent(ctx), key, p)
 		if err != nil {

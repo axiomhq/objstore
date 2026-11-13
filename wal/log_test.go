@@ -753,6 +753,41 @@ func TestLogHeadSwapTransientFailure(t *testing.T) {
 	}
 }
 
+// TestLogStagingThrottled: a store that refuses page or descriptor PUTs
+// for a second (a 503 SlowDown burst) and then recovers does not end an
+// owned session.
+func TestLogStagingThrottled(t *testing.T) {
+	for _, kind := range []string{"owners/", "groups/"} {
+		t.Run(kind, func(t *testing.T) {
+			synctest.Test(t, func(t *testing.T) {
+				var until time.Time
+				store := mem.Open(objstore.Config{}).WithBackend(func(b objstore.Backend) objstore.Backend {
+					return &logBackend{Backend: b, absent: func(ctx context.Context, key string, p []byte) (bool, error) {
+						if strings.Contains(key, kind) {
+							if until.IsZero() {
+								until = time.Now().Add(time.Second)
+							}
+							if time.Now().Before(until) {
+								return false, errors.New("SlowDown")
+							}
+						}
+						return b.PutIfAbsent(ctx, key, p)
+					}}
+				})
+				l := openOwned(t, store, "log/")
+				s := acquireOwned(t, l, wal.SessionOptions{CollectionWindow: time.Millisecond})
+				defer s.Close(t.Context())
+				if err := enqueueOwned(t, s, "payload", "m").Wait(t.Context()); err != nil {
+					t.Fatal(err)
+				}
+				if got := replayOwned(t, l, snapshotOwned(t, l)); !reflect.DeepEqual(got, []string{"payload"}) {
+					t.Fatalf("replay %v", got)
+				}
+			})
+		})
+	}
+}
+
 func TestLogOpenValidation(t *testing.T) {
 	for _, factory := range []struct {
 		name string
@@ -830,7 +865,7 @@ func TestLogStagingFailureTerminatesSuccessors(t *testing.T) {
 		if err := s.Close(t.Context()); !errors.Is(err, objstore.ErrAccessDenied) {
 			t.Fatal(err)
 		}
-		if puts.Load() != 3 || snapshotOwned(t, l).Cursor() != l.Genesis() {
+		if puts.Load() != 6 || snapshotOwned(t, l).Cursor() != l.Genesis() {
 			t.Fatal("failed stream advanced")
 		}
 		if _, err := s.Enqueue(nil, nil); !errors.Is(err, objstore.ErrAccessDenied) {
