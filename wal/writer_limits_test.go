@@ -175,13 +175,7 @@ func TestWriterUnackedBoundRefuses(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	deadline := time.Now().Add(time.Second)
-	for f.Fired() == 0 && time.Now().Before(deadline) {
-		time.Sleep(time.Millisecond)
-	}
-	if f.Fired() == 0 {
-		t.Fatal("first PUT did not enter the store")
-	}
+	waitFired(t, f)
 	second, err := w.Enqueue(context.Background(), record)
 	if err != nil {
 		t.Fatal(err)

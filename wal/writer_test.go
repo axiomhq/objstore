@@ -14,7 +14,6 @@ import (
 	"time"
 
 	"github.com/axiomhq/objstore"
-	"github.com/axiomhq/objstore/fs"
 	"github.com/axiomhq/objstore/storetest"
 	"github.com/axiomhq/objstore/storetest/bucket"
 )
@@ -355,10 +354,7 @@ func TestWriterRejectsOversizedRecordBeforePublish(t *testing.T) {
 	} {
 		t.Run(name, func(t *testing.T) {
 			ctx := context.Background()
-			s := fs.Open(t.TempDir(), "wal", objstore.Config{})
-			if err := s.EnsureBucket(ctx); err != nil {
-				t.Fatal(err)
-			}
+			s := bucket.NewFS(t)
 			w := NewWriter(s, testPrefix, 1, func(_ uint64, _ time.Time, records []testRecord) {
 				for _, r := range records {
 					if r.Size() > maxPageBytes {
@@ -453,13 +449,8 @@ func TestWriterRejectsPastUnackedBound(t *testing.T) {
 	f.Set(storetest.Plan{Op: storetest.OpPutIfAbsent, N: 1, Mode: storetest.Hang, Key: testPrefix})
 	acked := make(chan error, bound)
 	go func() { acked <- w.Append(context.Background(), rows("wedge")) }()
+	waitFired(t, f)
 	deadline := time.Now().Add(30 * time.Second)
-	for f.Fired() == 0 {
-		if time.Now().After(deadline) {
-			t.Fatal("the planned hang never fired — the writer never attempted a commit")
-		}
-		time.Sleep(5 * time.Millisecond)
-	}
 	// Fill the queue behind the wedged batch, right up to the bound.
 	for i := 0; i < bound-1; i++ {
 		go func(i int) {

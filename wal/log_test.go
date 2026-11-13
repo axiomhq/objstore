@@ -15,8 +15,8 @@ import (
 	"time"
 
 	"github.com/axiomhq/objstore"
-	"github.com/axiomhq/objstore/fs"
 	"github.com/axiomhq/objstore/mem"
+	"github.com/axiomhq/objstore/storetest/bucket"
 	"github.com/axiomhq/objstore/wal"
 )
 
@@ -618,10 +618,7 @@ func TestLogValidatesWholeChainBeforeCallbacks(t *testing.T) {
 func TestLogFSLostResponses(t *testing.T) {
 	for _, persistent := range []bool{false, true} {
 		t.Run(fmt.Sprintf("persistent=%v", persistent), func(t *testing.T) {
-			base := fs.Open(t.TempDir(), "bucket", objstore.Config{})
-			if err := base.EnsureBucket(t.Context()); err != nil {
-				t.Fatal(err)
-			}
+			base := bucket.NewFS(t)
 			lost := errors.New("lost durability response")
 			var attempts atomic.Int32
 			var mu sync.Mutex
@@ -708,13 +705,7 @@ func TestLogOpenValidation(t *testing.T) {
 		open func(*testing.T) *objstore.Store
 	}{
 		{name: "mem", open: func(*testing.T) *objstore.Store { return mem.Open(objstore.Config{}) }},
-		{name: "fs", open: func(t *testing.T) *objstore.Store {
-			s := fs.Open(t.TempDir(), "bucket", objstore.Config{})
-			if err := s.EnsureBucket(t.Context()); err != nil {
-				t.Fatal(err)
-			}
-			return s
-		}},
+		{name: "fs", open: func(t *testing.T) *objstore.Store { return bucket.NewFS(t) }},
 	} {
 		t.Run(factory.name, func(t *testing.T) {
 			store := factory.open(t)

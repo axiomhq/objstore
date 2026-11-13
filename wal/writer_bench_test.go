@@ -16,6 +16,7 @@ import (
 	"github.com/axiomhq/objstore"
 	"github.com/axiomhq/objstore/fs"
 	"github.com/axiomhq/objstore/storetest"
+	"github.com/axiomhq/objstore/storetest/bucket"
 )
 
 func BenchmarkSplitBatch(b *testing.B) {
@@ -131,10 +132,7 @@ func BenchmarkWALGroupCommit(b *testing.B) {
 
 func benchmarkGroupCommit(b *testing.B, backend string, interval time.Duration, callers, size int) {
 	ctx := context.Background()
-	s := fs.Open(b.TempDir(), "benchmark", objstore.Config{})
-	if err := s.EnsureBucket(ctx); err != nil {
-		b.Fatal(err)
-	}
+	s := bucket.NewFS(b)
 	if backend == "fault100ms" {
 		var fault *storetest.Fault
 		s, fault = storetest.NewFault(s)
@@ -172,10 +170,7 @@ func BenchmarkWALGroupCommitUncontended(b *testing.B) {
 	const interval = 10 * time.Millisecond
 	for _, size := range []int{512, 500_000} {
 		b.Run(fmt.Sprintf("%dB", size), func(b *testing.B) {
-			s := fs.Open(b.TempDir(), "uncontended", objstore.Config{})
-			if err := s.EnsureBucket(context.Background()); err != nil {
-				b.Fatal(err)
-			}
+			s := bucket.NewFS(b)
 			s, f := storetest.NewFault(s)
 			f.SetShape(storetest.Shape{Latency: 100 * time.Millisecond})
 			w := NewWriter[Bytes](s, testPrefix, 1, nil, WithCommitInterval(interval))
