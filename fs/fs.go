@@ -217,7 +217,7 @@ func (f *Backend) syncDir(dir string) error {
 // syncPublishedDir fsyncs dst's parent after a rename or link has published
 // into it. If this process has already walked dst's chain to the bucket
 // root, the parent alone is owed — it is the only directory whose entry the
-// publish changed. Otherwise the full walk (syncDirs) runs, and a completed
+// publish changed. Otherwise the full walk runs, and a completed
 // walk — never a failed one — marks the chain durable. The invariant: an
 // acknowledged publish's durability is decided by this process's own syncs
 // only. Two processes racing one fresh directory each run their own walk,
@@ -237,25 +237,16 @@ func (f *Backend) syncPublishedDir(dst string, t *objstore.Timings) error {
 		}
 		return err
 	}
-	if err := f.syncDirs(dst); err != nil {
-		return err
-	}
 	for dir := parent; ; dir = filepath.Dir(dir) {
-		f.durable.Store(dir, struct{}{})
-		if dir == f.root {
-			return nil
-		}
-	}
-}
-
-// syncDirs fsyncs dst's parent directory and every ancestor up to and
-// including f.root, so a just-published rename or link survives a crash —
-// a synced file in an unsynced directory is not durable.
-func (f *Backend) syncDirs(dst string) error {
-	for dir := filepath.Dir(dst); ; dir = filepath.Dir(dir) {
 		if err := f.syncDir(dir); err != nil {
 			return err
 		}
+		if dir == f.root {
+			break
+		}
+	}
+	for dir := parent; ; dir = filepath.Dir(dir) {
+		f.durable.Store(dir, struct{}{})
 		if dir == f.root {
 			return nil
 		}
