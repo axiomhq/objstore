@@ -101,8 +101,9 @@ func TestConditionalStreamCommitAndErrors(t *testing.T) {
 				if r.Method != http.MethodPut || r.URL.RawQuery != "x-id=PutObject" {
 					t.Errorf("not a single PUT: %s %s", r.Method, r.URL.RawQuery)
 				}
-				if r.Header.Get("If-Match") != "old" || r.Header.Get("X-Amz-Server-Side-Encryption-Aws-Kms-Key-Id") != "key-id" {
-					t.Errorf("missing condition/KMS: %v", r.Header)
+				if r.Header.Get("If-Match") != "old" || r.Header.Get("X-Amz-Server-Side-Encryption-Aws-Kms-Key-Id") != "key-id" ||
+					r.Header.Get("Expect") != "100-continue" {
+					t.Errorf("missing condition/KMS/Expect: %v", r.Header)
 				}
 				got, err := io.ReadAll(r.Body)
 				if err != nil || string(got) != "value" {
@@ -123,6 +124,21 @@ func TestConditionalStreamCommitAndErrors(t *testing.T) {
 				t.Fatalf("wrong commit info: %+v", info)
 			}
 		})
+	}
+}
+
+// TestConditionalUploadNotResent: a failed conditional PUT may have
+// committed, so it is not resent, even with a body the SDK could rewind.
+func TestConditionalUploadNotResent(t *testing.T) {
+	var puts atomic.Int32
+	b := fakeS3(t, func(w http.ResponseWriter, r *http.Request) {
+		if puts.Add(1) == 1 {
+			s3Error(w, http.StatusInternalServerError, "InternalError")
+		}
+	})
+	size := int64(0)
+	if _, ok, err := b.UploadIfAbsent(t.Context(), "key", strings.NewReader(""), objstore.UploadOptions{Size: &size}); ok || err == nil || puts.Load() != 1 {
+		t.Fatalf("ok=%v err=%v puts=%d", ok, err, puts.Load())
 	}
 }
 
