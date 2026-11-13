@@ -278,7 +278,6 @@ func TestWriterSplitsAtomicBatchAndResolvesAmbiguousPages(t *testing.T) {
 	}
 }
 
-// pageRecords re-types a decoded page's records for Encode.
 // pageRecords are a decoded page's records, each weighing its length as
 // the split tests' records do, so re-encoding a page also checks the
 // weight its header carries.
