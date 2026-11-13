@@ -196,8 +196,7 @@ func TestLease(t *testing.T) {
 	// read-back were lost. A retried Take must adopt our own record, not
 	// wait 1.5 TTL for it as if somebody else held it.
 	runUnit(t, "RetriedTakeAfterUnresolvedAcquire", func(t *testing.T) {
-		ls := &lossy{Store: newMemStore()}
-		ls.loseNextPut()
+		ls := &lossy{Store: newMemStore(), losePut: true}
 		l := New(ls, "retry/lease", "owner-a", time.Minute)
 		if err := l.Take(ctx); err == nil || errors.Is(err, ErrNotOwner) {
 			t.Fatalf("first Take: %v, want an unresolved outcome", err)
@@ -492,12 +491,6 @@ type lossy struct {
 
 var errLost = errors.New("connection reset")
 
-func (s *lossy) loseNextPut() {
-	s.mu.Lock()
-	s.losePut = true
-	s.mu.Unlock()
-}
-
 func (s *lossy) PutIfAbsent(ctx context.Context, key string, data []byte) (bool, error) {
 	ok, err := s.Store.PutIfAbsent(ctx, key, data)
 	s.mu.Lock()
@@ -789,8 +782,7 @@ func TestFenceAfterRelease(t *testing.T) {
 func TestReleaseAfterUnresolvedAcquire(t *testing.T) {
 	synctest.Test(t, func(t *testing.T) {
 		ctx := context.Background()
-		ls := &lossy{Store: newMemStore()}
-		ls.loseNextPut()
+		ls := &lossy{Store: newMemStore(), losePut: true}
 		l := New(ls, "unres/lease", "owner-a", time.Minute)
 		if err := l.Take(ctx); err == nil || errors.Is(err, ErrNotOwner) {
 			t.Fatalf("first Take: %v, want an unresolved outcome", err)
