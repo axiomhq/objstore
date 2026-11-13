@@ -235,6 +235,33 @@ func TestS3ConditionalPutVerdicts(t *testing.T) {
 	}
 }
 
+// TestS3ConditionalPutNotResent: a 500 can follow a commit, so a resend
+// would meet our own write as a 412 and report a won race as lost.
+func TestS3ConditionalPutNotResent(t *testing.T) {
+	for _, op := range []string{"PutIfAbsent", "PutIfMatch"} {
+		t.Run(op, func(t *testing.T) {
+			var puts atomic.Int32
+			s := fakeS3(t, func(w http.ResponseWriter, r *http.Request) {
+				if puts.Add(1) == 1 {
+					s3Error(w, http.StatusInternalServerError, "InternalError") // committed, answer lost
+					return
+				}
+				s3Error(w, http.StatusPreconditionFailed, "PreconditionFailed")
+			})
+			var ok bool
+			var err error
+			if op == "PutIfAbsent" {
+				ok, err = s.PutIfAbsent(t.Context(), "k", []byte("x"))
+			} else {
+				ok, err = s.PutIfMatch(t.Context(), "k", []byte("x"), "etag")
+			}
+			if ok || err == nil || puts.Load() != 1 {
+				t.Fatalf("%s: ok=%v err=%v puts=%d, want an error after one PUT", op, ok, err, puts.Load())
+			}
+		})
+	}
+}
+
 // TestS3PutIfMatchSendsUnquotedETag pins the exact If-Match header: the
 // ETag goes out without its quotes (the Ceph RGW workaround on PutIfMatch).
 // R2 documents the quoted RFC 9110 form; changing this must be deliberate
