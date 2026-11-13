@@ -256,7 +256,7 @@ func (s *Backend) Put(ctx context.Context, key string, data []byte) error {
 func (s *Backend) PutIfAbsent(ctx context.Context, key string, data []byte) (bool, error) {
 	in := s.putInput(ctx, key, data)
 	in.IfNoneMatch = aws.String("*")
-	_, err := s.client.PutObject(ctx, in)
+	_, err := s.client.PutObject(ctx, in, conditionalPut)
 	if err != nil {
 		switch apiErrorCode(err) {
 		case "PreconditionFailed":
@@ -487,10 +487,11 @@ func (s *Backend) GetIfChanged(ctx context.Context, key, etag string) ([]byte, s
 }
 
 // PutIfMatch replaces key only if its current ETag equals etag — compare-and-
-// swap, the manifest-swap primitive. (false, nil) = precondition failed: the
-// object changed under us, or no longer exists. ConditionalRequestConflict
-// is an error wrapping objstore.ErrConflict, as in PutIfAbsent: the CAS
-// was never evaluated.
+// swap, the manifest-swap primitive. (false, nil) = the store answered our
+// single PUT with 412 or 404: the object's ETag is not etag, or it no longer
+// exists. Any other failure is an error, and the write may have landed.
+// ConditionalRequestConflict is an error wrapping objstore.ErrConflict, as
+// in PutIfAbsent: the CAS was never evaluated.
 //
 // The ETag is sent without its surrounding quotes. S3 returns ETags quoted
 // and accepts either form in If-Match, but Ceph RGW (Hetzner Object Storage)
@@ -502,7 +503,7 @@ func (s *Backend) GetIfChanged(ctx context.Context, key, etag string) ([]byte, s
 func (s *Backend) PutIfMatch(ctx context.Context, key string, data []byte, etag string) (bool, error) {
 	in := s.putInput(ctx, key, data)
 	in.IfMatch = s.ifMatch(etag)
-	_, err := s.client.PutObject(ctx, in)
+	_, err := s.client.PutObject(ctx, in, conditionalPut)
 	if err != nil {
 		switch apiErrorCode(err) {
 		case "PreconditionFailed", "NoSuchKey":
@@ -513,6 +514,19 @@ func (s *Backend) PutIfMatch(ctx context.Context, key string, data []byte, etag 
 		return false, opErr("put-if-match", key, err)
 	}
 	return true, nil
+}
+
+// conditionalPut sends a conditional PUT once. A failed one may have
+// committed, and a resend would then meet our own write as a 412: a won race
+// reported as lost. With Expect: 100-continue, MinIO marks an early 412
+// Connection: close; without it, MinIO drops the connection silently and the
+// next PUT on it fails.
+// ponytail: a 503 SlowDown or a dial error is no longer retried inside the
+// call either; the caller sees it. Upgrade: a retryer that resends only on
+// answers proving no commit.
+func conditionalPut(o *awss3.Options) {
+	o.RetryMaxAttempts = 1
+	o.ContinueHeaderThresholdBytes = 1
 }
 
 // ifMatch is etag as this backend sends it in If-Match: bare, or quoted

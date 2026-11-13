@@ -232,14 +232,7 @@ func (s *Backend) conditionalUpload(ctx context.Context, key string, body io.Rea
 	} else {
 		in.IfMatch = s.ifMatch(etag)
 	}
-	// Expect: 100-continue lets the store refuse before the body is sent.
-	// MinIO otherwise drops the connection after a 412 without saying so,
-	// and the next PUT on it fails. One attempt only: a failed conditional
-	// PUT may have committed, so it is never resent.
-	o, err := s.client.PutObject(ctx, in, streamPutOptions, func(o *awss3.Options) {
-		o.ContinueHeaderThresholdBytes = 1
-		o.RetryMaxAttempts = 1
-	})
+	o, err := s.client.PutObject(ctx, in, streamPutOptions, conditionalPut)
 	if err != nil {
 		switch apiErrorCode(err) {
 		case "PreconditionFailed", "NoSuchKey":
