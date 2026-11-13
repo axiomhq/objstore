@@ -177,10 +177,7 @@ func (f *Fault) WatchRewrites() {
 func (f *Fault) Rewrites() []string {
 	f.mu.Lock()
 	defer f.mu.Unlock()
-	out := make([]string, 0, len(f.rewritten))
-	for k := range f.rewritten {
-		out = append(out, k)
-	}
+	out := slices.AppendSeq(make([]string, 0, len(f.rewritten)), maps.Keys(f.rewritten))
 	slices.Sort(out)
 	return out
 }
