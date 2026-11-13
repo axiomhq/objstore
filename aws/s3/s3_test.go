@@ -286,6 +286,10 @@ func TestS3PutIfMatchQuotedETags(t *testing.T) {
 			if ok, err := s.PutIfMatch(t.Context(), "k", []byte("x"), tc.etag); ok != tc.want || err != nil {
 				t.Fatalf("PutIfMatch(%s): ok=%v err=%v", tc.etag, ok, err)
 			}
+			size := int64(1)
+			if _, ok, err := s.UploadIfMatch(t.Context(), "k", strings.NewReader("x"), tc.etag, objstore.UploadOptions{Size: &size}); ok != tc.want || err != nil {
+				t.Fatalf("UploadIfMatch(%s): ok=%v err=%v", tc.etag, ok, err)
+			}
 		})
 	}
 }

@@ -230,7 +230,7 @@ func (s *Backend) conditionalUpload(ctx context.Context, key string, body io.Rea
 	if absent {
 		in.IfNoneMatch = aws.String("*")
 	} else {
-		in.IfMatch = aws.String(strings.Trim(etag, `"`))
+		in.IfMatch = s.ifMatch(etag)
 	}
 	o, err := s.client.PutObject(ctx, in, streamPutOptions)
 	if err != nil {

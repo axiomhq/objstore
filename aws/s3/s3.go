@@ -501,11 +501,7 @@ func (s *Backend) GetIfChanged(ctx context.Context, key, etag string) ([]byte, s
 // header is attempted, since a failed PUT can have an unknown outcome.
 func (s *Backend) PutIfMatch(ctx context.Context, key string, data []byte, etag string) (bool, error) {
 	in := s.putInput(ctx, key, data)
-	etag = strings.Trim(etag, `"`)
-	if s.quoteETags {
-		etag = `"` + etag + `"`
-	}
-	in.IfMatch = &etag
+	in.IfMatch = s.ifMatch(etag)
 	_, err := s.client.PutObject(ctx, in)
 	if err != nil {
 		switch apiErrorCode(err) {
@@ -517,6 +513,16 @@ func (s *Backend) PutIfMatch(ctx context.Context, key string, data []byte, etag 
 		return false, opErr("put-if-match", key, err)
 	}
 	return true, nil
+}
+
+// ifMatch is etag as this backend sends it in If-Match: bare, or quoted
+// with Config.QuoteETags.
+func (s *Backend) ifMatch(etag string) *string {
+	etag = strings.Trim(etag, `"`)
+	if s.quoteETags {
+		etag = `"` + etag + `"`
+	}
+	return &etag
 }
 
 // GetRange reads exactly length bytes of key at offset. The response's
