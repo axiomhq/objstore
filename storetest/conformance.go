@@ -290,8 +290,9 @@ func Conformance(t *testing.T, s *objstore.Store) {
 				t.Fatal(err)
 			}
 		}
-		// The ListPage and ListPrefixesPage cursor assume a byte-lexical server.
-		// A store without that order (R2) skips this subtest, as
+		// The ListPage and ListPrefixesPage cursor assume a server that honours
+		// a StartAfter that is not a key. A store without that (R2) skips this
+		// subtest, as
 		// go test -skip '/PagedLists/LexicalCursor$'; the order-free
 		// assertions below still run.
 		t.Run("LexicalCursor", func(t *testing.T) {
@@ -358,12 +359,11 @@ func Conformance(t *testing.T, s *objstore.Store) {
 				t.Fatalf("ListPrefixesPage accepted limit %d", limit)
 			}
 		}
-		// List and ListPrefixes past one server page (1,000 keys). A server
-		// need not return keys in byte-lexical order (R2 does not), so this
-		// asserts what holds on any order: every key and every child prefix
-		// exactly once, none missing, none repeated, and the listing ends;
-		// the Store then sorts them. The ListPage assertions above assume
-		// lexical server order and fail on a server without it.
+		// List and ListPrefixes past one server page (1,000 keys). This
+		// asserts what holds on any server order: every key and every child
+		// prefix exactly once, none missing, none repeated, and the listing
+		// ends; the Store then sorts them. The ListPage assertions above
+		// assume a server that honours any StartAfter and fail on R2.
 		const many = objstore.MaxListPage + 100
 		want := make([]string, many)
 		wantPrefixes := make([]string, many)

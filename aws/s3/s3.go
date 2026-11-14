@@ -354,8 +354,8 @@ func (s *Backend) ListPage(ctx context.Context, prefix, after string, limit int)
 }
 
 // List pages ListObjectsV2 by the server's continuation token, not by
-// StartAfter: R2 does not return keys in byte-lexical order, so starting a
-// page after the last key returned can skip or repeat keys, or loop.
+// StartAfter: the token does not depend on how a server treats StartAfter,
+// which R2 mishandles when it is not an existing key.
 func (s *Backend) List(ctx context.Context, prefix string) ([]string, error) {
 	var keys []string
 	pages := awss3.NewListObjectsV2Paginator(s.client, &awss3.ListObjectsV2Input{Bucket: &s.bucket, Prefix: &prefix})
