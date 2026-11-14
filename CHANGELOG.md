@@ -6,6 +6,7 @@
 
 - **wal**: HEAD lists its newest tips (`recent`, at most 64 cursors, about 110 bytes each), set once per publication before the first PUT attempt and copied unchanged by a takeover and by a resend. `Log.ReadHead` and `Head.Snapshot(ctx, from, maxSummaryBytes)` read every listed descriptor after `from` in one round beside the tip's, and `Replay` from `from` through that snapshot reads none of them again: a reader of G unindexed groups pays 1 round, not G. A HEAD without the list, or a group older than it, is walked as before. A binary before this change does not open a HEAD with the list.
 - **wal**: HEAD addresses the pages of each recent group (`pages`: owner, first page sequence and page sizes, beside `recent`), and `Head.Snapshot` takes `maxPageBytes`: it reads those groups' pages, oldest first within that many bytes, in the round it reads their descriptors, and `Batch.Read` uses a page read ahead only when its descriptor's size and hash match. A reader of a listed tail then reads its records in one round after HEAD.
+- **wal**: HEAD's `format` is 2 when it carries `recent` and `pages`; a reader accepts 1 and 2, so a binary that knows only 1 refuses a HEAD with the list instead of misreading it. A list that fails a check (its newest entry is not `tip`, its sequences are not consecutive, `pages` does not align with it) is dropped and the reader walks from `tip`, and a listed page whose size or hash does not match its descriptor is read again from the descriptor: a wrong list costs reads, never an error.
 
 ### Fixed
 

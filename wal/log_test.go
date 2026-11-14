@@ -921,9 +921,32 @@ func TestLogReadErrorIsCorruptOnlyWhenObjectMissing(t *testing.T) {
 // across a takeover, so a snapshot reads every listed descriptor after a
 // cursor and their pages in one round beside the tip's, and a replay from
 // there reads none of them again; only groups older than the list are
-// walked one round each, and their pages read as each batch is.
+// walked one round each, and their pages read as each batch is. A list that
+// fails a check costs rounds, never an error or a wrong record.
 func TestLogHeadListsRecentTips(t *testing.T) {
-	for _, groups := range []int{1, 5, 70} {
+	for _, tc := range []struct {
+		groups, rounds int
+		tamper         func(h map[string]any)
+	}{
+		// HEAD, then the listed descriptors and their pages; a group older
+		// than the list costs a round for its descriptor and one for its
+		// pages, read in the callback.
+		{groups: 1, rounds: 2},
+		{groups: 5, rounds: 2},
+		{groups: 70, rounds: 2 + 2*(70-64)},
+		// A wrong page size: that page is read again from its descriptor.
+		{groups: 5, rounds: 3, tamper: func(h map[string]any) {
+			b := h["pages"].([]any)[2].(map[string]any)["bytes"].([]any)
+			b[0] = b[0].(float64) + 1
+		}},
+		// A list whose newest entry is not Tip is dropped: HEAD, the tip's
+		// descriptor, the walk back over all 5 and their pages.
+		{groups: 5, rounds: 12, tamper: func(h map[string]any) {
+			r := h["recent"].([]any)
+			h["recent"], h["pages"] = r[:len(r)-1], h["pages"].([]any)[:len(r)-1]
+		}},
+	} {
+		groups := tc.groups
 		synctest.Test(t, func(t *testing.T) {
 			var slow atomic.Bool
 			store := mem.Open(objstore.Config{}).WithBackend(func(b objstore.Backend) objstore.Backend {
@@ -944,6 +967,17 @@ func TestLogHeadListsRecentTips(t *testing.T) {
 				}
 			}
 			s.Close(t.Context())
+			p, err := store.Get(t.Context(), "log/HEAD")
+			var head map[string]any
+			if err != nil || json.Unmarshal(p, &head) != nil || head["format"] != float64(2) {
+				t.Fatalf("HEAD %s, %v; want format 2", p, err)
+			}
+			if tc.tamper != nil {
+				tc.tamper(head)
+				if p, err = json.Marshal(head); err != nil || store.Put(t.Context(), "log/HEAD", p) != nil {
+					t.Fatal(err)
+				}
+			}
 			slow.Store(true)
 			t0 := time.Now()
 			h, err := l.ReadHead(t.Context())
@@ -967,11 +1001,8 @@ func TestLogHeadListsRecentTips(t *testing.T) {
 			if err != nil || !reflect.DeepEqual(got, want) {
 				t.Fatalf("records %v, %v; want %v", got, err, want)
 			}
-			// HEAD, then the listed descriptors and their pages; a group
-			// older than the list costs a round for its descriptor and one
-			// for its pages, read in the callback.
-			if wantRounds := 2 + 2*max(0, groups-64); rounds != wantRounds {
-				t.Fatalf("%d groups: %d rounds, want %d", groups, rounds, wantRounds)
+			if rounds != tc.rounds {
+				t.Fatalf("%d groups: %d rounds, want %d", groups, rounds, tc.rounds)
 			}
 		})
 	}

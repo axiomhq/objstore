@@ -137,6 +137,10 @@ type recentPages struct {
 	Bytes []int  `json:"bytes"`
 }
 
+// headFormat is HEAD's format: 2 since recent and pages. A reader accepts 1
+// and 2; a binary that knows only 1 refuses 2 instead of misreading it.
+const headFormat = 2
+
 // maxRecent bounds HEAD's Recent: about 110 bytes of HEAD a tip.
 // ponytail: a guess; size it from how many groups lie between two index
 // publications once that is measured.
@@ -158,7 +162,7 @@ func OpenLog(ctx context.Context, store *objstore.Store, prefix string, configur
 	h, _, err := l.readHead(ctx)
 	if errors.Is(err, objstore.ErrNotFound) {
 		inc := logToken()
-		h = logHead{Format: 1, Prefix: prefix, Incarnation: inc,
+		h = logHead{Format: headFormat, Prefix: prefix, Incarnation: inc,
 			Configuration: l.configuration, Revision: logToken(), Tip: l.genesisFor(inc)}
 		p, marshalErr := json.Marshal(h)
 		if marshalErr != nil {
@@ -199,21 +203,26 @@ func (l *Log) readHead(ctx context.Context) (logHead, string, error) {
 	if err := decodeLogJSON(p, &h); err != nil {
 		return h, "", err
 	}
-	valid := h.Format == 1 && h.Prefix == l.prefix && logHex(h.Revision, 32) && logHex(h.Incarnation, 32)
+	valid := (h.Format == 1 || h.Format == headFormat) && h.Prefix == l.prefix && logHex(h.Revision, 32) && logHex(h.Incarnation, 32)
 	valid = valid && (h.Owner == "" || logHex(h.Owner, 32)) && h.Tip.incarnation == h.Incarnation
 	valid = valid && (l.genesis == (Cursor{}) || h.Incarnation == l.genesis.incarnation)
 	valid = valid && (h.Tip.sequence != 0 || h.Tip == l.genesisFor(h.Incarnation))
 	valid = valid && (h.Owner != "" || h.Tip.sequence == 0) && tag != ""
-	valid = valid && len(h.Recent) <= maxRecent && (len(h.Recent) == 0 || h.Recent[len(h.Recent)-1] == h.Tip)
+	// The list only saves reads: one that fails a check is dropped, so the
+	// reader walks from Tip and the next publication starts it again.
+	list := len(h.Recent) <= maxRecent && (len(h.Recent) == 0 || h.Recent[len(h.Recent)-1] == h.Tip)
 	for i, c := range h.Recent {
-		valid = valid && c.valid() && c.incarnation == h.Incarnation && c.sequence > 0 && (i == 0 || c.sequence == h.Recent[i-1].sequence+1)
+		list = list && c.valid() && c.incarnation == h.Incarnation && c.sequence > 0 && (i == 0 || c.sequence == h.Recent[i-1].sequence+1)
 	}
-	valid = valid && (len(h.Pages) == 0 || len(h.Pages) == len(h.Recent))
+	list = list && (len(h.Pages) == 0 || len(h.Pages) == len(h.Recent))
 	for _, g := range h.Pages {
-		valid = valid && logHex(g.Owner, 32) && g.First > 0 && len(g.Bytes) > 0 && uint64(len(g.Bytes)) <= math.MaxUint64-g.First
+		list = list && logHex(g.Owner, 32) && g.First > 0 && len(g.Bytes) > 0 && uint64(len(g.Bytes)) <= math.MaxUint64-g.First
 		for _, n := range g.Bytes {
-			valid = valid && n > 0 && n <= maxPageBytes
+			list = list && n > 0 && n <= maxPageBytes
 		}
+	}
+	if !list {
+		h.Recent, h.Pages = nil, nil
 	}
 	if !valid || len(h.Configuration) > maxLogConfig {
 		return h, "", fmt.Errorf("%w: invalid owned HEAD", ErrCorrupt)
@@ -654,7 +663,7 @@ func (s *Session) publish(ctx context.Context, b *batch[logRecord], first uint64
 		return err
 	}
 	h := s.head
-	h.Tip = c
+	h.Format, h.Tip = headFormat, c
 	// Once, before the first PUT attempt: a resend sends the same bytes.
 	h.Recent = append(slices.Clone(s.head.Recent[max(0, len(s.head.Recent)-maxRecent+1):]), c)
 	g := recentPages{Owner: d.Owner, First: d.First, Bytes: make([]int, len(d.Pages))}
