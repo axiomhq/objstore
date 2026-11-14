@@ -939,6 +939,12 @@ func TestLogHeadListsRecentTips(t *testing.T) {
 			b := h["pages"].([]any)[2].(map[string]any)["bytes"].([]any)
 			b[0] = b[0].(float64) + 1
 		}},
+		// A wrong page address: the page read ahead is another group's,
+		// fails its descriptor's hash and is read again.
+		{groups: 5, rounds: 3, tamper: func(h map[string]any) {
+			p := h["pages"].([]any)
+			p[2].(map[string]any)["first"] = p[3].(map[string]any)["first"]
+		}},
 		// A list whose newest entry is not Tip is dropped: HEAD, the tip's
 		// descriptor, the walk back over all 5 and their pages.
 		{groups: 5, rounds: 12, tamper: func(h map[string]any) {
