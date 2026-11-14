@@ -727,7 +727,10 @@ func TestAdoptionDoesNotRearmPacing(t *testing.T) {
 	if err := w.Append(ctx, rows("b")); err != nil {
 		t.Fatal(err)
 	}
-	if elapsed := time.Since(start); elapsed > interval+250*time.Millisecond {
+	// The retry waits one interval and adopts; "b" is then due an interval
+	// after the original PUT, about 500 ms in (786 ms on a starved CI
+	// runner). Pacing re-armed at the adoption holds it to 1,000 ms or more.
+	if elapsed := time.Since(start); elapsed >= 2*interval-50*time.Millisecond {
 		t.Fatalf("second append landed after %s; adoption re-armed pacing", elapsed)
 	}
 	if entries, err := replay(ctx, s, testPrefix, 0); err != nil || len(entries) != 2 {

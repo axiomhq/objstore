@@ -718,8 +718,10 @@ func TestCommitIntervalCoalescesIntoOnePage(t *testing.T) {
 			t.Fatalf("append %d: %v", i, err)
 		}
 	}
-	if elapsed >= 100*time.Millisecond {
-		t.Fatalf("idle concurrent appends took %s; want an immediate commit", elapsed)
+	// An immediate commit is one 20 ms PUT plus scheduling (166 ms on a
+	// starved CI runner); a commit held for an interval takes at least 300.
+	if elapsed >= interval-50*time.Millisecond {
+		t.Fatalf("idle concurrent appends took %s; want an immediate commit, not one held an interval", elapsed)
 	}
 	mu.Lock()
 	gotCommits, gotRecords := commits, append([]string(nil), committed...)
@@ -739,12 +741,13 @@ func TestCommitIntervalCoalescesIntoOnePage(t *testing.T) {
 	if err != nil || len(entries) != 1 || len(ids(entries[0])) != 2 {
 		t.Fatalf("two appends did not become one WAL entry: %+v, %v", entries, err)
 	}
-	start = time.Now()
+	// The interval runs from the first commit's PUT, which started after
+	// start: time since start bounds the hold from below on any runner.
 	if err := w.Append(ctx, rows("c")); err != nil {
 		t.Fatal(err)
 	}
-	if elapsed := time.Since(start); elapsed < interval-50*time.Millisecond {
-		t.Fatalf("next append committed after %s, before the %s rate limit", elapsed, interval)
+	if elapsed := time.Since(start); elapsed < interval {
+		t.Fatalf("next append committed %s after the first, before the %s rate limit", elapsed, interval)
 	}
 	entries, err = replay(ctx, s, testPrefix, 0)
 	if err != nil || len(entries) != 2 || !slices.Equal(ids(entries[1]), []string{"c"}) {
