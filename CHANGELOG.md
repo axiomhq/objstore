@@ -17,6 +17,7 @@
 
 ### Changed
 
+- **s3**: the backend keeps up to 640 idle connections per host, not 64: a second burst of 640 concurrent reads opened 550 to 576 new connections at 64 and 0 to 2 at 640 (local HTTP server). The pool opens no connection; it keeps at most a caller's own peak, closed after 90 s idle.
 - **wal**: `Encode` and the writer skip per-record `Counter` and `Weigher` assertions when the record type has no such method: `SplitBatch` is about 30% faster with 4,100 fewer allocations for 1,024 records. Page bytes are unchanged.
 - **rangeread**: `Read` finds the extents each span covers with a binary search instead of scanning all of them: 10,000 one-KiB extents read 64% faster on `mem`. `ReadPlanned` is unchanged.
 - **wal**: `Log` JSON uses lowercase snake_case keys, as `lease` does: cursors (`{"format":1,"incarnation":...,"sequence":...}`), HEAD, descriptors and page entries. Logs written by earlier unreleased commits do not open.
