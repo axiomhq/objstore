@@ -2,6 +2,10 @@
 
 ## Unreleased
 
+### Added
+
+- **wal**: HEAD lists its newest tips (`recent`, at most 64 cursors, about 110 bytes each), set once per publication before the first PUT attempt and copied unchanged by a takeover and by a resend. `Log.ReadHead` and `Head.Snapshot(ctx, from, maxSummaryBytes)` read every listed descriptor after `from` in one round beside the tip's, and `Replay` from `from` through that snapshot reads none of them again: a reader of G unindexed groups pays 1 round, not G. A HEAD without the list, or a group older than it, is walked as before. A binary before this change does not open a HEAD with the list.
+
 ### Fixed
 
 - **wal**: a failed read of an accepted descriptor or page is `ErrCorrupt` only when the object is missing or short. Timeouts, cancellation and access errors no longer wrap `ErrCorrupt`, which callers treat as permanent.

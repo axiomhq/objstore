@@ -729,6 +729,9 @@ func TestLogHeadSwapTransientFailure(t *testing.T) {
 						first, firstTag = p, tag
 						return false, errors.New("transient store failure")
 					case 2:
+						if mode == "refused" && !bytes.Equal(p, first) {
+							t.Errorf("resent HEAD differs:\n%s\n%s", first, p)
+						}
 						if mode == "late" {
 							if ok, err := b.PutIfMatch(ctx, key, first, firstTag); err != nil || !ok {
 								return ok, err
@@ -912,4 +915,80 @@ func TestLogReadErrorIsCorruptOnlyWhenObjectMissing(t *testing.T) {
 			}
 		})
 	}
+}
+
+// TestLogHeadListsRecentTips: HEAD lists its newest tips, across a takeover,
+// so a snapshot reads every listed descriptor after a cursor in one round
+// beside the tip's, and a replay from there reads none of them again; only
+// groups older than the list are walked one round each.
+func TestLogHeadListsRecentTips(t *testing.T) {
+	for _, groups := range []int{1, 5, 70} {
+		synctest.Test(t, func(t *testing.T) {
+			var slow atomic.Bool
+			store := mem.Open(objstore.Config{}).WithBackend(func(b objstore.Backend) objstore.Backend {
+				return &slowReads{Backend: b, slow: &slow}
+			})
+			l := openOwned(t, store, "log/")
+			s := acquireOwned(t, l, wal.SessionOptions{CollectionWindow: time.Millisecond})
+			var want []string
+			for i := range groups {
+				if i == groups/2 {
+					// A takeover keeps the list.
+					s.Close(t.Context())
+					s = acquireOwned(t, l, wal.SessionOptions{CollectionWindow: time.Millisecond})
+				}
+				want = append(want, fmt.Sprint(i))
+				if err := enqueueOwned(t, s, want[i], "m").Wait(t.Context()); err != nil {
+					t.Fatal(err)
+				}
+			}
+			s.Close(t.Context())
+			slow.Store(true)
+			t0 := time.Now()
+			h, err := l.ReadHead(t.Context())
+			if err != nil {
+				t.Fatal(err)
+			}
+			snap, err := h.Snapshot(t.Context(), l.Genesis(), 64<<20)
+			if err != nil {
+				t.Fatal(err)
+			}
+			var got []string
+			err = l.Replay(t.Context(), l.Genesis(), snap, 64<<20, func(b wal.Batch) error {
+				got = append(got, fmt.Sprint(b.Cursor().Sequence()))
+				return nil
+			})
+			rounds := int(time.Since(t0) / time.Second)
+			slow.Store(false)
+			if err != nil || len(got) != groups {
+				t.Fatalf("replayed %v, %v", got, err)
+			}
+			if records := replayOwned(t, l, snap); !reflect.DeepEqual(records, want) {
+				t.Fatalf("records %v, want %v", records, want)
+			}
+			// HEAD, then the listed descriptors, then one round per older group.
+			if wantRounds := 2 + max(0, groups-64); rounds != wantRounds {
+				t.Fatalf("%d groups: %d rounds, want %d", groups, rounds, wantRounds)
+			}
+		})
+	}
+}
+
+type slowReads struct {
+	objstore.Backend
+	slow *atomic.Bool
+}
+
+func (b *slowReads) GetRange(ctx context.Context, key string, off, n int64) ([]byte, error) {
+	if b.slow.Load() {
+		time.Sleep(time.Second)
+	}
+	return b.Backend.GetRange(ctx, key, off, n)
+}
+
+func (b *slowReads) GetWithETag(ctx context.Context, key string) ([]byte, string, error) {
+	if b.slow.Load() {
+		time.Sleep(time.Second)
+	}
+	return b.Backend.GetWithETag(ctx, key)
 }

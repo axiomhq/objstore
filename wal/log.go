@@ -11,7 +11,9 @@ import (
 	"fmt"
 	"io"
 	"math"
+	"slices"
 	"strings"
+	"sync"
 	"time"
 	"unicode/utf8"
 
@@ -85,6 +87,9 @@ type Snapshot struct {
 	log      *Log
 	cursor   Cursor
 	metadata []byte
+	// Descriptor bytes read ahead (Head.Snapshot), by cursor; Replay uses
+	// one only when its walk reaches that exact cursor.
+	read map[Cursor][]byte
 }
 
 func (s Snapshot) Cursor() Cursor   { return s.cursor }
@@ -111,7 +116,17 @@ type logHead struct {
 	Owner         string `json:"owner"`
 	Revision      string `json:"revision"`
 	Tip           Cursor `json:"tip"`
+	// Recent is the newest tips, oldest first, ending at Tip: at most
+	// maxRecent. A reader reads their descriptors at once instead of
+	// walking back from Tip one at a time. Set once per publication,
+	// before the first PUT attempt; every other path copies it unchanged.
+	Recent []Cursor `json:"recent,omitempty"`
 }
+
+// maxRecent bounds HEAD's Recent: about 110 bytes of HEAD a tip.
+// ponytail: a guess; size it from how many groups lie between two index
+// publications once that is measured.
+const maxRecent = 64
 
 // OpenLog opens or initializes a log. Configuration is opaque, immutable,
 // copied, and limited to 64 KiB. Prefix is a nonempty canonical relative path
@@ -175,6 +190,10 @@ func (l *Log) readHead(ctx context.Context) (logHead, string, error) {
 	valid = valid && (l.genesis == (Cursor{}) || h.Incarnation == l.genesis.incarnation)
 	valid = valid && (h.Tip.sequence != 0 || h.Tip == l.genesisFor(h.Incarnation))
 	valid = valid && (h.Owner != "" || h.Tip.sequence == 0) && tag != ""
+	valid = valid && len(h.Recent) <= maxRecent && (len(h.Recent) == 0 || h.Recent[len(h.Recent)-1] == h.Tip)
+	for i, c := range h.Recent {
+		valid = valid && c.valid() && c.incarnation == h.Incarnation && c.sequence > 0 && (i == 0 || c.sequence == h.Recent[i-1].sequence+1)
+	}
 	if !valid || len(h.Configuration) > maxLogConfig {
 		return h, "", fmt.Errorf("%w: invalid owned HEAD", ErrCorrupt)
 	}
@@ -192,6 +211,66 @@ func (l *Log) Snapshot(ctx context.Context) (Snapshot, error) {
 		return Snapshot{}, err
 	}
 	return l.snapshot(ctx, h.Tip)
+}
+
+// Head is one read of HEAD.
+type Head struct {
+	log    *Log
+	tip    Cursor
+	recent []Cursor
+}
+
+// ReadHead reads HEAD once, for Head.Snapshot.
+func (l *Log) ReadHead(ctx context.Context) (Head, error) {
+	h, _, err := l.readHead(ctx)
+	return Head{log: l, tip: h.Tip, recent: h.Recent}, err
+}
+
+// Cursor is the head's tip.
+func (h Head) Cursor() Cursor { return h.tip }
+
+// Snapshot is Log.Snapshot at h's tip, reading beside the tip's descriptor
+// every descriptor h lists after from, oldest first while their Replay cost
+// stays within maxSummaryBytes, so a Replay from from through it reads none
+// of them again: one round for the whole listed tail instead of one per
+// group. A listed cursor is used only where the walk back from the tip
+// reaches it; descriptors are content-addressed, so a wrong list costs reads,
+// never a wrong descriptor.
+func (h Head) Snapshot(ctx context.Context, from Cursor, maxSummaryBytes int64) (Snapshot, error) {
+	l := h.log
+	if h.tip == l.genesis {
+		return Snapshot{log: l, cursor: h.tip}, nil
+	}
+	var ahead []Cursor
+	var used int64
+	for _, c := range h.recent {
+		if c.sequence <= from.sequence && c != h.tip {
+			continue
+		}
+		if used += 16*int64(c.bytes) + descriptorReserve; used > maxSummaryBytes {
+			break
+		}
+		ahead = append(ahead, c)
+	}
+	read := make(map[Cursor][]byte, len(ahead))
+	var mu sync.Mutex
+	var wg sync.WaitGroup
+	for _, c := range ahead {
+		wg.Go(func() {
+			// A failed read ahead is left to Replay, which reads it again.
+			if p, err := l.store.GetRange(ctx, l.prefix+"groups/"+c.hash, 0, int64(c.bytes)); err == nil {
+				mu.Lock()
+				read[c] = p
+				mu.Unlock()
+			}
+		})
+	}
+	wg.Wait()
+	d, _, err := l.readDescriptorFrom(ctx, h.tip, math.MaxInt64, read[h.tip])
+	if err != nil {
+		return Snapshot{}, err
+	}
+	return Snapshot{log: l, cursor: h.tip, metadata: bytes.Clone(d.Metadata[len(d.Metadata)-1]), read: read}, nil
 }
 
 func (l *Log) snapshot(ctx context.Context, c Cursor) (Snapshot, error) {
@@ -526,6 +605,8 @@ func (s *Session) publish(ctx context.Context, b *batch[logRecord], first uint64
 	}
 	h := s.head
 	h.Tip = c
+	// Once, before the first PUT attempt: a resend sends the same bytes.
+	h.Recent = append(slices.Clone(s.head.Recent[max(0, len(s.head.Recent)-maxRecent+1):]), c)
 	tag, terminal, err := s.log.swapHead(ctx, h, s.etag)
 	if err != nil {
 		return err
@@ -739,7 +820,7 @@ func (l *Log) Replay(ctx context.Context, from Cursor, through Snapshot, maxSumm
 		if c.sequence <= from.sequence {
 			return fmt.Errorf("%w: cursor is not committed ancestry", ErrCorrupt)
 		}
-		d, cost, err := l.readDescriptor(ctx, c, maxSummaryBytes-used)
+		d, cost, err := l.readDescriptorFrom(ctx, c, maxSummaryBytes-used, through.read[c])
 		if err != nil {
 			return err
 		}
@@ -759,6 +840,12 @@ func (l *Log) Replay(ctx context.Context, from Cursor, through Snapshot, maxSumm
 }
 
 func (l *Log) readDescriptor(ctx context.Context, c Cursor, budget int64) (*logDescriptor, int64, error) {
+	return l.readDescriptorFrom(ctx, c, budget, nil)
+}
+
+// readDescriptorFrom is readDescriptor of the bytes read ahead when they are
+// c's, else of a read.
+func (l *Log) readDescriptorFrom(ctx context.Context, c Cursor, budget int64, ahead []byte) (*logDescriptor, int64, error) {
 	if !c.valid() || c.sequence == 0 {
 		return nil, 0, fmt.Errorf("%w: invalid descriptor cursor", ErrCorrupt)
 	}
@@ -766,9 +853,12 @@ func (l *Log) readDescriptor(ctx context.Context, c Cursor, budget int64) (*logD
 	if cost > budget {
 		return nil, 0, ErrRecordTooLarge
 	}
-	p, err := l.store.GetRange(ctx, l.prefix+"groups/"+c.hash, 0, int64(c.bytes))
-	if err != nil {
-		return nil, 0, readErr("accepted descriptor", err)
+	p := ahead
+	if len(p) != c.bytes || logHash(p) != c.hash {
+		var err error
+		if p, err = l.store.GetRange(ctx, l.prefix+"groups/"+c.hash, 0, int64(c.bytes)); err != nil {
+			return nil, 0, readErr("accepted descriptor", err)
+		}
 	}
 	if len(p) != c.bytes || logHash(p) != c.hash {
 		return nil, 0, fmt.Errorf("%w: descriptor hash", ErrCorrupt)
