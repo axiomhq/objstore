@@ -84,6 +84,11 @@ func (t *Timings) Attrs() []slog.Attr {
 
 type storeTimeKey struct{}
 
+type storeTime struct {
+	t    *time.Time
+	host *bool
+}
+
 // WithStoreTime has a GetWithETag or GetIfChanged under ctx set *t to the
 // store's time when it answered, an answer of ErrNotFound or of not
 // modified included, for a caller to compare times by the store's clock
@@ -93,22 +98,29 @@ type storeTimeKey struct{}
 // mem, gcp/gcs and cloudflare/r2 take this process's clock: a file store is
 // one host's (or its clock is the one every process sharing it must keep),
 // gcs's client does not expose the response, and a Worker's clock is
-// Cloudflare's. One call at a time may record into t.
-func WithStoreTime(ctx context.Context, t *time.Time) context.Context {
-	return context.WithValue(ctx, storeTimeKey{}, t)
+// Cloudflare's. host, if not nil, is set to whether *t is this host's
+// clock standing in for a store that gave none: gcp/gcs always, and aws/s3
+// and azure/blob for an answer without a Date. A file store's, mem's and a
+// Worker's clock are their store's. One call at a time may record into t.
+func WithStoreTime(ctx context.Context, t *time.Time, host *bool) context.Context {
+	if host == nil {
+		host = new(bool)
+	}
+	return context.WithValue(ctx, storeTimeKey{}, storeTime{t, host})
 }
 
-// StoreTimeOf returns the time ctx records into (WithStoreTime), or nil.
-// For backends.
-func StoreTimeOf(ctx context.Context) *time.Time {
-	t, _ := ctx.Value(storeTimeKey{}).(*time.Time)
-	return t
+// StoreTimeOf returns the time and the host flag ctx records into
+// (WithStoreTime), or nils. For backends.
+func StoreTimeOf(ctx context.Context) (*time.Time, *bool) {
+	s, _ := ctx.Value(storeTimeKey{}).(storeTime)
+	return s.t, s.host
 }
 
-// RecordStoreTime records now into the time ctx carries, if any. For
-// backends whose clock is the store's.
-func RecordStoreTime(ctx context.Context) {
-	if t := StoreTimeOf(ctx); t != nil {
-		*t = time.Now()
+// RecordStoreTime records now into the time ctx carries, if any, and host
+// into its flag: true when this clock stands in for the store's. For
+// backends whose answers carry no time.
+func RecordStoreTime(ctx context.Context, host bool) {
+	if t, h := StoreTimeOf(ctx); t != nil {
+		*t, *h = time.Now(), host
 	}
 }

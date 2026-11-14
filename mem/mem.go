@@ -120,7 +120,7 @@ func (m *Backend) Get(ctx context.Context, key string) ([]byte, error) {
 }
 
 func (m *Backend) GetWithETag(ctx context.Context, key string) ([]byte, string, error) {
-	objstore.RecordStoreTime(ctx)
+	objstore.RecordStoreTime(ctx, false)
 	data, err := m.get(ctx, "get-with-etag", key)
 	if err != nil {
 		return nil, "", err

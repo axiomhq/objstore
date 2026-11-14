@@ -1052,11 +1052,12 @@ func TestFSStoreTimeIsThisClock(t *testing.T) {
 		t.Fatal(err)
 	}
 	var at time.Time
+	host := true
 	before := time.Now()
-	if _, _, err := f.GetWithETag(objstore.WithStoreTime(t.Context(), &at), "missing"); !errors.Is(err, objstore.ErrNotFound) {
+	if _, _, err := f.GetWithETag(objstore.WithStoreTime(t.Context(), &at, &host), "missing"); !errors.Is(err, objstore.ErrNotFound) {
 		t.Fatal(err)
 	}
-	if at.Before(before) || at.After(time.Now()) {
+	if at.Before(before) || at.After(time.Now()) || host {
 		t.Fatalf("store time %v, want this clock's, from %v", at, before)
 	}
 }

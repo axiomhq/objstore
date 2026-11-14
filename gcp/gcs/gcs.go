@@ -285,7 +285,7 @@ func (g *Backend) Get(ctx context.Context, key string) ([]byte, error) {
 func (g *Backend) GetWithETag(ctx context.Context, key string) ([]byte, string, error) {
 	// The client does not expose the response's Date: this host's clock,
 	// as on fs and mem (WithStoreTime), never none.
-	defer objstore.RecordStoreTime(ctx)
+	defer objstore.RecordStoreTime(ctx, true)
 	return g.get(ctx, "get-with-etag", key)
 }
 
@@ -296,7 +296,7 @@ func (g *Backend) GetWithETag(ctx context.Context, key string) ([]byte, string, 
 // the same generation back is also read as unchanged, before the body is
 // read. Any error is an error, never "unchanged".
 func (g *Backend) GetIfChanged(ctx context.Context, key, etag string) ([]byte, string, bool, error) {
-	defer objstore.RecordStoreTime(ctx) // this host's clock, as in GetWithETag
+	defer objstore.RecordStoreTime(ctx, true) // this host's clock, as in GetWithETag
 	if err := done(ctx, "get-if-changed", key); err != nil {
 		return nil, "", false, err
 	}

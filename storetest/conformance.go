@@ -474,7 +474,7 @@ func Conformance(t *testing.T, s *objstore.Store) {
 			"GetIfChanged unchanged": func(ctx context.Context) error { _, _, _, err := s.GetIfChanged(ctx, "store-time/m", tag); return err },
 		} {
 			var at time.Time
-			if err := read(objstore.WithStoreTime(ctx, &at)); err != nil {
+			if err := read(objstore.WithStoreTime(ctx, &at, nil)); err != nil {
 				t.Fatalf("%s: %v", name, err)
 			}
 			if d := time.Since(at); d < -time.Minute || d > time.Minute {

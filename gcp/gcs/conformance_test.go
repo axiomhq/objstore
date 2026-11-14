@@ -57,6 +57,12 @@ func TestConformance(t *testing.T) {
 			}
 			storetest.Conformance(t, s)
 			storetest.StreamingConformance(t, s, "STANDARD")
+			// gcs's client exposes no Date: its time is reported as the host's.
+			var at time.Time
+			var host bool
+			if _, _, err := s.GetWithETag(objstore.WithStoreTime(ctx, &at, &host), "store-time/none"); !errors.Is(err, objstore.ErrNotFound) || at.IsZero() || !host {
+				t.Fatalf("store time %v, host %t, %v: want this host's, reported as such", at, host, err)
+			}
 		})
 	}
 }

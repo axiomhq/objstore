@@ -551,11 +551,11 @@ func (s *Backend) GetWithETag(ctx context.Context, key string) ([]byte, string, 
 // storeTime records the Date of a GetObject's response, an error's
 // included, for objstore.WithStoreTime.
 func storeTime(ctx context.Context, out *awss3.GetObjectOutput, err error) {
-	t := objstore.StoreTimeOf(ctx)
+	t, host := objstore.StoreTimeOf(ctx)
 	if t == nil {
 		return
 	}
-	*t = time.Now() // an answer without a Date: this host's clock, never none
+	*t, *host = time.Now(), true // an answer without a Date: this host's clock, never none
 	var response *awshttp.ResponseError
 	var metadata smithymiddleware.Metadata
 	switch {
@@ -563,12 +563,12 @@ func storeTime(ctx context.Context, out *awss3.GetObjectOutput, err error) {
 		metadata = out.ResultMetadata
 	case errors.As(err, &response) && response.Response != nil:
 		if v, err := http.ParseTime(response.Response.Header.Get("Date")); err == nil {
-			*t = v
+			*t, *host = v, false
 		}
 		return
 	}
 	if v, ok := awsmiddleware.GetServerTime(metadata); ok {
-		*t = v
+		*t, *host = v, false
 	}
 }
 

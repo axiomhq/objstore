@@ -264,8 +264,9 @@ func TestS3StoreTimeIsDateHeader(t *testing.T) {
 		"unchanged": func(ctx context.Context) error { _, _, _, err := s.GetIfChanged(ctx, "k", `"e"`); return err },
 	} {
 		var at time.Time
-		if err := read(objstore.WithStoreTime(t.Context(), &at)); err != nil || !at.Equal(date) {
-			t.Errorf("%s: store time %v, want %v: %v", name, at, date, err)
+		host := true
+		if err := read(objstore.WithStoreTime(t.Context(), &at, &host)); err != nil || !at.Equal(date) || host {
+			t.Errorf("%s: store time %v (host %t), want %v from the store: %v", name, at, host, date, err)
 		}
 	}
 	// An answer without a Date records this host's clock, never none.
@@ -275,9 +276,10 @@ func TestS3StoreTimeIsDateHeader(t *testing.T) {
 		w.Write([]byte("x"))
 	})
 	var at time.Time
+	var host bool
 	before := time.Now()
-	if _, _, err := s.GetWithETag(objstore.WithStoreTime(t.Context(), &at), "k"); err != nil || at.Before(before) || at.After(time.Now()) {
-		t.Errorf("no Date: store time %v, want this clock's, from %v: %v", at, before, err)
+	if _, _, err := s.GetWithETag(objstore.WithStoreTime(t.Context(), &at, &host), "k"); err != nil || at.Before(before) || at.After(time.Now()) || !host {
+		t.Errorf("no Date: store time %v (host %t), want this clock's, from %v, reported as the host's: %v", at, host, before, err)
 	}
 }
 
