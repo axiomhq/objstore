@@ -17,6 +17,7 @@
 
 ### Changed
 
+- **s3**: on a custom endpoint the backend resolves the endpoint once per bucket instead of running the SDK's rules on every request, which for a region they do not list (R2's `auto`) compiled each partition's region regexp each time. `BenchmarkGetRange`: 144 KB and 1,700 allocations a call before, 37 KB and 491 after. Each request gets its own copy of the auth options, which the signer writes into.
 - **s3**: the backend keeps up to 640 idle connections per host, not 64: a second burst of 640 concurrent reads opened 550 to 576 new connections at 64 and 0 to 2 at 640 (local HTTP server). The pool opens no connection; it keeps at most a caller's own peak, closed after 90 s idle.
 - **wal**: `Encode` and the writer skip per-record `Counter` and `Weigher` assertions when the record type has no such method: `SplitBatch` is about 30% faster with 4,100 fewer allocations for 1,024 records. Page bytes are unchanged.
 - **rangeread**: `Read` finds the extents each span covers with a binary search instead of scanning all of them: 10,000 one-KiB extents read 64% faster on `mem`. `ReadPlanned` is unchanged.

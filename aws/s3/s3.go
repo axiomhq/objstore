@@ -14,6 +14,7 @@ import (
 	"net/url"
 	"slices"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/aws/aws-sdk-go-v2/aws"
@@ -22,6 +23,8 @@ import (
 	awss3 "github.com/aws/aws-sdk-go-v2/service/s3"
 	"github.com/aws/aws-sdk-go-v2/service/s3/types"
 	"github.com/aws/smithy-go"
+	smithyauth "github.com/aws/smithy-go/auth"
+	smithyendpoints "github.com/aws/smithy-go/endpoints"
 
 	"github.com/axiomhq/objstore"
 )
@@ -145,12 +148,53 @@ func New(ctx context.Context, cfg Config) (*Backend, error) {
 		if endpoint != "" {
 			o.BaseEndpoint = aws.String(endpoint)
 			o.UsePathStyle = true
+			o.EndpointResolverV2 = &staticEndpoint{rules: awss3.NewDefaultEndpointResolverV2()}
 		}
 		// Stores that do not return a checksum (Ceph RGW among them) would
 		// otherwise log a warning on every GET.
 		o.ResponseChecksumValidation = aws.ResponseChecksumValidationWhenRequired
 	})
 	return &Backend{client: client, bucket: bucket, endpoint: endpoint, sse: sse, kmsKeyID: kmsKeyID, quoteETags: cfg.QuoteETags}, nil
+}
+
+// staticEndpoint resolves a custom endpoint once per bucket. The SDK's rules
+// otherwise run on every request and, for a region they do not list (R2's
+// "auto"), compile each partition's region regexp each time: 75% of a
+// GetRange's allocated bytes. On a path-style custom endpoint the result
+// depends on nothing but the bucket. The signer writes into an auth
+// option's properties, so each request gets its own copy of them.
+type staticEndpoint struct {
+	rules awss3.EndpointResolverV2
+	cache sync.Map // bucket -> smithyendpoints.Endpoint
+}
+
+func (r *staticEndpoint) ResolveEndpoint(ctx context.Context, p awss3.EndpointParameters) (smithyendpoints.Endpoint, error) {
+	bucket := aws.ToString(p.Bucket)
+	cached, ok := r.cache.Load(bucket)
+	if !ok {
+		e, err := r.rules.ResolveEndpoint(ctx, p)
+		if err != nil {
+			return e, err
+		}
+		cached, _ = r.cache.LoadOrStore(bucket, e)
+	}
+	e := cached.(smithyendpoints.Endpoint)
+	var props smithy.Properties
+	for k, v := range e.Properties.Values() {
+		props.Set(k, v)
+	}
+	if opts, ok := smithyauth.GetAuthOptions(&e.Properties); ok {
+		own := make([]*smithyauth.Option, len(opts))
+		for i, o := range opts {
+			c := &smithyauth.Option{SchemeID: o.SchemeID}
+			c.IdentityProperties.SetAll(&o.IdentityProperties)
+			c.SignerProperties.SetAll(&o.SignerProperties)
+			own[i] = c
+		}
+		smithyauth.SetAuthOptions(&props, own)
+	}
+	e.Properties, e.Headers = props, e.Headers.Clone()
+	return e, nil
 }
 
 // ID is the endpoint and bucket, or s3://bucket on AWS's default endpoint.
