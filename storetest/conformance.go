@@ -290,60 +290,66 @@ func Conformance(t *testing.T, s *objstore.Store) {
 				t.Fatal(err)
 			}
 		}
-		var keys []string
-		for after := ""; ; {
-			page, next, err := s.ListPage(ctx, "page/", after, 2)
-			if err != nil || len(page) > 2 {
-				t.Fatalf("ListPage: page=%v next=%q err=%v", page, next, err)
-			}
-			keys = append(keys, page...)
-			if next == "" {
-				break
-			}
-			if next <= after {
-				t.Fatalf("cursor did not advance: %q after %q", next, after)
-			}
-			after = next
-		}
-		if got, want := strings.Join(keys, ","), "page/0,page/a/1,page/a/2,page/b/1,page/c/1,page/z"; got != want {
-			t.Fatalf("paged keys = %q, want %q", got, want)
-		}
-		// after need not be a key: the page starts at the first key past it.
-		for after, want := range map[string]string{
-			"page/":     "page/0,page/a/1,page/a/2,page/b/1,page/c/1,page/z",
-			"page/a/15": "page/a/2,page/b/1,page/c/1,page/z",
-			"page/b":    "page/b/1,page/c/1,page/z",
-			"page/y":    "page/z",
-			"page/zz":   "",
-		} {
-			page, next, err := s.ListPage(ctx, "page/", after, objstore.MaxListPage)
-			if got := strings.Join(page, ","); err != nil || got != want || next != "" {
-				t.Fatalf("ListPage after %q = %q next=%q err=%v, want %q", after, got, next, err, want)
-			}
-		}
-		// Limit 1 splits every page; limit 2 and the maximum let one page
-		// of the underlying listing mix objects (page/0, page/z) with
-		// prefixes, and only the prefixes may come back.
-		for _, limit := range []int{1, 2, objstore.MaxListPage} {
-			var prefixes []string
+		// The ListPage and ListPrefixesPage cursor assume a byte-lexical server.
+		// A store without that order (R2) skips this subtest, as
+		// go test -skip '/PagedLists/LexicalCursor$'; the order-free
+		// assertions below still run.
+		t.Run("LexicalCursor", func(t *testing.T) {
+			var keys []string
 			for after := ""; ; {
-				page, next, err := s.ListPrefixesPage(ctx, "page/", after, limit)
-				if err != nil || len(page) > limit {
-					t.Fatalf("ListPrefixesPage(limit %d): page=%v next=%q err=%v", limit, page, next, err)
+				page, next, err := s.ListPage(ctx, "page/", after, 2)
+				if err != nil || len(page) > 2 {
+					t.Fatalf("ListPage: page=%v next=%q err=%v", page, next, err)
 				}
-				prefixes = append(prefixes, page...)
+				keys = append(keys, page...)
 				if next == "" {
 					break
 				}
 				if next <= after {
-					t.Fatalf("ListPrefixesPage(limit %d): cursor did not advance: %q after %q", limit, next, after)
+					t.Fatalf("cursor did not advance: %q after %q", next, after)
 				}
 				after = next
 			}
-			if got, want := strings.Join(prefixes, ","), "page/a/,page/b/,page/c/"; got != want {
-				t.Fatalf("paged prefixes (limit %d) = %q, want %q", limit, got, want)
+			if got, want := strings.Join(keys, ","), "page/0,page/a/1,page/a/2,page/b/1,page/c/1,page/z"; got != want {
+				t.Fatalf("paged keys = %q, want %q", got, want)
 			}
-		}
+			// after need not be a key: the page starts at the first key past it.
+			for after, want := range map[string]string{
+				"page/":     "page/0,page/a/1,page/a/2,page/b/1,page/c/1,page/z",
+				"page/a/15": "page/a/2,page/b/1,page/c/1,page/z",
+				"page/b":    "page/b/1,page/c/1,page/z",
+				"page/y":    "page/z",
+				"page/zz":   "",
+			} {
+				page, next, err := s.ListPage(ctx, "page/", after, objstore.MaxListPage)
+				if got := strings.Join(page, ","); err != nil || got != want || next != "" {
+					t.Fatalf("ListPage after %q = %q next=%q err=%v, want %q", after, got, next, err, want)
+				}
+			}
+			// Limit 1 splits every page; limit 2 and the maximum let one page
+			// of the underlying listing mix objects (page/0, page/z) with
+			// prefixes, and only the prefixes may come back.
+			for _, limit := range []int{1, 2, objstore.MaxListPage} {
+				var prefixes []string
+				for after := ""; ; {
+					page, next, err := s.ListPrefixesPage(ctx, "page/", after, limit)
+					if err != nil || len(page) > limit {
+						t.Fatalf("ListPrefixesPage(limit %d): page=%v next=%q err=%v", limit, page, next, err)
+					}
+					prefixes = append(prefixes, page...)
+					if next == "" {
+						break
+					}
+					if next <= after {
+						t.Fatalf("ListPrefixesPage(limit %d): cursor did not advance: %q after %q", limit, next, after)
+					}
+					after = next
+				}
+				if got, want := strings.Join(prefixes, ","), "page/a/,page/b/,page/c/"; got != want {
+					t.Fatalf("paged prefixes (limit %d) = %q, want %q", limit, got, want)
+				}
+			}
+		})
 		for _, limit := range []int{0, -1, objstore.MaxListPage + 1} {
 			if _, _, err := s.ListPage(ctx, "page/", "", limit); err == nil {
 				t.Fatalf("ListPage accepted limit %d", limit)

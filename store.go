@@ -248,7 +248,9 @@ var errListLimit = fmt.Errorf("limit must be between 1 and %d", MaxListPage)
 
 // ListPage returns at most limit (1 to MaxListPage) keys under prefix,
 // lexically after after. next is the last returned key when another page
-// remains, otherwise empty.
+// remains, otherwise empty. The after cursor assumes the server lists in
+// byte-lexical order, which R2 does not: there a page after a key can skip
+// or repeat keys. Use List, or start every page from "".
 func (s *Store) ListPage(ctx context.Context, prefix, after string, limit int) ([]string, string, error) {
 	if limit < 1 || limit > MaxListPage {
 		return nil, "", OpErr("list-page", prefix, errListLimit)
@@ -256,7 +258,8 @@ func (s *Store) ListPage(ctx context.Context, prefix, after string, limit int) (
 	return s.b.ListPage(ctx, prefix, after, limit)
 }
 
-// List returns all keys under prefix, lexically sorted.
+// List returns all keys under prefix, lexically sorted. List loads the whole
+// listing; use it only on prefixes the caller bounds.
 func (s *Store) List(ctx context.Context, prefix string) ([]string, error) {
 	if b, ok := s.b.(ListBackend); ok {
 		return sorted(b.List(ctx, prefix))

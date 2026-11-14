@@ -43,11 +43,10 @@ type Backend struct {
 // goroutine past it.
 const httpTimeout = 60 * time.Second
 
-// idleConnsPerHost is the warm connection pool to one endpoint: dotwerk's
-// widest read burst, 640 requests at once, so a burst reuses connections
-// instead of handshaking most of them again (at 64, a second 640-wide burst
-// opened 576 new ones). The pool never opens a connection; it keeps at most
-// a caller's own peak, and the transport closes those idle for 90 s.
+// idleConnsPerHost is the warm connection pool to one endpoint: a 640-wide
+// burst reopened 576 connections at 64, and none at 640. The pool never
+// opens a connection; it keeps at most a caller's own peak, and the
+// transport closes those idle for 90 s.
 const idleConnsPerHost = 640
 
 // Config selects the bucket and the S3 endpoint.
