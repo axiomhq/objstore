@@ -88,11 +88,12 @@ type storeTimeKey struct{}
 // store's time when it answered, an answer of ErrNotFound or of not
 // modified included, for a caller to compare times by the store's clock
 // rather than its own. aws/s3 and azure/blob take the response's Date
-// header, to the second (aws/s3 also serves R2's and MinIO's S3 APIs). fs,
-// mem and cloudflare/r2 take this process's clock: a file store is one
-// host's (or its clock is the one every process sharing it must keep), and
-// a Worker's clock is Cloudflare's. gcp/gcs leaves *t unchanged: its client
-// does not expose the response. One call at a time may record into t.
+// header, to the second, or this process's clock for an answer without one
+// (aws/s3 also serves R2's and MinIO's S3 APIs). fs,
+// mem, gcp/gcs and cloudflare/r2 take this process's clock: a file store is
+// one host's (or its clock is the one every process sharing it must keep),
+// gcs's client does not expose the response, and a Worker's clock is
+// Cloudflare's. One call at a time may record into t.
 func WithStoreTime(ctx context.Context, t *time.Time) context.Context {
 	return context.WithValue(ctx, storeTimeKey{}, t)
 }

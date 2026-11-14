@@ -452,9 +452,9 @@ func Conformance(t *testing.T, s *objstore.Store) {
 		}
 	})
 	// GetWithETag and GetIfChanged record the store's time (WithStoreTime),
-	// for a missing key and an unchanged one too. The test stores share
-	// this host's clock, give or take a Date header's second; a backend that
-	// cannot tell records nothing.
+	// for a missing key and an unchanged one too; every backend records one.
+	// The test stores share this host's clock, give or take a Date header's
+	// second.
 	t.Run("StoreTime", func(t *testing.T) {
 		if err := s.Put(ctx, "store-time/m", []byte("v1")); err != nil {
 			t.Fatal(err)
@@ -477,7 +477,7 @@ func Conformance(t *testing.T, s *objstore.Store) {
 			if err := read(objstore.WithStoreTime(ctx, &at)); err != nil {
 				t.Fatalf("%s: %v", name, err)
 			}
-			if d := time.Since(at); !at.IsZero() && (d < -time.Minute || d > time.Minute) {
+			if d := time.Since(at); d < -time.Minute || d > time.Minute {
 				t.Fatalf("%s: store time %v, %v from this clock", name, at, d)
 			}
 		}

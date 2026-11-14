@@ -555,6 +555,7 @@ func storeTime(ctx context.Context, out *awss3.GetObjectOutput, err error) {
 	if t == nil {
 		return
 	}
+	*t = time.Now() // an answer without a Date: this host's clock, never none
 	var response *awshttp.ResponseError
 	var metadata smithymiddleware.Metadata
 	switch {

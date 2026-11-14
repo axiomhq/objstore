@@ -268,6 +268,17 @@ func TestS3StoreTimeIsDateHeader(t *testing.T) {
 			t.Errorf("%s: store time %v, want %v: %v", name, at, date, err)
 		}
 	}
+	// An answer without a Date records this host's clock, never none.
+	s = fakeS3(t, func(w http.ResponseWriter, r *http.Request) {
+		w.Header()["Date"] = nil
+		w.Header().Set("ETag", `"e"`)
+		w.Write([]byte("x"))
+	})
+	var at time.Time
+	before := time.Now()
+	if _, _, err := s.GetWithETag(objstore.WithStoreTime(t.Context(), &at), "k"); err != nil || at.Before(before) || at.After(time.Now()) {
+		t.Errorf("no Date: store time %v, want this clock's, from %v: %v", at, before, err)
+	}
 }
 
 // TestS3ConditionalPutNotResent: a 500 can follow a commit, so a resend
