@@ -137,6 +137,7 @@ func (b *Backend) get(ctx context.Context, op, key string, opts map[string]any) 
 		opts = map[string]any{}
 	}
 	object, err := call(ctx, b.bucket, "get", key, opts)
+	objstore.RecordStoreTime(ctx) // a Worker's clock is Cloudflare's
 	if err != nil {
 		return nil, "", false, objstore.OpErr(op, key, err)
 	}

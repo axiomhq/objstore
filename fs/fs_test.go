@@ -1043,3 +1043,20 @@ func TestFSEnsureBucketReportsUnsyncableBucket(t *testing.T) {
 		t.Fatalf("refused ancestor fsync: %v, want ErrPermission", err)
 	}
 }
+
+// TestFSStoreTimeIsThisClock: a file store's time is this host's, recorded
+// for a missing key as for an object (objstore.WithStoreTime).
+func TestFSStoreTimeIsThisClock(t *testing.T) {
+	f := New(t.TempDir(), "b")
+	if err := f.EnsureBucket(t.Context()); err != nil {
+		t.Fatal(err)
+	}
+	var at time.Time
+	before := time.Now()
+	if _, _, err := f.GetWithETag(objstore.WithStoreTime(t.Context(), &at), "missing"); !errors.Is(err, objstore.ErrNotFound) {
+		t.Fatal(err)
+	}
+	if at.Before(before) || at.After(time.Now()) {
+		t.Fatalf("store time %v, want this clock's, from %v", at, before)
+	}
+}

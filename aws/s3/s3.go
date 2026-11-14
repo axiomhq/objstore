@@ -18,6 +18,7 @@ import (
 	"time"
 
 	"github.com/aws/aws-sdk-go-v2/aws"
+	awsmiddleware "github.com/aws/aws-sdk-go-v2/aws/middleware"
 	awshttp "github.com/aws/aws-sdk-go-v2/aws/transport/http"
 	"github.com/aws/aws-sdk-go-v2/config"
 	awss3 "github.com/aws/aws-sdk-go-v2/service/s3"
@@ -25,6 +26,7 @@ import (
 	"github.com/aws/smithy-go"
 	smithyauth "github.com/aws/smithy-go/auth"
 	smithyendpoints "github.com/aws/smithy-go/endpoints"
+	smithymiddleware "github.com/aws/smithy-go/middleware"
 
 	"github.com/axiomhq/objstore"
 )
@@ -535,6 +537,7 @@ func (s *Backend) DropBucket(ctx context.Context) error {
 // GetWithETag returns the object and its ETag for conditional replacement.
 func (s *Backend) GetWithETag(ctx context.Context, key string) ([]byte, string, error) {
 	out, err := s.client.GetObject(ctx, &awss3.GetObjectInput{Bucket: &s.bucket, Key: &key})
+	storeTime(ctx, out, err)
 	if err != nil {
 		return nil, "", opErr("get-with-etag", key, err)
 	}
@@ -545,6 +548,29 @@ func (s *Backend) GetWithETag(ctx context.Context, key string) ([]byte, string, 
 	return data, aws.ToString(out.ETag), nil
 }
 
+// storeTime records the Date of a GetObject's response, an error's
+// included, for objstore.WithStoreTime.
+func storeTime(ctx context.Context, out *awss3.GetObjectOutput, err error) {
+	t := objstore.StoreTimeOf(ctx)
+	if t == nil {
+		return
+	}
+	var response *awshttp.ResponseError
+	var metadata smithymiddleware.Metadata
+	switch {
+	case err == nil:
+		metadata = out.ResultMetadata
+	case errors.As(err, &response) && response.Response != nil:
+		if v, err := http.ParseTime(response.Response.Header.Get("Date")); err == nil {
+			*t = v
+		}
+		return
+	}
+	if v, ok := awsmiddleware.GetServerTime(metadata); ok {
+		*t = v
+	}
+}
+
 // GetIfChanged uses a single conditional request, including the 304 path.
 func (s *Backend) GetIfChanged(ctx context.Context, key, etag string) ([]byte, string, bool, error) {
 	in := &awss3.GetObjectInput{Bucket: &s.bucket, Key: &key}
@@ -552,6 +578,7 @@ func (s *Backend) GetIfChanged(ctx context.Context, key, etag string) ([]byte, s
 		in.IfNoneMatch = &etag
 	}
 	out, err := s.client.GetObject(ctx, in)
+	storeTime(ctx, out, err)
 	if err != nil {
 		var response *awshttp.ResponseError
 		if etag != "" && errors.As(err, &response) && response.HTTPStatusCode() == http.StatusNotModified {

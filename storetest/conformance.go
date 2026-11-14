@@ -451,6 +451,37 @@ func Conformance(t *testing.T, s *objstore.Store) {
 			t.Fatalf("state after races: %q %q", data, tag2)
 		}
 	})
+	// GetWithETag and GetIfChanged record the store's time (WithStoreTime),
+	// for a missing key and an unchanged one too. The test stores share
+	// this host's clock, give or take a Date header's second; a backend that
+	// cannot tell records nothing.
+	t.Run("StoreTime", func(t *testing.T) {
+		if err := s.Put(ctx, "store-time/m", []byte("v1")); err != nil {
+			t.Fatal(err)
+		}
+		_, tag, err := s.GetWithETag(ctx, "store-time/m")
+		if err != nil {
+			t.Fatal(err)
+		}
+		for name, read := range map[string]func(context.Context) error{
+			"GetWithETag": func(ctx context.Context) error { _, _, err := s.GetWithETag(ctx, "store-time/m"); return err },
+			"GetWithETag missing": func(ctx context.Context) error {
+				if _, _, err := s.GetWithETag(ctx, "store-time/none"); !errors.Is(err, objstore.ErrNotFound) {
+					return fmt.Errorf("want ErrNotFound, got %v", err)
+				}
+				return nil
+			},
+			"GetIfChanged unchanged": func(ctx context.Context) error { _, _, _, err := s.GetIfChanged(ctx, "store-time/m", tag); return err },
+		} {
+			var at time.Time
+			if err := read(objstore.WithStoreTime(ctx, &at)); err != nil {
+				t.Fatalf("%s: %v", name, err)
+			}
+			if d := time.Since(at); !at.IsZero() && (d < -time.Minute || d > time.Minute) {
+				t.Fatalf("%s: store time %v, %v from this clock", name, at, d)
+			}
+		}
+	})
 	// CAS on a missing key: the precondition cannot hold. MinIO creates the
 	// object on PutIfMatch for a missing key, while AWS S3 and R2 answer
 	// 404, so the MinIO CI job skips this subtest by name.

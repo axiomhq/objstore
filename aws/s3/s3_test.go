@@ -235,6 +235,41 @@ func TestS3ConditionalPutVerdicts(t *testing.T) {
 	}
 }
 
+// TestS3StoreTimeIsDateHeader: GetWithETag and GetIfChanged record the
+// response's Date header, an hour from this clock here, for an object, a
+// missing key and an unchanged one.
+func TestS3StoreTimeIsDateHeader(t *testing.T) {
+	date := time.Now().Add(-time.Hour).UTC().Truncate(time.Second)
+	s := fakeS3(t, func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Date", date.Format(http.TimeFormat))
+		switch {
+		case strings.HasSuffix(r.URL.Path, "/missing"):
+			s3Error(w, http.StatusNotFound, "NoSuchKey")
+		case r.Header.Get("If-None-Match") != "":
+			w.WriteHeader(http.StatusNotModified)
+		default:
+			w.Header().Set("ETag", `"e"`)
+			w.Write([]byte("x"))
+		}
+	})
+	for name, read := range map[string]func(context.Context) error{
+		"object": func(ctx context.Context) error { _, _, err := s.GetWithETag(ctx, "k"); return err },
+		"missing": func(ctx context.Context) error {
+			_, _, err := s.GetWithETag(ctx, "missing")
+			if !errors.Is(err, objstore.ErrNotFound) {
+				return err
+			}
+			return nil
+		},
+		"unchanged": func(ctx context.Context) error { _, _, _, err := s.GetIfChanged(ctx, "k", `"e"`); return err },
+	} {
+		var at time.Time
+		if err := read(objstore.WithStoreTime(t.Context(), &at)); err != nil || !at.Equal(date) {
+			t.Errorf("%s: store time %v, want %v: %v", name, at, date, err)
+		}
+	}
+}
+
 // TestS3ConditionalPutNotResent: a 500 can follow a commit, so a resend
 // would meet our own write as a 412 and report a won race as lost.
 func TestS3ConditionalPutNotResent(t *testing.T) {

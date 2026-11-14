@@ -427,6 +427,7 @@ func (f *Backend) get(ctx context.Context, key string) ([]byte, error) {
 // GetWithETag reads the object at key and its ETag, the hex SHA-256 of its
 // content.
 func (f *Backend) GetWithETag(ctx context.Context, key string) ([]byte, string, error) {
+	objstore.RecordStoreTime(ctx) // a file store is one host's; see WithStoreTime
 	data, err := f.get(ctx, key)
 	if err != nil {
 		return nil, "", objstore.OpErr("get-with-etag", key, err)

@@ -81,3 +81,33 @@ func (t *Timings) Attrs() []slog.Attr {
 	}
 	return out
 }
+
+type storeTimeKey struct{}
+
+// WithStoreTime has a GetWithETag or GetIfChanged under ctx set *t to the
+// store's time when it answered, an answer of ErrNotFound or of not
+// modified included, for a caller to compare times by the store's clock
+// rather than its own. aws/s3 and azure/blob take the response's Date
+// header, to the second (aws/s3 also serves R2's and MinIO's S3 APIs). fs,
+// mem and cloudflare/r2 take this process's clock: a file store is one
+// host's (or its clock is the one every process sharing it must keep), and
+// a Worker's clock is Cloudflare's. gcp/gcs leaves *t unchanged: its client
+// does not expose the response. One call at a time may record into t.
+func WithStoreTime(ctx context.Context, t *time.Time) context.Context {
+	return context.WithValue(ctx, storeTimeKey{}, t)
+}
+
+// StoreTimeOf returns the time ctx records into (WithStoreTime), or nil.
+// For backends.
+func StoreTimeOf(ctx context.Context) *time.Time {
+	t, _ := ctx.Value(storeTimeKey{}).(*time.Time)
+	return t
+}
+
+// RecordStoreTime records now into the time ctx carries, if any. For
+// backends whose clock is the store's.
+func RecordStoreTime(ctx context.Context) {
+	if t := StoreTimeOf(ctx); t != nil {
+		*t = time.Now()
+	}
+}

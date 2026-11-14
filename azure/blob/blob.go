@@ -166,6 +166,11 @@ func (b *Backend) GetIfChanged(ctx context.Context, key, etag string) ([]byte, s
 	// Capture the wire status rather than mistaking an empty 200 for 304.
 	var response *http.Response
 	o, err := b.download(policy.WithCaptureResponse(ctx, &response), key, opts)
+	if t := objstore.StoreTimeOf(ctx); t != nil && response != nil {
+		if v, err := http.ParseTime(response.Header.Get("Date")); err == nil {
+			*t = v // for objstore.WithStoreTime
+		}
+	}
 	if etag != "" && response != nil && response.StatusCode == http.StatusNotModified {
 		return nil, etag, true, nil
 	}
