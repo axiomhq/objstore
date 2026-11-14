@@ -203,7 +203,10 @@ func (l *Log) readHead(ctx context.Context) (logHead, string, error) {
 	if err := decodeLogJSON(p, &h); err != nil {
 		return h, "", err
 	}
-	valid := (h.Format == 1 || h.Format == headFormat) && h.Prefix == l.prefix && logHex(h.Revision, 32) && logHex(h.Incarnation, 32)
+	if h.Format != 1 && h.Format != headFormat {
+		return h, "", fmt.Errorf("%w: HEAD format %d; this binary reads 1 and %d", ErrCorrupt, h.Format, headFormat)
+	}
+	valid := h.Prefix == l.prefix && logHex(h.Revision, 32) && logHex(h.Incarnation, 32)
 	valid = valid && (h.Owner == "" || logHex(h.Owner, 32)) && h.Tip.incarnation == h.Incarnation
 	valid = valid && (l.genesis == (Cursor{}) || h.Incarnation == l.genesis.incarnation)
 	valid = valid && (h.Tip.sequence != 0 || h.Tip == l.genesisFor(h.Incarnation))

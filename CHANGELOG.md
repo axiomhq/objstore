@@ -10,6 +10,7 @@
 
 ### Fixed
 
+- **wal**: a HEAD of a format this binary does not read, such as 3, is still `ErrCorrupt`, and the error now names it and the formats the binary reads (`HEAD format 3; this binary reads 1 and 2`) instead of `invalid owned HEAD`.
 - **wal**: a failed read of an accepted descriptor or page is `ErrCorrupt` only when the object is missing or short. Timeouts, cancellation and access errors no longer wrap `ErrCorrupt`, which callers treat as permanent.
 - **fs**: keys with `.lock` or `.tmp-*` in any element are `ErrInvalidKey`, not only the last. Such a key made a directory that shadowed the lock file and failed every later write. `GetRange` returns `ErrRange` for a negative offset or length instead of an OS error or a panic.
 

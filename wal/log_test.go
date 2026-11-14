@@ -1032,3 +1032,34 @@ func (b *slowReads) GetWithETag(ctx context.Context, key string) ([]byte, string
 	}
 	return b.Backend.GetWithETag(ctx, key)
 }
+
+// A HEAD of a later format is refused, naming the format it has and those
+// this binary reads; formats 1 and 2 open.
+func TestLogHeadFormat(t *testing.T) {
+	for _, format := range []int{1, 2, 3} {
+		store := mem.Open(objstore.Config{})
+		openOwned(t, store, "log/")
+		p, err := store.Get(t.Context(), "log/HEAD")
+		if err != nil {
+			t.Fatal(err)
+		}
+		var h map[string]any
+		if err := json.Unmarshal(p, &h); err != nil || h["format"] != float64(2) {
+			t.Fatalf("new HEAD %s: %v", p, err)
+		}
+		h["format"] = format
+		if p, err = json.Marshal(h); err != nil {
+			t.Fatal(err)
+		}
+		if err := store.Put(t.Context(), "log/HEAD", p); err != nil {
+			t.Fatal(err)
+		}
+		_, err = wal.OpenLog(t.Context(), store, "log/", []byte("configuration"))
+		if format < 3 && err != nil {
+			t.Fatalf("format %d: %v", format, err)
+		}
+		if format == 3 && (!errors.Is(err, wal.ErrCorrupt) || !strings.Contains(err.Error(), "HEAD format 3; this binary reads 1 and 2")) {
+			t.Fatalf("format 3: %v", err)
+		}
+	}
+}
