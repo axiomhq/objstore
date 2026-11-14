@@ -100,6 +100,30 @@ func (p *paced) ListPrefixesPage(ctx context.Context, prefix, after string, limi
 	return p.Backend.ListPrefixesPage(ctx, prefix, after, limit)
 }
 
+// List and ListPrefixes wait once, though a listing can span pages.
+// ponytail: pace each page if a provider's list rate limit is ever hit.
+func (p *paced) List(ctx context.Context, prefix string) ([]string, error) {
+	b, ok := p.Backend.(ListBackend)
+	if !ok {
+		return paginate(ctx, prefix, p.ListPage)
+	}
+	if err := p.wait(ctx); err != nil {
+		return nil, err
+	}
+	return b.List(ctx, prefix)
+}
+
+func (p *paced) ListPrefixes(ctx context.Context, prefix string) ([]string, error) {
+	b, ok := p.Backend.(ListBackend)
+	if !ok {
+		return paginate(ctx, prefix, p.ListPrefixesPage)
+	}
+	if err := p.wait(ctx); err != nil {
+		return nil, err
+	}
+	return b.ListPrefixes(ctx, prefix)
+}
+
 func (p *paced) Delete(ctx context.Context, key string) error {
 	if err := p.wait(ctx); err != nil {
 		return err

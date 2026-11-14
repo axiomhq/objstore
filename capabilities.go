@@ -45,6 +45,16 @@ type ReaderBackend interface {
 	NewReader(ctx context.Context, key string, offset, length int64) (io.ReadCloser, error)
 }
 
+// ListBackend is the optional whole-listing capability, for a backend whose
+// server pages by its own cursor and does not promise lexical order, so
+// paging ListPage by the last key returned could skip or repeat keys. It
+// returns every key (or child prefix, as ListPrefixesPage) under prefix
+// exactly once, in any order; Store sorts them. Wrappers must forward it.
+type ListBackend interface {
+	List(ctx context.Context, prefix string) ([]string, error)
+	ListPrefixes(ctx context.Context, prefix string) ([]string, error)
+}
+
 // StatBackend is the optional object metadata capability.
 type StatBackend interface {
 	Stat(ctx context.Context, key string) (ObjectInfo, error)

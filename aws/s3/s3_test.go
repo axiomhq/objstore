@@ -386,6 +386,35 @@ func TestS3ListPrefixesPageSkipsPrefixlessPages(t *testing.T) {
 	}
 }
 
+// List and ListPrefixes follow the server's continuation token and never
+// page by StartAfter, which on a server that is not byte-lexical (R2) skips
+// or repeats keys. The Store returns them sorted.
+func TestS3ListFollowsContinuationTokens(t *testing.T) {
+	pages := map[string]string{
+		"":   `<IsTruncated>true</IsTruncated><NextContinuationToken>t1</NextContinuationToken><Contents><Key>ns/b</Key></Contents><Contents><Key>ns/c</Key></Contents><CommonPrefixes><Prefix>ns/z/</Prefix></CommonPrefixes>`,
+		"t1": `<IsTruncated>false</IsTruncated><Contents><Key>ns/a</Key></Contents><CommonPrefixes><Prefix>ns/y/</Prefix></CommonPrefixes>`,
+	}
+	b := fakeS3(t, func(w http.ResponseWriter, r *http.Request) {
+		q := r.URL.Query()
+		body, ok := pages[q.Get("continuation-token")]
+		if q.Get("list-type") != "2" || q.Has("start-after") || !ok {
+			t.Errorf("unexpected request %s %s", r.Method, r.URL)
+			s3Error(w, http.StatusBadRequest, "InvalidRequest")
+			return
+		}
+		fmt.Fprint(w, `<?xml version="1.0"?><ListBucketResult>`+body+`</ListBucketResult>`)
+	})
+	s := objstore.Open(b, objstore.Config{})
+	keys, err := s.List(t.Context(), "ns/")
+	if err != nil || !slices.Equal(keys, []string{"ns/a", "ns/b", "ns/c"}) {
+		t.Fatalf("List = %v, %v", keys, err)
+	}
+	prefixes, err := s.ListPrefixes(t.Context(), "ns/")
+	if err != nil || !slices.Equal(prefixes, []string{"ns/y/", "ns/z/"}) {
+		t.Fatalf("ListPrefixes = %v, %v", prefixes, err)
+	}
+}
+
 func TestS3ConditionalRead(t *testing.T) {
 	for _, tc := range []struct {
 		name, etag string

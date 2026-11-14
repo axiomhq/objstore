@@ -3,6 +3,7 @@ package storetest
 import (
 	"context"
 	"errors"
+	"fmt"
 	"strings"
 	"sync"
 	"testing"
@@ -351,6 +352,42 @@ func Conformance(t *testing.T, s *objstore.Store) {
 				t.Fatalf("ListPrefixesPage accepted limit %d", limit)
 			}
 		}
+		// List and ListPrefixes past one server page (1,000 keys). A server
+		// need not return keys in byte-lexical order (R2 does not), so this
+		// asserts what holds on any order: every key and every child prefix
+		// exactly once, none missing, none repeated, and the listing ends;
+		// the Store then sorts them. The ListPage assertions above assume
+		// lexical server order and fail on a server without it.
+		const many = objstore.MaxListPage + 100
+		want := make([]string, many)
+		wantPrefixes := make([]string, many)
+		var wg sync.WaitGroup
+		errs := make(chan error, many)
+		sem := make(chan struct{}, 32)
+		for i := range many {
+			wantPrefixes[i] = fmt.Sprintf("many/%04d/", i)
+			want[i] = wantPrefixes[i] + "x"
+			sem <- struct{}{}
+			wg.Go(func() {
+				defer func() { <-sem }()
+				if err := s.Put(ctx, want[i], []byte("x")); err != nil {
+					errs <- err
+				}
+			})
+		}
+		wg.Wait()
+		close(errs)
+		if err := <-errs; err != nil {
+			t.Fatal(err)
+		}
+		keys, err := s.List(ctx, "many/")
+		if err != nil || strings.Join(keys, ",") != strings.Join(want, ",") {
+			t.Fatalf("List of %d keys: %d keys, err %v; first wrong at %d", many, len(keys), err, firstDiff(keys, want))
+		}
+		prefixes, err := s.ListPrefixes(ctx, "many/")
+		if err != nil || strings.Join(prefixes, ",") != strings.Join(wantPrefixes, ",") {
+			t.Fatalf("ListPrefixes of %d prefixes: %d prefixes, err %v; first wrong at %d", many, len(prefixes), err, firstDiff(prefixes, wantPrefixes))
+		}
 	})
 	// Every error leaving a backend names the operation and the key. A bare
 	// SDK/syscall error names neither, so a failure surfaced three layers up
@@ -540,4 +577,14 @@ func Conformance(t *testing.T, s *objstore.Store) {
 			})
 		}
 	})
+}
+
+// firstDiff is the first index where got and want differ, or -1.
+func firstDiff(got, want []string) int {
+	for i := range max(len(got), len(want)) {
+		if i >= len(got) || i >= len(want) || got[i] != want[i] {
+			return i
+		}
+	}
+	return -1
 }

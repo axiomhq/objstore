@@ -7,6 +7,7 @@ import (
 	"errors"
 	"fmt"
 	"math"
+	"slices"
 	"time"
 
 	"golang.org/x/sync/semaphore"
@@ -257,6 +258,9 @@ func (s *Store) ListPage(ctx context.Context, prefix, after string, limit int) (
 
 // List returns all keys under prefix, lexically sorted.
 func (s *Store) List(ctx context.Context, prefix string) ([]string, error) {
+	if b, ok := s.b.(ListBackend); ok {
+		return sorted(b.List(ctx, prefix))
+	}
 	return paginate(ctx, prefix, s.ListPage)
 }
 
@@ -266,7 +270,15 @@ func (s *Store) List(ctx context.Context, prefix string) ([]string, error) {
 // instead of one key per object in the bucket. A prefix appears
 // only if at least one object lives under it, on every backend.
 func (s *Store) ListPrefixes(ctx context.Context, prefix string) ([]string, error) {
+	if b, ok := s.b.(ListBackend); ok {
+		return sorted(b.ListPrefixes(ctx, prefix))
+	}
 	return paginate(ctx, prefix, s.ListPrefixesPage)
+}
+
+func sorted(keys []string, err error) ([]string, error) {
+	slices.Sort(keys)
+	return keys, err
 }
 
 func paginate(ctx context.Context, prefix string, listPage func(context.Context, string, string, int) ([]string, string, error)) ([]string, error) {

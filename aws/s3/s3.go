@@ -307,6 +307,40 @@ func (s *Backend) ListPage(ctx context.Context, prefix, after string, limit int)
 	return keys, "", nil
 }
 
+// List pages ListObjectsV2 by the server's continuation token, not by
+// StartAfter: R2 does not return keys in byte-lexical order, so starting a
+// page after the last key returned can skip or repeat keys, or loop.
+func (s *Backend) List(ctx context.Context, prefix string) ([]string, error) {
+	var keys []string
+	pages := awss3.NewListObjectsV2Paginator(s.client, &awss3.ListObjectsV2Input{Bucket: &s.bucket, Prefix: &prefix})
+	for pages.HasMorePages() {
+		page, err := pages.NextPage(ctx)
+		if err != nil {
+			return nil, opErr("list", prefix, err)
+		}
+		for _, obj := range page.Contents {
+			keys = append(keys, *obj.Key)
+		}
+	}
+	return keys, nil
+}
+
+// ListPrefixes is List of the common prefixes one level under prefix.
+func (s *Backend) ListPrefixes(ctx context.Context, prefix string) ([]string, error) {
+	var out []string
+	pages := awss3.NewListObjectsV2Paginator(s.client, &awss3.ListObjectsV2Input{Bucket: &s.bucket, Prefix: &prefix, Delimiter: aws.String("/")})
+	for pages.HasMorePages() {
+		page, err := pages.NextPage(ctx)
+		if err != nil {
+			return nil, opErr("list-prefixes", prefix, err)
+		}
+		for _, cp := range page.CommonPrefixes {
+			out = append(out, *cp.Prefix)
+		}
+	}
+	return out, nil
+}
+
 // ListPrefixesPage asks S3 for the common prefixes one level under prefix: with
 // Delimiter "/" the server collapses everything below each child prefix, so
 // discovery costs one request per 1000 namespaces instead of one key per
