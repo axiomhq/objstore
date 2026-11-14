@@ -90,6 +90,9 @@ type Snapshot struct {
 	// Descriptor bytes read ahead (Head.Snapshot), by cursor; Replay uses
 	// one only when its walk reaches that exact cursor.
 	read map[Cursor][]byte
+	// Page bytes read ahead, by group cursor and page; Batch.Read uses one
+	// only when its descriptor's size and hash match.
+	pages map[Cursor][][]byte
 }
 
 func (s Snapshot) Cursor() Cursor   { return s.cursor }
@@ -121,6 +124,17 @@ type logHead struct {
 	// walking back from Tip one at a time. Set once per publication,
 	// before the first PUT attempt; every other path copies it unchanged.
 	Recent []Cursor `json:"recent,omitempty"`
+	// Pages, beside Recent, addresses each recent group's pages, so a reader
+	// reads them in the round it reads the descriptors.
+	Pages []recentPages `json:"pages,omitempty"`
+}
+
+// recentPages addresses one group's pages: the owner and first page sequence
+// that name their keys, and each page's size.
+type recentPages struct {
+	Owner string `json:"owner"`
+	First uint64 `json:"first"`
+	Bytes []int  `json:"bytes"`
 }
 
 // maxRecent bounds HEAD's Recent: about 110 bytes of HEAD a tip.
@@ -194,6 +208,13 @@ func (l *Log) readHead(ctx context.Context) (logHead, string, error) {
 	for i, c := range h.Recent {
 		valid = valid && c.valid() && c.incarnation == h.Incarnation && c.sequence > 0 && (i == 0 || c.sequence == h.Recent[i-1].sequence+1)
 	}
+	valid = valid && (len(h.Pages) == 0 || len(h.Pages) == len(h.Recent))
+	for _, g := range h.Pages {
+		valid = valid && logHex(g.Owner, 32) && g.First > 0 && len(g.Bytes) > 0 && uint64(len(g.Bytes)) <= math.MaxUint64-g.First
+		for _, n := range g.Bytes {
+			valid = valid && n > 0 && n <= maxPageBytes
+		}
+	}
 	if !valid || len(h.Configuration) > maxLogConfig {
 		return h, "", fmt.Errorf("%w: invalid owned HEAD", ErrCorrupt)
 	}
@@ -218,12 +239,13 @@ type Head struct {
 	log    *Log
 	tip    Cursor
 	recent []Cursor
+	pages  []recentPages
 }
 
 // ReadHead reads HEAD once, for Head.Snapshot.
 func (l *Log) ReadHead(ctx context.Context) (Head, error) {
 	h, _, err := l.readHead(ctx)
-	return Head{log: l, tip: h.Tip, recent: h.Recent}, err
+	return Head{log: l, tip: h.Tip, recent: h.Recent, pages: h.Pages}, err
 }
 
 // Cursor is the head's tip.
@@ -233,10 +255,13 @@ func (h Head) Cursor() Cursor { return h.tip }
 // every descriptor h lists after from, oldest first while their Replay cost
 // stays within maxSummaryBytes, so a Replay from from through it reads none
 // of them again: one round for the whole listed tail instead of one per
-// group. A listed cursor is used only where the walk back from the tip
-// reaches it; descriptors are content-addressed, so a wrong list costs reads,
-// never a wrong descriptor.
-func (h Head) Snapshot(ctx context.Context, from Cursor, maxSummaryBytes int64) (Snapshot, error) {
+// group. In the same round it reads those groups' pages, oldest first while
+// their bytes stay within maxPageBytes, which their Batch.Read then uses. A
+// listed cursor is used only where the walk back from the tip reaches it,
+// and a page only where its descriptor's size and hash match; descriptors
+// and pages are checked as when read, so a wrong list costs reads, never a
+// wrong descriptor or page.
+func (h Head) Snapshot(ctx context.Context, from Cursor, maxSummaryBytes, maxPageBytes int64) (Snapshot, error) {
 	l := h.log
 	if h.tip == l.genesis {
 		return Snapshot{log: l, cursor: h.tip}, nil
@@ -253,8 +278,33 @@ func (h Head) Snapshot(ctx context.Context, from Cursor, maxSummaryBytes int64) 
 		ahead = append(ahead, c)
 	}
 	read := make(map[Cursor][]byte, len(ahead))
+	pages := make(map[Cursor][][]byte)
 	var mu sync.Mutex
 	var wg sync.WaitGroup
+	var pageBytes int64
+	for i, c := range h.recent {
+		if len(h.pages) != len(h.recent) || c.sequence <= from.sequence || !slices.Contains(ahead, c) {
+			continue
+		}
+		g := h.pages[i]
+		for _, n := range g.Bytes {
+			pageBytes += int64(n)
+		}
+		if pageBytes > maxPageBytes {
+			break
+		}
+		ps := make([][]byte, len(g.Bytes))
+		pages[c] = ps
+		for j, n := range g.Bytes {
+			wg.Go(func() {
+				key := Key(l.prefix+"owners/"+g.Owner+"/", g.First+uint64(j))
+				// A failed read ahead is left to Batch.Read, which reads it again.
+				if p, err := l.store.GetRange(ctx, key, 0, int64(n)); err == nil {
+					ps[j] = p
+				}
+			})
+		}
+	}
 	for _, c := range ahead {
 		wg.Go(func() {
 			// A failed read ahead is left to Replay, which reads it again.
@@ -270,7 +320,7 @@ func (h Head) Snapshot(ctx context.Context, from Cursor, maxSummaryBytes int64) 
 	if err != nil {
 		return Snapshot{}, err
 	}
-	return Snapshot{log: l, cursor: h.tip, metadata: bytes.Clone(d.Metadata[len(d.Metadata)-1]), read: read}, nil
+	return Snapshot{log: l, cursor: h.tip, metadata: bytes.Clone(d.Metadata[len(d.Metadata)-1]), read: read, pages: pages}, nil
 }
 
 func (l *Log) snapshot(ctx context.Context, c Cursor) (Snapshot, error) {
@@ -607,6 +657,16 @@ func (s *Session) publish(ctx context.Context, b *batch[logRecord], first uint64
 	h.Tip = c
 	// Once, before the first PUT attempt: a resend sends the same bytes.
 	h.Recent = append(slices.Clone(s.head.Recent[max(0, len(s.head.Recent)-maxRecent+1):]), c)
+	g := recentPages{Owner: d.Owner, First: d.First, Bytes: make([]int, len(d.Pages))}
+	for i, p := range d.Pages {
+		g.Bytes[i] = p.Bytes
+	}
+	prev := s.head.Pages
+	if len(prev) != len(s.head.Recent) {
+		// A list from before pages: both start again at this group.
+		prev, h.Recent = nil, h.Recent[len(h.Recent)-1:]
+	}
+	h.Pages = append(slices.Clone(prev[max(0, len(prev)-maxRecent+1):]), g)
 	tag, terminal, err := s.log.swapHead(ctx, h, s.etag)
 	if err != nil {
 		return err
@@ -728,6 +788,7 @@ type Batch struct {
 	log        *Log
 	cursor     Cursor
 	descriptor *logDescriptor
+	pages      [][]byte // read ahead, by page; nil entries are read
 }
 
 func (b Batch) Cursor() Cursor { return b.cursor }
@@ -763,9 +824,14 @@ func (b Batch) Read(ctx context.Context) ([][]byte, error) {
 		key := Key(b.log.prefix+"owners/"+d.Owner+"/", d.First+uint64(i))
 		// The accepted descriptor fixes the exact range; a corrupt object
 		// cannot force an unbounded Get allocation.
-		p, err := b.log.store.GetRange(ctx, key, 0, int64(page.Bytes))
-		if err != nil {
-			return nil, readErr("accepted page", err)
+		var p []byte
+		if i < len(b.pages) && len(b.pages[i]) == page.Bytes && logHash(b.pages[i]) == page.Hash {
+			p = b.pages[i]
+		} else {
+			var err error
+			if p, err = b.log.store.GetRange(ctx, key, 0, int64(page.Bytes)); err != nil {
+				return nil, readErr("accepted page", err)
+			}
 		}
 		if len(p) != page.Bytes || logHash(p) != page.Hash {
 			return nil, fmt.Errorf("%w: page hash", ErrCorrupt)
@@ -825,7 +891,7 @@ func (l *Log) Replay(ctx context.Context, from Cursor, through Snapshot, maxSumm
 			return err
 		}
 		used += cost
-		chain = append(chain, Batch{log: l, cursor: c, descriptor: d})
+		chain = append(chain, Batch{log: l, cursor: c, descriptor: d, pages: through.pages[c]})
 		c = d.Previous
 	}
 	for i := len(chain) - 1; i >= 0; i-- {

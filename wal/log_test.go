@@ -917,10 +917,11 @@ func TestLogReadErrorIsCorruptOnlyWhenObjectMissing(t *testing.T) {
 	}
 }
 
-// TestLogHeadListsRecentTips: HEAD lists its newest tips, across a takeover,
-// so a snapshot reads every listed descriptor after a cursor in one round
-// beside the tip's, and a replay from there reads none of them again; only
-// groups older than the list are walked one round each.
+// TestLogHeadListsRecentTips: HEAD lists its newest tips and their pages,
+// across a takeover, so a snapshot reads every listed descriptor after a
+// cursor and their pages in one round beside the tip's, and a replay from
+// there reads none of them again; only groups older than the list are
+// walked one round each, and their pages read as each batch is.
 func TestLogHeadListsRecentTips(t *testing.T) {
 	for _, groups := range []int{1, 5, 70} {
 		synctest.Test(t, func(t *testing.T) {
@@ -949,25 +950,27 @@ func TestLogHeadListsRecentTips(t *testing.T) {
 			if err != nil {
 				t.Fatal(err)
 			}
-			snap, err := h.Snapshot(t.Context(), l.Genesis(), 64<<20)
+			snap, err := h.Snapshot(t.Context(), l.Genesis(), 64<<20, 64<<20)
 			if err != nil {
 				t.Fatal(err)
 			}
 			var got []string
 			err = l.Replay(t.Context(), l.Genesis(), snap, 64<<20, func(b wal.Batch) error {
-				got = append(got, fmt.Sprint(b.Cursor().Sequence()))
-				return nil
+				records, err := b.Read(t.Context())
+				for _, r := range records {
+					got = append(got, string(r))
+				}
+				return err
 			})
 			rounds := int(time.Since(t0) / time.Second)
 			slow.Store(false)
-			if err != nil || len(got) != groups {
-				t.Fatalf("replayed %v, %v", got, err)
+			if err != nil || !reflect.DeepEqual(got, want) {
+				t.Fatalf("records %v, %v; want %v", got, err, want)
 			}
-			if records := replayOwned(t, l, snap); !reflect.DeepEqual(records, want) {
-				t.Fatalf("records %v, want %v", records, want)
-			}
-			// HEAD, then the listed descriptors, then one round per older group.
-			if wantRounds := 2 + max(0, groups-64); rounds != wantRounds {
+			// HEAD, then the listed descriptors and their pages; a group
+			// older than the list costs a round for its descriptor and one
+			// for its pages, read in the callback.
+			if wantRounds := 2 + 2*max(0, groups-64); rounds != wantRounds {
 				t.Fatalf("%d groups: %d rounds, want %d", groups, rounds, wantRounds)
 			}
 		})
