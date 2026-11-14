@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"context"
 	"fmt"
+	"io"
 	"net/http"
 	"net/http/httptest"
 	"reflect"
@@ -50,6 +51,10 @@ func (c *checkedEndpoint) ResolveEndpoint(ctx context.Context, p awss3.EndpointP
 // part of the endpoint mutable fails here.
 func TestEndpointCacheMatchesRules(t *testing.T) {
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		// Read the body: answering an 8 MiB part unread closes the
+		// connection under a client still writing it, and a starved client
+		// then fails the part (broken pipe) and aborts the upload.
+		io.Copy(io.Discard, r.Body)
 		q := r.URL.Query()
 		w.Header().Set("ETag", `"e"`)
 		switch {
@@ -109,6 +114,8 @@ func TestEndpointCacheMatchesRules(t *testing.T) {
 		},
 		func() { b.Upload(ctx, "k", bytes.NewReader([]byte("x")), objstore.UploadOptions{Size: &small}) },
 		func() { b.Upload(ctx, "k", bytes.NewReader(make([]byte, large)), objstore.UploadOptions{Size: &large}) },
+		// A body short of its size aborts the multipart upload.
+		func() { b.Upload(ctx, "k", bytes.NewReader(nil), objstore.UploadOptions{Size: &large}) },
 		func() { b.UploadIfAbsent(ctx, "k", bytes.NewReader([]byte("x")), objstore.UploadOptions{Size: &small}) },
 		func() {
 			b.UploadIfMatch(ctx, "k", bytes.NewReader([]byte("x")), "e", objstore.UploadOptions{Size: &small})
@@ -130,7 +137,7 @@ func TestEndpointCacheMatchesRules(t *testing.T) {
 			}
 		}
 	})
-	want := "CompleteMultipartUpload,CreateBucket,CreateMultipartUpload,DeleteBucket,DeleteObject,DeleteObjects,GetObject,HeadBucket,HeadObject,ListObjectsV2,PutObject,UploadPart"
+	want := "AbortMultipartUpload,CompleteMultipartUpload,CreateBucket,CreateMultipartUpload,DeleteBucket,DeleteObject,DeleteObjects,GetObject,HeadBucket,HeadObject,ListObjectsV2,PutObject,UploadPart"
 	if got := strings.Join(ops, ","); got != want {
 		t.Errorf("operations resolved %s, want %s", got, want)
 	}
