@@ -586,6 +586,53 @@ func TestS3GetRangeContentRangeGuard(t *testing.T) {
 	}
 }
 
+// A body cut off after its headers, as R2 sent once in about a million
+// ranged GETs (a 206 promising 512 bytes, then the connection closed), is
+// transient: the same GET a moment later returns the whole object. The SDK
+// retries failed responses but not a body that ends short, so the read
+// should retry it rather than fail its caller.
+func TestS3GetRetriesShortBody(t *testing.T) {
+	const object = "0123456789"
+	for _, tc := range []struct {
+		name string
+		get  func(s *Backend) ([]byte, error)
+		want string
+	}{
+		{"get", func(s *Backend) ([]byte, error) { return s.Get(context.Background(), "k") }, object},
+		{"get-range", func(s *Backend) ([]byte, error) { return s.GetRange(context.Background(), "k", 2, 4) }, object[2:6]},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			var attempts atomic.Int32
+			s := fakeS3(t, func(w http.ResponseWriter, r *http.Request) {
+				body := object
+				if r.Header.Get("Range") != "" {
+					body = object[2:6]
+					w.Header().Set("Content-Range", "bytes 2-5/10")
+					w.Header().Set("Content-Length", fmt.Sprint(len(body)))
+					w.WriteHeader(http.StatusPartialContent)
+				} else {
+					w.Header().Set("Content-Length", fmt.Sprint(len(body)))
+				}
+				if attempts.Add(1) == 1 {
+					w.(http.Flusher).Flush()
+					conn, _, err := w.(http.Hijacker).Hijack()
+					if err != nil {
+						t.Error(err)
+						return
+					}
+					conn.Close()
+					return
+				}
+				fmt.Fprint(w, body)
+			})
+			data, err := tc.get(s)
+			if err != nil || string(data) != tc.want {
+				t.Fatalf("after %d attempt(s): got %q, %v; want %q", attempts.Load(), data, err, tc.want)
+			}
+		})
+	}
+}
+
 // TestS3DropBucketMissingBucket: DropBucket on a bucket that is already
 // gone succeeds, whether the list or the final DeleteBucket finds it
 // missing; any other failure still surfaces.
