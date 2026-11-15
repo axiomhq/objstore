@@ -43,7 +43,9 @@ without deleting any objects. Streaming, signing and per-object KMS overrides
 are unsupported. Context cancellation prevents dispatch, but R2 offers no
 AbortSignal option: dispatched Promises are awaited and write errors may be
 ambiguous. Go callers must run outside synchronous JS callbacks so the event
-loop can resolve those Promises.
+loop can resolve those Promises. A read whose stream breaks fails: the runtime
+rejects `arrayBuffer()`, so the binding never returns a short body, and
+objstore does not retry it (unlike s3's cut-body retry).
 
 For Azure, construct an SDK `*container.Client` with your credentials, retry and
 transport options, then call `blob.Open(blob.Config{Client: client}, cfg)`.
