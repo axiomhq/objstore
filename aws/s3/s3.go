@@ -271,7 +271,7 @@ func readBody(op, key string, body io.ReadCloser, contentLength *int64) ([]byte,
 		// longer than ContentLength is as wrong as a short one.
 		var extra [1]byte
 		if _, err := io.ReadFull(body, extra[:]); err == nil {
-			return nil, objstore.OpErr(op, key, fmt.Errorf("long read: body exceeds ContentLength %d", *contentLength))
+			return nil, objstore.OpErr(op, key, fmt.Errorf("%w: body exceeds ContentLength %d", errLongRead, *contentLength))
 		} else if !errors.Is(err, io.EOF) {
 			return nil, objstore.OpErr(op, key, err)
 		}
@@ -286,6 +286,54 @@ func readBody(op, key string, body io.ReadCloser, contentLength *int64) ([]byte,
 			len(data), *contentLength))
 	}
 	return data, nil
+}
+
+// errLongRead is a body longer than its ContentLength: a server fault a
+// second attempt would repeat, so getObject does not retry it.
+var errLongRead = errors.New("long read")
+
+// readAttempts is how many times getObject sends a GET whose body is cut.
+const readAttempts = 3
+
+// getObject sends in and reads its body whole. The SDK retries a failed
+// answer itself, but not a 2xx answer whose body then ends short of its
+// ContentLength or breaks mid-read: R2 cut one body after its headers in
+// millions of GETs, the object intact. So such a body is sent for again,
+// readAttempts in all, after the client retryer's jittered exponential
+// backoff; the last error is returned unchanged. A context error, a long
+// body, a failed answer and check's error are returned at once. check, if
+// set, vets an answer before its body is read. Every attempt runs inside
+// the one pacer slot the call took (objstore's paced wraps the backend), as
+// the SDK's own retries do: a resend takes no slot again. Its errors carry
+// op and key (opErr).
+func (s *Backend) getObject(ctx context.Context, op, key string, in *awss3.GetObjectInput, check func(*awss3.GetObjectOutput) error) (*awss3.GetObjectOutput, []byte, error) {
+	for attempt := 1; ; attempt++ {
+		out, err := s.client.GetObject(ctx, in)
+		storeTime(ctx, out, err)
+		if err != nil {
+			return nil, nil, opErr(op, key, err)
+		}
+		if check != nil {
+			if err := check(out); err != nil {
+				out.Body.Close()
+				return nil, nil, err
+			}
+		}
+		data, err := readBody(op, key, out.Body, out.ContentLength)
+		if err == nil || attempt == readAttempts || errors.Is(err, errLongRead) || ctx.Err() != nil ||
+			errors.Is(err, context.Canceled) || errors.Is(err, context.DeadlineExceeded) {
+			return out, data, err
+		}
+		delay, derr := s.client.Options().Retryer.RetryDelay(attempt, err)
+		if derr != nil {
+			return out, nil, err
+		}
+		select {
+		case <-ctx.Done():
+			return out, nil, objstore.OpErr(op, key, ctx.Err())
+		case <-time.After(delay):
+		}
+	}
 }
 
 // Put writes key unconditionally.
@@ -328,11 +376,8 @@ func apiErrorCode(err error) string {
 
 // Get reads the whole object at key.
 func (s *Backend) Get(ctx context.Context, key string) ([]byte, error) {
-	out, err := s.client.GetObject(ctx, &awss3.GetObjectInput{Bucket: &s.bucket, Key: &key})
-	if err != nil {
-		return nil, opErr("get", key, err)
-	}
-	return readBody("get", key, out.Body, out.ContentLength)
+	_, data, err := s.getObject(ctx, "get", key, &awss3.GetObjectInput{Bucket: &s.bucket, Key: &key}, nil)
+	return data, err
 }
 
 // ListPage is one ListObjectsV2 request with StartAfter = after.
@@ -536,12 +581,7 @@ func (s *Backend) DropBucket(ctx context.Context) error {
 
 // GetWithETag returns the object and its ETag for conditional replacement.
 func (s *Backend) GetWithETag(ctx context.Context, key string) ([]byte, string, error) {
-	out, err := s.client.GetObject(ctx, &awss3.GetObjectInput{Bucket: &s.bucket, Key: &key})
-	storeTime(ctx, out, err)
-	if err != nil {
-		return nil, "", opErr("get-with-etag", key, err)
-	}
-	data, err := readBody("get-with-etag", key, out.Body, out.ContentLength)
+	out, data, err := s.getObject(ctx, "get-with-etag", key, &awss3.GetObjectInput{Bucket: &s.bucket, Key: &key}, nil)
 	if err != nil {
 		return nil, "", err
 	}
@@ -578,17 +618,12 @@ func (s *Backend) GetIfChanged(ctx context.Context, key, etag string) ([]byte, s
 	if etag != "" {
 		in.IfNoneMatch = &etag
 	}
-	out, err := s.client.GetObject(ctx, in)
-	storeTime(ctx, out, err)
+	out, data, err := s.getObject(ctx, "get-if-changed", key, in, nil)
 	if err != nil {
 		var response *awshttp.ResponseError
 		if etag != "" && errors.As(err, &response) && response.HTTPStatusCode() == http.StatusNotModified {
 			return nil, etag, true, nil
 		}
-		return nil, "", false, opErr("get-if-changed", key, err)
-	}
-	data, err := readBody("get-if-changed", key, out.Body, out.ContentLength)
-	if err != nil {
 		return nil, "", false, err
 	}
 	return data, aws.ToString(out.ETag), false, nil
@@ -656,20 +691,17 @@ func (s *Backend) ifMatch(etag string) *string {
 // ignores Range is ErrRange, not a whole-object download.
 func (s *Backend) GetRange(ctx context.Context, key string, offset, length int64) ([]byte, error) {
 	span := fmt.Sprintf("bytes=%d-%d", offset, offset+length-1)
-	out, err := s.client.GetObject(ctx, &awss3.GetObjectInput{Bucket: &s.bucket, Key: &key, Range: &span})
-	if err != nil {
-		return nil, opErr("get-range", key, err)
-	}
 	// Check both the returned range and length: a server ignoring Range must
 	// not turn a block read into an unbounded whole-object download.
-	var first, last, total int64
-	if out.ContentRange == nil || out.ContentLength == nil || *out.ContentLength != length {
-		out.Body.Close()
-		return nil, opErr("get-range", key, objstore.ErrRange)
-	}
-	if n, _ := fmt.Sscanf(*out.ContentRange, "bytes %d-%d/%d", &first, &last, &total); n != 3 || first != offset || last != offset+length-1 || total <= last {
-		out.Body.Close()
-		return nil, opErr("get-range", key, objstore.ErrRange)
-	}
-	return readBody("get-range", key, out.Body, out.ContentLength)
+	_, data, err := s.getObject(ctx, "get-range", key, &awss3.GetObjectInput{Bucket: &s.bucket, Key: &key, Range: &span}, func(out *awss3.GetObjectOutput) error {
+		var first, last, total int64
+		if out.ContentRange == nil || out.ContentLength == nil || *out.ContentLength != length {
+			return opErr("get-range", key, objstore.ErrRange)
+		}
+		if n, _ := fmt.Sscanf(*out.ContentRange, "bytes %d-%d/%d", &first, &last, &total); n != 3 || first != offset || last != offset+length-1 || total <= last {
+			return opErr("get-range", key, objstore.ErrRange)
+		}
+		return nil
+	})
+	return data, err
 }

@@ -144,7 +144,15 @@ func (b *Backend) NewReader(ctx context.Context, key string, offset, length int6
 			return nil, opErr("new-reader", key, fmt.Errorf("%w: response %q, length %d", objstore.ErrRange, value(o.ContentRange), value(o.ContentLength)))
 		}
 	}
-	return stream.Download(ctx, o.Body, o.ContentLength), nil
+	return stream.Download(ctx, resumed(ctx, o), o.ContentLength), nil
+}
+
+// resumed is o's body read through the SDK's retry reader: a body cut
+// after its headers or mid-read (R2's S3 API cut one in millions of GETs)
+// is read on from the bytes seen, at the same ETag, three attempts in all.
+// azcore retries failed answers, not a body that breaks.
+func resumed(ctx context.Context, o azblob.DownloadStreamResponse) io.ReadCloser {
+	return o.NewRetryReader(ctx, &azblob.RetryReaderOptions{MaxRetries: 2})
 }
 
 func (b *Backend) Get(ctx context.Context, key string) ([]byte, error) {
@@ -180,8 +188,9 @@ func (b *Backend) GetIfChanged(ctx context.Context, key, etag string) ([]byte, s
 	if err != nil {
 		return nil, "", false, opErr("get-if-changed", key, err)
 	}
-	defer o.Body.Close()
-	data, err := io.ReadAll(stream.Download(ctx, o.Body, o.ContentLength))
+	body := resumed(ctx, o)
+	defer body.Close()
+	data, err := io.ReadAll(stream.Download(ctx, body, o.ContentLength))
 	if err != nil {
 		return nil, "", false, opErr("get-if-changed", key, err)
 	}
