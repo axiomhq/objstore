@@ -5,6 +5,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"net"
 	"net/http"
 	"net/http/httptest"
 	"slices"
@@ -14,6 +15,7 @@ import (
 	"time"
 
 	"github.com/aws/aws-sdk-go-v2/aws"
+	"github.com/aws/aws-sdk-go-v2/aws/retry"
 	awshttp "github.com/aws/aws-sdk-go-v2/aws/transport/http"
 	"github.com/aws/aws-sdk-go-v2/config"
 	awss3 "github.com/aws/aws-sdk-go-v2/service/s3"
@@ -585,6 +587,166 @@ func TestS3GetRangeContentRangeGuard(t *testing.T) {
 		})
 	}
 }
+
+// A body cut off after its headers, as R2 sent once in about a million
+// ranged GETs (a 206 promising 512 bytes, then the connection closed), is
+// transient: the same GET a moment later returns the whole object. The SDK
+// retries failed responses but not a body that ends short or breaks
+// mid-read, so each of the four reads retries it, three attempts in all;
+// a cancelled context and a body longer than its ContentLength are not
+// retried.
+func TestS3GetRetriesShortBody(t *testing.T) {
+	object := strings.Repeat("0123456789abcdef", 32) // 512 bytes
+	const off, n = 6, 500
+	reads := map[string]struct {
+		read func(context.Context, *Backend) ([]byte, error)
+		want string
+	}{
+		"get":       {func(ctx context.Context, s *Backend) ([]byte, error) { return s.Get(ctx, "k") }, object},
+		"get-range": {func(ctx context.Context, s *Backend) ([]byte, error) { return s.GetRange(ctx, "k", off, n) }, object[off : off+n]},
+		"get-with-etag": {func(ctx context.Context, s *Backend) ([]byte, error) {
+			d, _, err := s.GetWithETag(ctx, "k")
+			return d, err
+		}, object},
+		"get-if-changed": {func(ctx context.Context, s *Backend) ([]byte, error) {
+			d, _, _, err := s.GetIfChanged(ctx, "k", `"old"`)
+			return d, err
+		}, object},
+	}
+	// cut writes the headers and the body's first sent bytes, then ends the
+	// connection: closed after the headers, or reset (RST) mid-body.
+	cut := func(t *testing.T, w http.ResponseWriter, body string, sent int, reset bool) {
+		w.(http.Flusher).Flush()
+		conn, _, err := w.(http.Hijacker).Hijack()
+		if err != nil {
+			t.Error(err)
+			return
+		}
+		conn.Write([]byte(body[:sent]))
+		if reset {
+			conn.(*net.TCPConn).SetLinger(0)
+		}
+		conn.Close()
+	}
+	// serve answers each GET whole, after faults(attempt) first.
+	serve := func(t *testing.T, attempts *atomic.Int32, fault func(attempt int32, w http.ResponseWriter, body string) bool) http.HandlerFunc {
+		return func(w http.ResponseWriter, r *http.Request) {
+			body := object
+			w.Header().Set("ETag", `"e"`)
+			if r.Header.Get("Range") != "" {
+				body = object[off : off+n]
+				w.Header().Set("Content-Range", fmt.Sprintf("bytes %d-%d/%d", off, off+n-1, len(object)))
+			}
+			w.Header().Set("Content-Length", fmt.Sprint(len(body)))
+			status := http.StatusOK
+			if r.Header.Get("Range") != "" {
+				status = http.StatusPartialContent
+			}
+			w.WriteHeader(status)
+			if fault(attempts.Add(1), w, body) {
+				return
+			}
+			fmt.Fprint(w, body)
+		}
+	}
+	for _, tc := range []struct {
+		name     string
+		faults   int32 // attempts that fail
+		reset    bool  // reset after 100 bytes, else close after the headers
+		attempts int32
+		err      string
+	}{
+		{name: "closed after the headers", faults: 1, attempts: 2},
+		{name: "reset after 100 bytes", faults: 1, reset: true, attempts: 2},
+		{name: "three cut bodies", faults: 3, attempts: 3, err: "short read: got 0 bytes, ContentLength says"},
+	} {
+		for name, r := range reads {
+			t.Run(tc.name+"/"+name, func(t *testing.T) {
+				var attempts atomic.Int32
+				s := retryS3(t, serve(t, &attempts, func(attempt int32, w http.ResponseWriter, body string) bool {
+					if attempt > tc.faults {
+						return false
+					}
+					sent := 0
+					if tc.reset {
+						sent = 100
+					}
+					cut(t, w, body, sent, tc.reset)
+					return true
+				}), nil)
+				data, err := r.read(t.Context(), s)
+				if got := attempts.Load(); got != tc.attempts {
+					t.Fatalf("%d attempts, want %d: %q, %v", got, tc.attempts, data, err)
+				}
+				if tc.err == "" && (err != nil || string(data) != r.want) {
+					t.Fatalf("got %d bytes, %v; want the whole body", len(data), err)
+				}
+				if tc.err != "" && (err == nil || !strings.Contains(err.Error(), tc.err)) {
+					t.Fatalf("got %v, want %q", err, tc.err)
+				}
+			})
+		}
+	}
+	t.Run("cancelled context", func(t *testing.T) {
+		var attempts atomic.Int32
+		ctx, cancel := context.WithCancel(t.Context())
+		s := retryS3(t, serve(t, &attempts, func(_ int32, w http.ResponseWriter, _ string) bool {
+			w.(http.Flusher).Flush()
+			cancel()
+			time.Sleep(100 * time.Millisecond) // the client gives up the body
+			return true
+		}), nil)
+		if _, err := s.Get(ctx, "k"); !errors.Is(err, context.Canceled) || attempts.Load() != 1 {
+			t.Fatalf("%d attempts, %v; want 1, context.Canceled", attempts.Load(), err)
+		}
+	})
+	t.Run("long body", func(t *testing.T) {
+		var attempts atomic.Int32
+		// The client sees one byte more than ContentLength says.
+		s := retryS3(t, serve(t, &attempts, func(int32, http.ResponseWriter, string) bool { return false }), func(resp *http.Response) {
+			resp.Body = io.NopCloser(io.MultiReader(resp.Body, strings.NewReader("x")))
+		})
+		if _, err := s.Get(t.Context(), "k"); err == nil || !strings.Contains(err.Error(), "long read") || attempts.Load() != 1 {
+			t.Fatalf("%d attempts, %v; want 1, a long read", attempts.Load(), err)
+		}
+	})
+}
+
+// retryS3 is fakeS3 with a retryer that backs off a millisecond, and edit,
+// if set, applied to each response the client receives.
+func retryS3(t *testing.T, handler http.HandlerFunc, edit func(*http.Response)) *Backend {
+	t.Helper()
+	srv := httptest.NewServer(handler)
+	t.Cleanup(srv.Close)
+	client := srv.Client()
+	var hc aws.HTTPClient = client
+	if edit != nil {
+		hc = doFunc(func(r *http.Request) (*http.Response, error) {
+			resp, err := client.Do(r)
+			if err == nil {
+				edit(resp)
+			}
+			return resp, err
+		})
+	}
+	s, err := New(t.Context(), Config{Endpoint: srv.URL, Bucket: "b", AWS: &aws.Config{
+		Region: "us-east-1", HTTPClient: hc,
+		Retryer: func() aws.Retryer {
+			return retry.NewStandard(func(o *retry.StandardOptions) { o.MaxBackoff = time.Millisecond })
+		},
+		Credentials: aws.CredentialsProviderFunc(func(context.Context) (aws.Credentials, error) {
+			return aws.Credentials{AccessKeyID: "test", SecretAccessKey: "test"}, nil
+		}),
+	}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	return s
+}
+
+type doFunc func(*http.Request) (*http.Response, error)
+
+func (f doFunc) Do(r *http.Request) (*http.Response, error) { return f(r) }
 
 // TestS3DropBucketMissingBucket: DropBucket on a bucket that is already
 // gone succeeds, whether the list or the final DeleteBucket finds it

@@ -2,6 +2,7 @@ package blob
 
 import (
 	"bytes"
+	"cmp"
 	"context"
 	"encoding/base64"
 	"errors"
@@ -142,6 +143,56 @@ func TestDownloadTerminalError(t *testing.T) {
 	defer r.Close()
 	if _, err := io.ReadAll(r); !errors.Is(err, terminal) {
 		t.Fatalf("lost terminal error: %v", err)
+	}
+}
+
+// A download whose body is cut after its headers, as R2's S3 API sent once
+// in millions of GETs, resumes from the bytes read, at the same ETag; three
+// cut bodies in a row fail the read.
+func TestDownloadResumesCutBody(t *testing.T) {
+	const object = "0123456789"
+	for _, tc := range []struct {
+		name     string
+		cuts     int32
+		attempts int32
+		ok       bool
+	}{{"one cut", 1, 2, true}, {"three cuts", 3, 3, false}} {
+		for name, read := range map[string]func(*Backend) ([]byte, error){
+			"get":       func(b *Backend) ([]byte, error) { return b.Get(t.Context(), "key") },
+			"get-range": func(b *Backend) ([]byte, error) { return b.GetRange(t.Context(), "key", 2, 6) },
+		} {
+			t.Run(tc.name+"/"+name, func(t *testing.T) {
+				var attempts atomic.Int32
+				b := fakeBlob(t, func(w http.ResponseWriter, r *http.Request) {
+					first, last := 0, len(object)-1
+					if span := cmp.Or(r.Header.Get("x-ms-range"), r.Header.Get("Range")); span != "" {
+						fmt.Sscanf(span, "bytes=%d-%d", &first, &last)
+					}
+					if attempts.Add(1) > 1 && r.Header.Get("If-Match") != `"e"` {
+						t.Errorf("resume without If-Match: %q", r.Header.Get("If-Match"))
+					}
+					w.Header().Set("ETag", `"e"`)
+					w.Header().Set("Content-Length", fmt.Sprint(last-first+1))
+					w.Header().Set("Content-Range", fmt.Sprintf("bytes %d-%d/%d", first, last, len(object)))
+					w.WriteHeader(206)
+					if attempts.Load() <= tc.cuts {
+						w.(http.Flusher).Flush()
+						conn, _, _ := w.(http.Hijacker).Hijack()
+						conn.Close()
+						return
+					}
+					fmt.Fprint(w, object[first:last+1])
+				})
+				data, err := read(b)
+				want := object
+				if name == "get-range" {
+					want = object[2:8]
+				}
+				if attempts.Load() != tc.attempts || (err == nil) != tc.ok || tc.ok && string(data) != want {
+					t.Fatalf("%d attempts, %q, %v; want %d, ok %t", attempts.Load(), data, err, tc.attempts, tc.ok)
+				}
+			})
+		}
 	}
 }
 
