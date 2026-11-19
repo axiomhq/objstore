@@ -6,6 +6,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"math/rand/v2"
 	"reflect"
 	"strings"
 	"sync"
@@ -583,6 +584,95 @@ func TestLogLazyMultiPageValidation(t *testing.T) {
 		snapshotOwned(t, l)
 		if err := l.Replay(t.Context(), l.Genesis(), upper, 1<<20, func(wal.Batch) error { return nil }); err != nil {
 			t.Fatal(err)
+		}
+	})
+}
+
+// TestLogReadPlaced: a batch cut into pages whose headers differ in length,
+// of records whose length prefixes take 1, 2 and 3 bytes, an empty one
+// among them; each record's payload lies at its place.
+func TestLogReadPlaced(t *testing.T) {
+	synctest.Test(t, func(t *testing.T) {
+		store := mem.Open(objstore.Config{})
+		l := openOwned(t, store, "log/")
+		s := acquireOwned(t, l, wal.SessionOptions{MaxBatchBytes: 64 << 20, MaxPendingBytes: 256 << 20})
+		defer s.Close(t.Context())
+		// 150 small records and a large one fill page 0; the second large
+		// one does not fit beside them and opens page 1, with 20 more.
+		r := rand.New(rand.NewPCG(1, 2))
+		record := func(n int) []byte {
+			p := make([]byte, n)
+			for i := range p {
+				p[i] = byte(r.Uint32())
+			}
+			return p
+		}
+		var records [][]byte
+		small := []int{0, 1, 127, 128, 16383, 16384, 100000}
+		for i := range 150 {
+			records = append(records, record(small[i%len(small)]))
+		}
+		records = append(records, record(17<<20), record(17<<20))
+		for i := range 20 {
+			records = append(records, record(small[i%len(small)]))
+		}
+		var acks []*wal.Receipt
+		for i, p := range records {
+			a, err := s.Enqueue(p, []byte(fmt.Sprint(i)))
+			if err != nil {
+				t.Fatal(err)
+			}
+			acks = append(acks, a)
+		}
+		for _, a := range acks {
+			if err := a.Wait(t.Context()); err != nil {
+				t.Fatal(err)
+			}
+		}
+		var batches []wal.Batch
+		if err := l.Replay(t.Context(), l.Genesis(), snapshotOwned(t, l), 1<<20, func(b wal.Batch) error { batches = append(batches, b); return nil }); err != nil {
+			t.Fatal(err)
+		}
+		if len(batches) != 1 {
+			t.Fatalf("%d batches, want 1", len(batches))
+		}
+		got, err := batches[0].Read(t.Context())
+		if err != nil {
+			t.Fatal(err)
+		}
+		placed, places, err := batches[0].ReadPlaced(t.Context())
+		if err != nil {
+			t.Fatal(err)
+		}
+		if len(got) != len(records) || len(placed) != len(got) || len(places) != len(got) {
+			t.Fatalf("%d records read, %d placed, %d places; want %d", len(got), len(placed), len(places), len(records))
+		}
+		pages := map[string]int{}
+		for i := range got {
+			if !bytes.Equal(got[i], records[i]) || !bytes.Equal(placed[i], got[i]) {
+				t.Fatalf("record %d: ReadPlaced and Read disagree", i)
+			}
+			pl := places[i]
+			pages[pl.Key]++
+			if pl.Len == 0 {
+				// A store reads no empty range: the byte before is the
+				// record's length prefix, 0.
+				at, err := store.GetRange(t.Context(), pl.Key, pl.Off-1, 1)
+				if err != nil || at[0] != 0 {
+					t.Fatalf("empty record %d at %+v: prefix %v, %v", i, pl, at, err)
+				}
+				continue
+			}
+			at, err := store.GetRange(t.Context(), pl.Key, pl.Off, pl.Len)
+			if err != nil {
+				t.Fatalf("record %d at %+v: %v", i, pl, err)
+			}
+			if !bytes.Equal(at, got[i]) {
+				t.Fatalf("record %d of %d bytes: %d bytes at %s %d differ from its payload", i, len(got[i]), pl.Len, pl.Key, pl.Off)
+			}
+		}
+		if len(pages) < 2 {
+			t.Fatalf("the records lie in %d pages, want 2 or more", len(pages))
 		}
 	})
 }
