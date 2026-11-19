@@ -819,19 +819,43 @@ func (b Batch) Metadata() [][]byte {
 // page ordering, timestamp, record count and the descriptor's read budget are
 // checked before any payloads escape. Reads have no retained cache.
 func (b Batch) Read(ctx context.Context) ([][]byte, error) {
+	out, _, err := b.read(ctx, false)
+	return out, err
+}
+
+// Place is where a record's payload lies: Len bytes at byte Off of the
+// object at Key, the page's whole key in the log's store.
+type Place struct {
+	Key      string
+	Off, Len int64
+}
+
+// ReadPlaced is Read, and also returns each payload's Place, in the same
+// order, after the same checks. It guarantees two things: the object at a
+// returned Key is never rewritten or deleted, and the payload lies verbatim
+// at the returned Off.
+func (b Batch) ReadPlaced(ctx context.Context) ([][]byte, []Place, error) {
+	return b.read(ctx, true)
+}
+
+func (b Batch) read(ctx context.Context, placed bool) ([][]byte, []Place, error) {
 	if b.log == nil || b.descriptor == nil {
-		return nil, fmt.Errorf("%w: invalid batch", ErrCorrupt)
+		return nil, nil, fmt.Errorf("%w: invalid batch", ErrCorrupt)
 	}
 	d := b.descriptor
 	out := make([][]byte, 0, len(d.Metadata))
+	var places []Place
+	if placed {
+		places = make([]Place, 0, len(d.Metadata))
+	}
 	var used int64
 	for i, page := range d.Pages {
 		if err := ctx.Err(); err != nil {
-			return nil, err
+			return nil, nil, err
 		}
 		used += int64(page.Bytes) + 24*int64(page.Records)
 		if used > d.ReadLimit {
-			return nil, ErrRecordTooLarge
+			return nil, nil, ErrRecordTooLarge
 		}
 		key := Key(b.log.prefix+"owners/"+d.Owner+"/", d.First+uint64(i))
 		// The accepted descriptor fixes the exact range; a corrupt object
@@ -842,11 +866,11 @@ func (b Batch) Read(ctx context.Context) ([][]byte, error) {
 		} else {
 			var err error
 			if p, err = b.log.store.GetRange(ctx, key, 0, int64(page.Bytes)); err != nil {
-				return nil, readErr("accepted page", err)
+				return nil, nil, readErr("accepted page", err)
 			}
 		}
 		if len(p) != page.Bytes || logHash(p) != page.Hash {
-			return nil, fmt.Errorf("%w: page hash", ErrCorrupt)
+			return nil, nil, fmt.Errorf("%w: page hash", ErrCorrupt)
 		}
 		// Bound record descriptors by the accepted summary before scanning;
 		// Decode would allocate a second slice from the page's claimed count.
@@ -855,22 +879,26 @@ func (b Batch) Read(ctx context.Context) ([][]byte, error) {
 				return fmt.Errorf("%w: excess accepted records", ErrCorrupt)
 			}
 			out = append(out, record)
+			if placed {
+				// record aliases p from its payload to p's end.
+				places = append(places, Place{Key: key, Off: int64(cap(p) - cap(record)), Len: int64(len(record))})
+			}
 			return nil
 		})
 		if err != nil {
-			return nil, err
+			return nil, nil, err
 		}
 		valid := h.Seq == d.First+uint64(i) && h.Nonce == d.Nonce && h.At.UnixMilli() == d.At
 		valid = valid && h.BatchIndex == uint64(i) && h.BatchPages == uint64(len(d.Pages))
 		valid = valid && h.Records == page.Records && h.Rows == page.Records && h.Weight == 0
 		if !valid {
-			return nil, fmt.Errorf("%w: accepted page header", ErrCorrupt)
+			return nil, nil, fmt.Errorf("%w: accepted page header", ErrCorrupt)
 		}
 	}
 	if len(out) != len(d.Metadata) {
-		return nil, fmt.Errorf("%w: accepted record count", ErrCorrupt)
+		return nil, nil, fmt.Errorf("%w: accepted record count", ErrCorrupt)
 	}
-	return out, nil
+	return out, places, nil
 }
 
 // Replay validates and bounds the entire backward descriptor chain before
